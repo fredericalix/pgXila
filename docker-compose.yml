@@ -34,7 +34,7 @@ services:
       - state:/var/lib/pgxila
       - ./docker/certs:/export
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -q -U postgres -d pgxila"]
+      test: ["CMD-SHELL", "gosu postgres pg_isready -q -d pgxila"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -63,7 +63,7 @@ services:
       - /var/lib/postgresql
       - /var/lib/pgxila
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -q -U postgres -d pgxila"]
+      test: ["CMD-SHELL", "gosu postgres pg_isready -q -d pgxila"]
       interval: 5s
       timeout: 3s
       retries: 20

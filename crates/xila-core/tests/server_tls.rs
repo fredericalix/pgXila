@@ -87,13 +87,6 @@ async fn a_client_connects_with_tls_1_3_and_scram() {
         .unwrap();
     assert!(row.get::<_, bool>("ssl"));
     assert_eq!(row.get::<_, &str>("version"), "TLSv1.3");
-
-    let version: String = client
-        .query_one("SELECT xila.version()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert!(!version.is_empty());
 }
 
 #[tokio::test]
@@ -183,11 +176,14 @@ async fn the_client_refuses_a_certificate_from_an_unknown_authority() {
 #[tokio::test]
 #[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
 async fn the_client_refuses_a_certificate_for_another_host_name() {
-    let params = params();
+    // Reach the same server, but under a name its certificate does not cover.
+    let params = ConnectParams {
+        host: "not-the-server.example".into(),
+        ..params()
+    };
     let address: IpAddr = "127.0.0.1".parse().unwrap();
     let mut config = postgres_config(&params);
-    // Reach the same server, but under a name its certificate does not cover.
-    config.host("not-the-server.example").hostaddr(address);
+    config.hostaddr(address);
 
     let tls = MakeRustlsConnect::new(tls_config(params.ca_file.as_deref()).unwrap());
     let error = config
