@@ -1,0 +1,87 @@
+# pgXila development server: PostgreSQL 19 with the pgxila extension,
+# pgvector and mandatory TLS.
+#
+#   docker compose up --build        build and start the server
+#   docker compose --profile test run --rm --build extension-test
+#                                    run the extension test suite
+#   scripts/test-integration.sh      run the integration tests
+#
+# The server listens on localhost:5419 by default (set PGXILA_PORT to change
+# it). The public certificate of the development CA is written to
+# docker/certs/ca.crt for the clients.
+name: pgxila
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: pgxila/db:dev
+    # The agent settings (endpoint URL and token) come from .env.local, which
+    # is never committed. The file is optional: the server runs without it.
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      POSTGRES_DB: pgxila
+      POSTGRES_INITDB_ARGS: --auth-local=peer --auth-host=scram-sha-256
+      PGXILA_TLS_HOSTS: ${PGXILA_TLS_HOSTS:-localhost,127.0.0.1,::1}
+    ports:
+      - "127.0.0.1:${PGXILA_PORT:-5419}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - state:/var/lib/pgxila
+      - ./docker/certs:/export
+    healthcheck:
+      test: ["CMD-SHELL", "gosu postgres pg_isready -q -d pgxila"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # TEST ONLY: a throwaway server for the integration tests, started by
+  # scripts/test-integration.sh. Its data is not kept. Its pg_hba.conf also
+  # accepts unencrypted connections, to prove that the extension refuses them
+  # by itself.
+  db-scratch:
+    profiles: ["test"]
+    image: pgxila/db:dev
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/pgxila/postgresql.conf
+      - -c
+      - hba_file=/etc/pgxila-test/pg_hba.permissive.conf
+    environment:
+      POSTGRES_DB: pgxila
+      POSTGRES_INITDB_ARGS: --auth-local=peer --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:${PGXILA_SCRATCH_PORT:-5420}:5432"
+    volumes:
+      - ./docker/test/pg_hba.permissive.conf:/etc/pgxila-test/pg_hba.permissive.conf:ro
+      - ${PGXILA_SCRATCH_CERTS:-./docker/certs/scratch}:/export
+    tmpfs:
+      - /var/lib/postgresql
+      - /var/lib/pgxila
+    healthcheck:
+      test: ["CMD-SHELL", "gosu postgres pg_isready -q -d pgxila"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  extension-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: test
+    image: pgxila/extension-test:dev
+    volumes:
+      - test-cargo-registry:/opt/cargo/registry
+      - test-target:/src/extension/target
+
+volumes:
+  pgdata:
+  state:
+  test-cargo-registry:
+  test-target:

@@ -1,0 +1,40 @@
+[package]
+name = "pgxila"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99.1"
+description = "pgXila: a fantasy OS that lives inside PostgreSQL"
+license = "PostgreSQL"
+repository = "https://github.com/fredericalix/pgXila"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg19"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.20.1"
+# Used by the in-database tests, which are compiled into the library itself.
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+pgrx-tests = "=0.20.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

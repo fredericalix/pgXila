@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# Runs the integration tests against real pgXila servers in Docker.
+#
+# Two servers are used:
+#
+#   db          the development server, with the configuration of the image.
+#               Only connection tests run against it: they create a temporary
+#               role and touch no data.
+#   db-scratch  a throwaway server whose data is not kept. The example stack
+#               is loaded into it and the API tests read and write there. Its
+#               pg_hba.conf also accepts unencrypted connections, to prove
+#               that the extension refuses them by itself.
+#
+# Roles get a random password, and are removed when the tests end.
+set -Eeuo pipefail
+cd "$(dirname "$0")/.."
+
+PORT="${PGXILA_PORT:-5419}"
+SCRATCH_PORT="${PGXILA_SCRATCH_PORT:-5420}"
+ROLE="xila_integration_test"
+OUTSIDER="xila_integration_outsider"
+PASSWORD="$(openssl rand -hex 24)"
+COMPOSE=(docker compose --profile test)
+
+psql_in() { # service, then psql arguments; SQL on stdin
+    local service="$1"; shift
+    "${COMPOSE[@]}" exec -T -u postgres -e PGOPTIONS='-c client_min_messages=warning' "$service" \
+        psql -X -q -v ON_ERROR_STOP=1 -d pgxila "$@"
+}
+
+cleanup() {
+    psql_in db -c "DROP ROLE IF EXISTS $ROLE" >/dev/null 2>&1 || true
+    "${COMPOSE[@]}" rm -f -s -v db-scratch >/dev/null 2>&1 || true
+    rm -rf "$SCRATCH_CERTS"
+}
+SCRATCH_CERTS="$(mktemp -d)"
+trap cleanup EXIT
+export PGXILA_SCRATCH_CERTS="$SCRATCH_CERTS"
+
+"${COMPOSE[@]}" up -d --build --wait db db-scratch
+
+# A plain login role on the development server: enough to test connections.
+psql_in db -v role="$ROLE" -v password="$PASSWORD" <<'SQL'
+DROP ROLE IF EXISTS :"role";
+CREATE ROLE :"role" LOGIN PASSWORD :'password';
+SQL
+
+# On the scratch server: a pgXila user, a role that is not one, and a stack.
+psql_in db-scratch -v role="$ROLE" -v outsider="$OUTSIDER" -v password="$PASSWORD" <<'SQL'
+CREATE ROLE :"role" LOGIN PASSWORD :'password' IN ROLE xila_user;
+CREATE ROLE :"outsider" LOGIN PASSWORD :'password';
+SQL
+PGXILA_SERVICE=db-scratch scripts/load-example.sh carnet
+
+export PGXILA_TEST_HOST=localhost
+export PGXILA_TEST_PORT="$PORT"
+export PGXILA_TEST_DATABASE=pgxila
+export PGXILA_TEST_USER="$ROLE"
+export PGXILA_TEST_OUTSIDER="$OUTSIDER"
+export PGXILA_TEST_PASSWORD="$PASSWORD"
+export PGXILA_TEST_CA="$PWD/docker/certs/ca.crt"
+export PGXILA_TEST_SCRATCH_PORT="$SCRATCH_PORT"
+export PGXILA_TEST_SCRATCH_CA="$SCRATCH_CERTS/ca.crt"
+
+# The API tests share one stack: run them one at a time.
+cargo test --workspace -- --ignored --test-threads=1 "$@"
+
+scratch() { # runs a command inside the scratch server, as the postgres user
+    "${COMPOSE[@]}" exec -T -u postgres "$@"
+}
+history_count() {
+    scratch db-scratch psql -X -At -d "${1:-pgxila}" -c "SELECT count(*) FROM xila.history"
+}
+
+echo
+echo "History cannot be escaped by an ordinary role"
+before="$(history_count)"
+scratch -e PGPASSWORD="$PASSWORD" db-scratch \
+    psql -X -q -v ON_ERROR_STOP=1 "host=localhost dbname=pgxila user=$ROLE sslmode=require" <<'SQL'
+SET search_path = '';
+SET xila.restoring = on;
+UPDATE carnet.contacts SET ville = 'Ailleurs' WHERE nom = 'Pascal';
+UPDATE carnet.contacts SET ville = 'Clermont-Ferrand' WHERE nom = 'Pascal';
+SQL
+after="$(history_count)"
+[ "$after" -eq "$((before + 2))" ] || {
+    echo "FAILED: expected 2 new history rows, got $((after - before))" >&2; exit 1; }
+echo "ok"
+
+echo
+echo "A backup is restored with its stacks, its cards and its history"
+summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.background),
+                (SELECT count(*) FROM xila.widget), (SELECT count(*) FROM xila.layout),
+                (SELECT count(*) FROM xila.action), (SELECT count(*) FROM xila.key_binding),
+                (SELECT count(*) FROM xila.palette), (SELECT count(*) FROM xila.history),
+                (SELECT count(*) FROM carnet.contacts),
+                (SELECT count(*) FROM pg_trigger WHERE tgname = 'xila_card'),
+                xila.card('carnet')->'texts'"
+scratch db-scratch sh -c '
+    set -e
+    pg_dump -d pgxila -Fc -f /tmp/pgxila.dump
+    createdb restored
+    pg_restore --exit-on-error -d restored /tmp/pgxila.dump'
+original="$(scratch db-scratch psql -X -At -d pgxila -c "$summary")"
+restored="$(scratch db-scratch psql -X -At -d restored -c "$summary")"
+[ "$original" = "$restored" ] || {
+    echo "FAILED: the restored database differs" >&2
+    echo "  original: $original" >&2
+    echo "  restored: $restored" >&2
+    exit 1; }
+echo "ok ($restored)"
