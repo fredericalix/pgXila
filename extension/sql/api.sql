@@ -35,7 +35,7 @@ $$;
 CREATE FUNCTION xila.source_of(bg xila.background) RETURNS regclass
 LANGUAGE sql STABLE AS $$
     SELECT CASE WHEN bg.source_table IS NOT NULL
-                THEN to_regclass(format('%I.%I', bg.source_schema, bg.source_table)) END
+                THEN xila.relation(bg.source_schema, bg.source_table)::regclass END
 $$;
 
 -- "ORDER BY" expression of the cards of a background: the order columns,
@@ -163,6 +163,10 @@ LANGUAGE sql STABLE AS $$
                'column', w.bound_column,
                'type', CASE WHEN w.bound_column IS NOT NULL
                             THEN xila.field_type(xila.source_of(bg), w.bound_column) END,
+               'required', CASE WHEN w.bound_column IS NOT NULL THEN (
+                   SELECT c.attnotnull FROM pg_attribute c
+                   WHERE c.attrelid = xila.source_of(bg) AND c.attname = w.bound_column
+                     AND c.attnum > 0 AND NOT c.attisdropped) END,
                'action', a.name))
                || jsonb_build_object(
                'props', xila.resolved_props(w.props),
@@ -227,9 +231,7 @@ CREATE VIEW xila.visible_stack AS
     FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id
     WHERE s.kind = 'user'
       AND CASE WHEN b.source_table IS NULL THEN true
-               ELSE has_table_privilege(
-                        to_regclass(format('%I.%I', b.source_schema, b.source_table))::oid,
-                        'SELECT')
+               ELSE xila.may_read(xila.relation(b.source_schema, b.source_table))
           END;
 
 CREATE FUNCTION xila.open_stack(stack text) RETURNS jsonb
@@ -241,7 +243,7 @@ DECLARE
 BEGIN
     SELECT * INTO info FROM xila.stack WHERE id = bg.stack_id;
 
-    IF source IS NOT NULL AND NOT has_table_privilege(source, 'SELECT') THEN
+    IF source IS NOT NULL AND NOT xila.may_read(source) THEN
         RAISE EXCEPTION 'You do not have access to the stack “%”.', stack USING ERRCODE = 'XL004';
     END IF;
 
@@ -250,10 +252,12 @@ BEGIN
                                     'may_edit', xila.may_edit(info.id)),
         'source', jsonb_build_object(
             'has_cards', source IS NOT NULL,
-            'count', xila.card_count(stack)),
+            'count', xila.card_count(stack),
+            'managed', bg.managed),
         'widgets', xila.widgets_json(bg, NULL),
         'actions', (
-            SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'label', a.label)
+            SELECT coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+                       'name', a.name, 'label', a.label, 'for', a.args->>'for'))
                                       ORDER BY a.name), '[]')
             FROM xila.action a
             WHERE (a.background_id = bg.id OR a.background_id IS NULL)
@@ -300,6 +304,9 @@ DECLARE
 BEGIN
     IF move NOT IN ('first', 'last', 'at', 'next', 'previous') THEN
         RAISE EXCEPTION 'Unknown move: %.', move USING ERRCODE = 'XL002';
+    END IF;
+    IF source IS NOT NULL AND NOT xila.may_read(source) THEN
+        RAISE EXCEPTION 'You do not have access to the stack “%”.', stack USING ERRCODE = 'XL004';
     END IF;
 
     IF source IS NULL THEN

@@ -34,7 +34,7 @@ pub type Connect<A> = Box<dyn FnMut(&ConnectParams) -> Result<Session<A>, String
 
 enum Stage<A: Api> {
     Login(LoginForm),
-    Session(Box<Session<A>>, Ui),
+    Session(Box<Session<A>>, Box<Ui>),
 }
 
 pub struct App<A: Api> {
@@ -75,7 +75,9 @@ impl<A: Api> App<A> {
         match (self.connect)(params) {
             Ok(session) => {
                 let mut session = Box::new(session);
-                let mut ui = Ui::default();
+                // This client draws in a window: it has the visual editor.
+                session.be_graphic();
+                let mut ui = Box::new(Ui::default());
                 screen::settle(&mut session, &mut ui, &self.fonts);
                 self.stage = Stage::Session(session, ui);
             }
@@ -163,17 +165,27 @@ impl<A: Api> App<A> {
         }
     }
 
-    /// Looks at what the server pushed since the last call. Returns true
-    /// when the screen must be drawn again.
+    /// The pointer moved to a point of the screen. Returns true when the
+    /// screen must be drawn again.
+    pub fn pointer_move(&mut self, x: i32, y: i32) -> bool {
+        match &mut self.stage {
+            Stage::Login(_) => false,
+            Stage::Session(session, ui) => screen::pointer_move(session, ui, &self.fonts, x, y),
+        }
+    }
+
+    /// Looks at what the server pushed since the last call, and lets time
+    /// pass. Returns true when the screen must be drawn again.
     pub fn tick(&mut self) -> bool {
         match &mut self.stage {
             Stage::Login(_) => false,
             Stage::Session(session, ui) => {
+                let saved = screen::tick(session, ui, &self.fonts);
                 let changed = session.poll();
                 if changed {
                     screen::settle(session, ui, &self.fonts);
                 }
-                changed
+                saved || changed
             }
         }
     }

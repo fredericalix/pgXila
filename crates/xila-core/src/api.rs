@@ -92,6 +92,9 @@ pub struct Source {
     /// False for a static screen, which has a single card and no data.
     pub has_cards: bool,
     pub count: u64,
+    /// True when pgXila created the table of the stack and may alter it.
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -122,6 +125,10 @@ pub enum FieldType {
 pub struct Widget {
     pub name: String,
     pub kind: WidgetKind,
+    /// `background` for a widget of every card, `card` for one of a single
+    /// card.
+    #[serde(default)]
+    pub layer: Option<String>,
     pub ord: i32,
     #[serde(default)]
     pub group: Option<String>,
@@ -132,6 +139,9 @@ pub struct Widget {
     pub column: Option<String>,
     #[serde(default, rename = "type")]
     pub field_type: Option<FieldType>,
+    /// For a field: whether a card must have a value for it.
+    #[serde(default)]
+    pub required: Option<bool>,
     /// The action a button or a grid row triggers.
     #[serde(default)]
     pub action: Option<String>,
@@ -150,6 +160,11 @@ pub struct Choice {
 }
 
 impl Widget {
+    /// True for a widget that belongs to a single card.
+    pub fn on_card(&self) -> bool {
+        self.layer.as_deref() == Some("card")
+    }
+
     /// The values this field is limited to, if it is: those of its
     /// properties, or yes and no for a boolean. Empty for a free field.
     pub fn choices(&self) -> Vec<Choice> {
@@ -214,6 +229,10 @@ impl Placement {
 pub struct ActionInfo {
     pub name: String,
     pub label: String,
+    /// Whom the action is kept for, when it is: `author` or `editor`. Such
+    /// an action serves the author screens, not the buttons of a stack.
+    #[serde(default, rename = "for")]
+    pub kept_for: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -294,6 +313,12 @@ pub struct Context {
     /// True when the user has accepted the question the action asked.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub confirmed: bool,
+    /// Which client this is: `text` or `graphic`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub renderer: String,
+    /// What a tool of the client, such as the visual editor, has to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
 }
 
 /// What the server asks the client to do after an action.
@@ -325,6 +350,8 @@ pub enum Effect {
     Confirm { text: String, label: String },
     /// Select the row of the grid that has this key.
     Select { row: String },
+    /// Open the visual editor on a stack. Only the graphical client has one.
+    Design { stack: String },
     /// Leave the client.
     Quit,
 }
@@ -471,8 +498,7 @@ mod tests {
         let context = Context {
             card: Some("42".into()),
             dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
-            row: None,
-            confirmed: false,
+            ..Context::default()
         };
         assert_eq!(
             serde_json::to_value(&context).unwrap(),
@@ -485,6 +511,18 @@ mod tests {
                 "card": "42", "dirty": { "city": "Paris" }, "row": "7", "confirmed": true
             })
         );
+        // A tool of the graphical client says what it wants in "input".
+        let tool = Context {
+            renderer: "graphic".into(),
+            input: Some(serde_json::json!({ "widget": "city" })),
+            ..Context::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap(),
+            serde_json::json!({
+                "card": null, "dirty": {}, "renderer": "graphic", "input": { "widget": "city" }
+            })
+        );
     }
 
     #[test]
@@ -492,7 +530,8 @@ mod tests {
         let effects: Vec<Effect> = serde_json::from_value(serde_json::json!([
             { "do": "new", "values": { "stack": "books", "type": "text" } },
             { "do": "confirm", "text": "Delete this card?", "label": "Delete" },
-            { "do": "select", "row": "42" }
+            { "do": "select", "row": "42" },
+            { "do": "design", "stack": "books" }
         ]))
         .unwrap();
         assert_eq!(
@@ -506,6 +545,7 @@ mod tests {
                 },
                 Effect::Confirm { text: "Delete this card?".into(), label: "Delete".into() },
                 Effect::Select { row: "42".into() },
+                Effect::Design { stack: "books".into() },
             ]
         );
     }

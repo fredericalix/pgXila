@@ -250,7 +250,10 @@ mod tests {
         create_library_stack();
         let screen = json("SELECT xila.open_stack('library')");
         assert_eq!(screen["stack"]["title"], "Library");
-        assert_eq!(screen["source"], serde_json::json!({ "has_cards": true, "count": 3 }));
+        assert_eq!(
+            screen["source"],
+            serde_json::json!({ "has_cards": true, "count": 3, "managed": false })
+        );
 
         let widgets = screen["widgets"].as_array().unwrap();
         let names: Vec<_> = widgets.iter().map(|w| w["name"].as_str().unwrap()).collect();
@@ -952,7 +955,6 @@ mod tests {
     #[pg_test]
     fn history_is_read_by_those_who_may_read_the_cards() {
         create_books_as_ada();
-        Spi::run("GRANT USAGE ON SCHEMA books TO dan").unwrap();
 
         // Without access to the table: nothing of the stack.
         become_role("dan");
@@ -960,7 +962,8 @@ mod tests {
 
         // With access to the whole table: its changes, cards included.
         become_role("ada");
-        Spi::run("GRANT SELECT, UPDATE ON books.cards TO dan").unwrap();
+        Spi::run("GRANT USAGE ON SCHEMA books TO dan; GRANT SELECT, UPDATE ON books.cards TO dan;")
+            .unwrap();
         become_role("dan");
         assert_eq!(number("SELECT count(*) FROM xila.card_history_line WHERE stack = 'books'"), 2);
         assert_eq!(number("SELECT count(*) FROM xila.history_line WHERE stack = 'books'"), 1);
@@ -993,6 +996,41 @@ mod tests {
              SELECT id, 'card', 'x', 'delete' FROM xila.stack WHERE name = 'books'",
         );
         assert_eq!(state, "42501");
+    }
+
+    #[pg_test]
+    fn a_private_stack_does_not_break_the_screens_of_the_others() {
+        // A stack made in author mode is private: nobody else may even use
+        // its schema. For the others it is simply not there.
+        create_books_as_ada();
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.visible_stack"), 0);
+        assert_eq!(json("SELECT xila.grid_rows('stacks', 'list')")["total"], 0);
+        for query in ["SELECT xila.open_stack('books')", "SELECT xila.card('books')"] {
+            let (state, message) = error_of(query);
+            assert_eq!(state, "XL004", "{query}");
+            assert_eq!(message, "You do not have access to the stack “books”.");
+        }
+        assert_eq!(number("SELECT count(*) FROM xila.history_line"), 0);
+        assert_eq!(number("SELECT count(*) FROM xila.card_history_line"), 0);
+        // Its definition is no secret, like every definition.
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+
+        // Once its author lets them in, it is listed.
+        become_role("ada");
+        Spi::run("GRANT USAGE ON SCHEMA books TO dan; GRANT SELECT ON books.cards TO dan;")
+            .unwrap();
+        become_role("dan");
+        assert_eq!(
+            json("SELECT xila.grid_rows('stacks', 'list')")["rows"][0]["cells"],
+            serde_json::json!({ "title": "Books", "cards": "2" })
+        );
+        // The right to read the table without the right to use its schema is
+        // not access either.
+        become_role("ada");
+        Spi::run("REVOKE USAGE ON SCHEMA books FROM dan").unwrap();
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.visible_stack"), 0);
     }
 
     #[pg_test]
@@ -1185,6 +1223,390 @@ mod tests {
         );
         let (state, _) = error_of("SELECT xila.act('books', 'author')");
         assert_eq!(state, "XL004");
+    }
+
+    // ----------------------------------------------------------------------
+    // The visual editor
+    // ----------------------------------------------------------------------
+
+    /// The rectangle a widget has in the window, as [x, y, w, h], or null.
+    fn place_of(stack: &str, widget: &str) -> serde_json::Value {
+        json(&format!(
+            "SELECT coalesce((
+                 SELECT jsonb_build_array(l.x, l.y, l.w, l.h)
+                 FROM xila.layout l JOIN xila.widget w ON w.id = l.widget_id
+                 WHERE w.background_id = xila.background_id('{stack}') AND w.name = '{widget}'
+                   AND l.renderer = 'graphic' AND l.w > 0), 'null')"
+        ))
+    }
+
+    /// One widget of a screen definition.
+    fn widget_of(screen: &serde_json::Value, name: &str) -> serde_json::Value {
+        screen["widgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == name)
+            .unwrap_or_else(|| panic!("no widget {name}"))
+            .clone()
+    }
+
+    #[pg_test]
+    fn a_screen_says_what_the_editor_needs_to_know() {
+        create_books_as_ada();
+        Spi::run(r#"SELECT xila.set_field('books', 'title', '{"required": true}')"#).unwrap();
+        let screen = json("SELECT xila.open_stack('books')");
+        assert_eq!(screen["source"]["managed"], true);
+        assert_eq!(widget_of(&screen, "title")["required"], true);
+        assert_eq!(widget_of(&screen, "year")["required"], false);
+        assert_eq!(widget_of(&screen, "next").get("required"), None);
+        // The actions the editor uses are offered to those who may edit.
+        let actions: Vec<_> =
+            screen["actions"].as_array().unwrap().iter().map(|a| a["name"].clone()).collect();
+        for action in ["place_widgets", "add_widget", "set_widget", "remove_widget", "undo"] {
+            assert!(actions.contains(&serde_json::json!(action)), "{action}");
+        }
+
+        Spi::run(
+            "GRANT USAGE ON SCHEMA books TO xila_user; GRANT SELECT ON books.cards TO xila_user;",
+        )
+        .unwrap();
+        become_role("bob");
+        let screen = json("SELECT xila.open_stack('books')");
+        let actions: Vec<_> =
+            screen["actions"].as_array().unwrap().iter().map(|a| a["name"].clone()).collect();
+        assert!(!actions.contains(&serde_json::json!("place_widgets")));
+    }
+
+    #[pg_test]
+    fn widgets_are_given_a_place_and_the_layout_can_be_reset() {
+        create_books_as_ada();
+        assert_eq!(place_of("books", "title"), serde_json::Value::Null);
+
+        Spi::run(
+            r#"SELECT xila.place_widgets('books', 'graphic', '{
+                   "title": {"x": 100, "y": 44, "w": 200, "h": 14},
+                   "year":  {"x": 100, "y": 64, "w": 60,  "h": 14},
+                   "new":   {"x": 7,   "y": 100, "w": 62, "h": 15}}')"#,
+        )
+        .unwrap();
+        assert_eq!(place_of("books", "year"), serde_json::json!([100, 64, 60, 14]));
+        let screen = json("SELECT xila.open_stack('books')");
+        let new = widget_of(&screen, "new");
+        assert_eq!(new["layout"]["graphic"]["x"], 7);
+        assert_eq!(new["layout"]["graphic"]["style"]["variant"], "primary", "styles are kept");
+
+        // Placing again moves; a place off the screen is refused.
+        Spi::run(
+            r#"SELECT xila.place_widgets('books', 'graphic',
+                   '{"year": {"x": 240, "y": 44, "w": 60, "h": 14}}')"#,
+        )
+        .unwrap();
+        assert_eq!(place_of("books", "year"), serde_json::json!([240, 44, 60, 14]));
+        for wrong in [
+            r#"{"year": {"x": 450, "y": 44, "w": 60, "h": 14}}"#,
+            r#"{"year": {"x": 10, "y": 44, "w": 0, "h": 14}}"#,
+            r#"{"year": {"x": 10, "y": 44, "w": 60}}"#,
+            r#"{"year": {"x": "left", "y": 44, "w": 60, "h": 14}}"#,
+        ] {
+            let (state, message) =
+                error_of(&format!("SELECT xila.place_widgets('books', 'graphic', '{wrong}')"));
+            assert_eq!(state, "XL003", "{wrong}");
+            assert_eq!(message, "The place given to “year” does not fit on the screen.");
+        }
+        let (state, _) = error_of(
+            r#"SELECT xila.place_widgets('books', 'graphic', '{"nothing": {"x": 1, "y": 1, "w": 9, "h": 9}}')"#,
+        );
+        assert_eq!(state, "XL002");
+
+        // In a layout made by hand, a new field goes under the lowest one.
+        Spi::run("SELECT xila.add_field('books', 'Author')").unwrap();
+        assert_eq!(place_of("books", "author"), serde_json::json!([100, 64, 200, 14]));
+
+        // Someone else may not move anything.
+        become_role("bob");
+        let (state, _) = error_of(
+            r#"SELECT xila.place_widgets('books', 'graphic', '{"year": {"x": 1, "y": 1, "w": 9, "h": 9}}')"#,
+        );
+        assert_eq!(state, "XL004");
+        let (state, _) = error_of("SELECT xila.reset_layout('books', 'graphic')");
+        assert_eq!(state, "XL004");
+
+        // Back to the automatic placement: no rectangle is left, styles are.
+        become_role("ada");
+        Spi::run("SELECT xila.reset_layout('books', 'graphic')").unwrap();
+        assert_eq!(place_of("books", "title"), serde_json::Value::Null);
+        assert_eq!(place_of("books", "new"), serde_json::Value::Null);
+        let screen = json("SELECT xila.open_stack('books')");
+        assert_eq!(widget_of(&screen, "new")["layout"]["graphic"]["style"]["variant"], "primary");
+        assert_eq!(widget_of(&screen, "title")["layout"], serde_json::json!({}));
+        // And a new field gets no rectangle either.
+        Spi::run("SELECT xila.add_field('books', 'Publisher')").unwrap();
+        assert_eq!(place_of("books", "publisher"), serde_json::Value::Null);
+    }
+
+    #[pg_test]
+    fn texts_and_buttons_are_added_changed_and_removed() {
+        create_books_as_ada();
+        assert_eq!(
+            text(
+                r#"SELECT xila.add_widget('books', 'text',
+                       '{"text": "Lent to {title}", "placement": {"x": 20, "y": 90, "w": 120, "h": 11}}')"#
+            )
+            .as_deref(),
+            Some("text1")
+        );
+        assert_eq!(
+            text(
+                r#"SELECT xila.add_widget('books', 'button', '{"label": "Go", "action": "next"}')"#
+            )
+            .as_deref(),
+            Some("button1")
+        );
+        assert_eq!(text("SELECT xila.add_widget('books', 'text')").as_deref(), Some("text2"));
+
+        let screen = json("SELECT xila.open_stack('books')");
+        let note = widget_of(&screen, "text1");
+        assert_eq!(note["kind"], "text");
+        assert_eq!(note["props"]["template"], "Lent to {title}");
+        assert_eq!(note["layout"]["graphic"]["w"], 120);
+        let go = widget_of(&screen, "button1");
+        assert_eq!((go["label"].as_str(), go["action"].as_str()), (Some("Go"), Some("next")));
+        assert_eq!(json("SELECT xila.card('books')")["texts"]["text1"], "Lent to Candide");
+
+        // Changing them.
+        Spi::run(
+            r#"SELECT xila.set_widget('books', 'text1', '{"text": "On loan"}');
+               SELECT xila.set_widget('books', 'button1',
+                          '{"label": "Back", "action": "previous", "main": true}');"#,
+        )
+        .unwrap();
+        let screen = json("SELECT xila.open_stack('books')");
+        assert_eq!(widget_of(&screen, "text1")["props"]["template"], "On loan");
+        let back = widget_of(&screen, "button1");
+        assert_eq!(
+            (back["label"].as_str(), back["action"].as_str()),
+            (Some("Back"), Some("previous"))
+        );
+        assert_eq!(back["layout"]["graphic"]["style"]["variant"], "primary");
+        Spi::run(r#"SELECT xila.set_widget('books', 'button1', '{"main": false, "action": ""}')"#)
+            .unwrap();
+        let back = widget_of(&json("SELECT xila.open_stack('books')"), "button1");
+        assert_eq!(back.get("action"), None);
+        assert_eq!(back["layout"]["graphic"]["style"].get("variant"), None);
+
+        // A field keeps the rules of fields: its label and "required".
+        Spi::run(r#"SELECT xila.set_widget('books', 'year', '{"label": "Published"}')"#).unwrap();
+        assert_eq!(
+            text("SELECT label FROM xila.field WHERE stack = 'books' AND name = 'year'").as_deref(),
+            Some("Published")
+        );
+        let (state, _) =
+            error_of(r#"SELECT xila.set_widget('books', 'text1', '{"required": true}')"#);
+        assert_eq!(state, "XL003");
+        let (state, _) = error_of(r#"SELECT xila.set_widget('books', 'year', '{"text": "x"}')"#);
+        assert_eq!(state, "XL003");
+        let (state, message) =
+            error_of(r#"SELECT xila.set_widget('books', 'button1', '{"action": "explode"}')"#);
+        assert_eq!(state, "XL003");
+        assert_eq!(message, "This stack has no action named “explode”.");
+        let (state, _) = error_of("SELECT xila.add_widget('books', 'field')");
+        assert_eq!(state, "XL003");
+
+        // Removing: a text simply goes; a field goes with its column.
+        Spi::run(
+            "SELECT xila.remove_widget('books', 'text1'); SELECT xila.remove_widget('books', 'year');",
+        )
+        .unwrap();
+        assert_eq!(number("SELECT count(*) FROM xila.widget WHERE name = 'text1'"), 0);
+        assert_eq!(fields_of("books"), serde_json::json!(["title"]));
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'books' AND column_name = 'year'"
+            ),
+            0
+        );
+    }
+
+    #[pg_test]
+    fn a_text_or_a_button_can_belong_to_a_single_card() {
+        create_books_as_ada();
+        let first = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+        let last =
+            json("SELECT xila.card('books', NULL, 'last')")["key"].as_str().unwrap().to_owned();
+
+        let name = text(&format!(
+            r#"SELECT xila.add_widget('books', 'text', '{{"text": "Signed copy"}}', '{first}')"#
+        ))
+        .unwrap();
+        assert_eq!(name, "text1");
+        // It is on its card, and on no other.
+        let on_first = json(&format!("SELECT xila.card('books', '{first}', 'at')->'widgets'"));
+        assert_eq!(on_first[0]["name"], "text1");
+        assert_eq!(on_first[0]["layer"], "card");
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{last}', 'at')->'widgets'")),
+            serde_json::json!([])
+        );
+        assert!(json("SELECT xila.open_stack('books')")["widgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["name"] != "text1"));
+
+        // It is placed like any other, on its card.
+        Spi::run(&format!(
+            r#"SELECT xila.place_widgets('books', 'graphic',
+                   '{{"text1": {{"x": 30, "y": 80, "w": 90, "h": 11}}}}', '{first}')"#
+        ))
+        .unwrap();
+        let on_first = json(&format!("SELECT xila.card('books', '{first}', 'at')->'widgets'"));
+        assert_eq!(on_first[0]["layout"]["graphic"]["y"], 80);
+        // Without the card, it is not found.
+        let (state, _) = error_of(r#"SELECT xila.set_widget('books', 'text1', '{"text": "x"}')"#);
+        assert_eq!(state, "XL002");
+
+        // Moved to the background, it is on every card; and back.
+        Spi::run(&format!(
+            r#"SELECT xila.set_widget('books', 'text1', '{{"layer": "background"}}', '{first}')"#
+        ))
+        .unwrap();
+        assert_eq!(
+            widget_of(&json("SELECT xila.open_stack('books')"), "text1")["layer"],
+            "background"
+        );
+        Spi::run(&format!(
+            r#"SELECT xila.set_widget('books', 'text1', '{{"layer": "card"}}', '{last}')"#
+        ))
+        .unwrap();
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{last}', 'at')->'widgets'"))[0]["name"],
+            "text1"
+        );
+        // A field belongs to the background, always.
+        let (state, _) = error_of(&format!(
+            r#"SELECT xila.set_widget('books', 'year', '{{"layer": "card"}}', '{first}')"#
+        ));
+        assert_eq!(state, "XL003");
+    }
+
+    #[pg_test]
+    fn the_window_gets_the_editor_and_the_terminal_the_forms() {
+        create_books_as_ada();
+        assert_eq!(
+            json(r#"SELECT xila.act('books', 'author', '{"renderer": "graphic"}')"#),
+            serde_json::json!([{ "do": "design", "stack": "books" }])
+        );
+        assert_eq!(
+            json(
+                r#"SELECT xila.act('stacks', 'author', '{"renderer": "graphic", "row": "books"}')"#
+            ),
+            serde_json::json!([{ "do": "design", "stack": "books" }])
+        );
+        assert_eq!(
+            json(r#"SELECT xila.act('books', 'author', '{"renderer": "text"}')"#),
+            serde_json::json!([{ "do": "show", "stack": "author", "card": "books" }])
+        );
+        // From the editor, the forms and the history of the stack.
+        assert_eq!(
+            json(r#"SELECT xila.act('books', 'author_form', '{"renderer": "graphic"}')"#),
+            serde_json::json!([{ "do": "show", "stack": "author", "card": "books" }])
+        );
+        assert_eq!(
+            json("SELECT xila.act('books', 'stack_history')"),
+            serde_json::json!([{ "do": "show", "stack": "history", "card": "books" }])
+        );
+        assert_eq!(
+            json("SELECT xila.act('books', 'new_field')"),
+            serde_json::json!([
+                { "do": "show", "stack": "field" },
+                { "do": "new", "values": { "stack": "books", "type": "text" } }
+            ])
+        );
+        // A stack created in the window opens in the editor.
+        let effects = json(
+            r#"SELECT xila.act('new_stack', 'create',
+                   '{"renderer": "graphic", "dirty": {"title": "Maps"}}')"#,
+        );
+        assert_eq!(effects[1], serde_json::json!({ "do": "design", "stack": "maps" }));
+    }
+
+    #[pg_test]
+    fn the_editor_acts_through_actions() {
+        create_books_as_ada();
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+
+        // Moving.
+        let effects = json(
+            r#"SELECT xila.act('books', 'place_widgets', '{"input": {"placements":
+                   {"year": {"x": 100, "y": 64, "w": 60, "h": 14}}}}')"#,
+        );
+        assert_eq!(effects, serde_json::json!([{ "do": "reload" }]));
+        assert_eq!(place_of("books", "year"), serde_json::json!([100, 64, 60, 14]));
+
+        // A new text, on the background or on the card on screen.
+        let effects = json(
+            r#"SELECT xila.act('books', 'add_widget', '{"input": {"kind": "text",
+                   "props": {"placement": {"x": 20, "y": 90, "w": 60, "h": 11}}}}')"#,
+        );
+        assert_eq!(
+            effects,
+            serde_json::json!([{ "do": "reload" }, { "do": "focus", "widget": "text1" }])
+        );
+        let effects = json(&format!(
+            r#"SELECT xila.act('books', 'add_widget',
+                   '{{"card": "{key}", "input": {{"kind": "button", "layer": "card"}}}}')"#
+        ));
+        assert_eq!(effects[1]["widget"], "button1");
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{key}', 'at')->'widgets'"))[0]["name"],
+            "button1"
+        );
+        let (state, _) = error_of(
+            r#"SELECT xila.act('books', 'add_widget', '{"input": {"kind": "text", "layer": "card"}}')"#,
+        );
+        assert_eq!(state, "XL003", "there is no card to put it on");
+
+        // Changing a widget of the card on screen.
+        Spi::run(&format!(
+            r#"SELECT xila.act('books', 'set_widget', '{{"card": "{key}",
+                   "input": {{"widget": "button1", "changes": {{"label": "Lend"}}}}}}')"#
+        ))
+        .unwrap();
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{key}', 'at')->'widgets'"))[0]["label"],
+            "Lend"
+        );
+
+        // Removing asks first; for a field it says what will be lost.
+        let asked =
+            json(r#"SELECT xila.act('books', 'remove_widget', '{"input": {"widget": "text1"}}')"#);
+        assert_eq!(asked[0]["text"], "Take “text1” off the screen?");
+        let asked =
+            json(r#"SELECT xila.act('books', 'remove_widget', '{"input": {"widget": "year"}}')"#);
+        assert_eq!(
+            asked[0]["text"],
+            "Remove the field “Year”? 2 cards have a value for it. History can bring it back."
+        );
+        let effects = json(
+            r#"SELECT xila.act('books', 'remove_widget',
+                   '{"confirmed": true, "input": {"widget": "year"}}')"#,
+        );
+        assert_eq!(effects[1]["text"], "“year” removed.");
+        assert_eq!(fields_of("books"), serde_json::json!(["title"]));
+
+        // Resetting the layout asks too.
+        let asked = json("SELECT xila.act('books', 'reset_layout')");
+        assert_eq!(asked[0]["label"], "Reset");
+        Spi::run(r#"SELECT xila.act('books', 'reset_layout', '{"confirmed": true}')"#).unwrap();
+        assert_eq!(place_of("books", "text1"), serde_json::Value::Null);
+
+        // (A test is one transaction, hence one line of history: the line
+        // that created the stack, which a key does not undo. Undoing step by
+        // step is checked by the integration tests.)
+        let (state, message) = error_of("SELECT xila.act('books', 'undo')");
+        assert_eq!((state.as_str(), message.as_str()), ("XL003", "There is nothing left to undo."));
     }
 
     #[pg_test]

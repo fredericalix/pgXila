@@ -290,3 +290,110 @@ fn author_mode_is_kept_from_those_who_may_not_use_it() {
 
     forget_the_test_stack();
 }
+
+/// Opens the test stack from the list of stacks.
+fn open_the_test_stack(session: &mut Session<Server>) {
+    session.activate("stacks");
+    select(session, "list", "title", "Test books");
+    session.activate("list");
+    assert_eq!(session.view().stack(), STACK, "{:?}", session.message());
+}
+
+/// The rectangle the server holds for a widget in the window, if any.
+fn place_of(session: &Session<Server>, widget: &str) -> Option<(i32, i32)> {
+    let widget = session.view().widgets().find(|w| w.name == widget)?;
+    widget.layout.get("graphic").filter(|place| place.w > 0).map(|place| (place.x, place.y))
+}
+
+#[test]
+#[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
+fn undo_goes_back_one_change_at_a_time() {
+    forget_the_test_stack();
+    execute_as_author("SELECT xila.create_stack('Test books')");
+    execute_as_author(&format!("SELECT xila.add_field('{STACK}', 'Title')"));
+    execute_as_author(&format!("SELECT xila.add_field('{STACK}', 'Year', 'number')"));
+    let mut session = session_as("PGXILA_TEST_AUTHOR");
+    open_the_test_stack(&mut session);
+
+    // Three changes, as the visual editor makes them: each is an action, and
+    // so a transaction and a line of history.
+    session.run_with(
+        "place_widgets",
+        serde_json::json!({ "placements": {
+            "title": { "x": 100, "y": 44, "w": 200, "h": 14 },
+            "year": { "x": 100, "y": 64, "w": 60, "h": 14 }
+        } }),
+    );
+    assert_eq!(place_of(&session, "year"), Some((100, 64)), "{:?}", session.message());
+    session.run_with(
+        "add_widget",
+        serde_json::json!({ "kind": "text", "props": {
+            "placement": { "x": 20, "y": 90, "w": 90, "h": 14 }
+        } }),
+    );
+    assert_eq!(session.view().focus.as_deref(), Some("text1"), "the new widget is pointed at");
+    session.run_with(
+        "set_widget",
+        serde_json::json!({ "widget": "text1", "changes": { "text": "Hello" } }),
+    );
+    let template = |session: &Session<Server>| {
+        session.view().widgets().find(|w| w.name == "text1").map(|w| w.props["template"].clone())
+    };
+    assert_eq!(template(&session), Some("Hello".into()));
+
+    // Undo walks back through them, newest first.
+    session.run("undo");
+    assert_eq!(session.message(), Some("Undone: Text of “text1” changed."));
+    assert_eq!(template(&session), Some("Text".into()));
+    session.run("undo");
+    assert_eq!(session.message(), Some("Undone: “text1” added to the screen."));
+    assert_eq!(template(&session), None);
+    session.run("undo");
+    assert_eq!(session.message(), Some("Undone: Layout changed."));
+    assert_eq!(place_of(&session, "year"), None);
+
+    // A new change starts over from the most recent line.
+    session.run_with(
+        "place_widgets",
+        serde_json::json!({ "placements": { "title": { "x": 120, "y": 44, "w": 200, "h": 14 } } }),
+    );
+    assert_eq!(place_of(&session, "title"), Some((120, 44)));
+    session.run("undo");
+    assert_eq!(session.message(), Some("Undone: “title” moved."));
+    assert_eq!(place_of(&session, "title"), None);
+
+    // Every undo is in the history of the stack, where it can be rewound.
+    session.run("stack_history");
+    assert_eq!(session.view().stack(), "history");
+    let lines = column(&session, "changes", "summary");
+    assert_eq!(lines[0], "Screen rewound (1 change undone)");
+    assert_eq!(lines[1], "“title” moved");
+    assert!(lines.contains(&"Layout changed".to_string()));
+    session.press("F12");
+
+    // The change of someone else is not undone with a key.
+    let mut editor = session_as("PGXILA_TEST_EDITOR");
+    open_the_test_stack(&mut editor);
+    assert!(editor.view().screen.stack.may_edit, "a member of the owner role may edit");
+    editor.run_with(
+        "place_widgets",
+        serde_json::json!({ "placements": { "year": { "x": 8, "y": 120, "w": 60, "h": 14 } } }),
+    );
+    assert_eq!(editor.message(), None);
+    session.run("undo");
+    assert_eq!(
+        session.message(),
+        Some(
+            format!(
+                "The last change was made by {}: use the history of the stack to rewind it.",
+                var("PGXILA_TEST_EDITOR")
+            )
+            .as_str()
+        )
+    );
+    // Their own, they may undo.
+    editor.run("undo");
+    assert_eq!(editor.message(), Some("Undone: “year” moved."));
+
+    forget_the_test_stack();
+}

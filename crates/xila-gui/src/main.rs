@@ -215,6 +215,10 @@ fn translate(key: &WindowKey, text: Option<&str>, shift: bool, command: bool) ->
                 NamedKey::Enter => Key::Enter,
                 NamedKey::Tab if shift => Key::BackTab,
                 NamedKey::Tab => Key::Tab,
+                NamedKey::ArrowUp if shift => Key::ShiftUp,
+                NamedKey::ArrowDown if shift => Key::ShiftDown,
+                NamedKey::ArrowLeft if shift => Key::ShiftLeft,
+                NamedKey::ArrowRight if shift => Key::ShiftRight,
                 NamedKey::ArrowUp => Key::Up,
                 NamedKey::ArrowDown => Key::Down,
                 NamedKey::ArrowLeft => Key::Left,
@@ -228,6 +232,10 @@ fn translate(key: &WindowKey, text: Option<&str>, shift: bool, command: bool) ->
                 // Other named keys carry no text worth typing.
                 _ => return Vec::new(),
             }]
+        }
+        // Control-Z, or Command-Z on a Mac, undoes.
+        WindowKey::Character(letter) if command && letter.eq_ignore_ascii_case("z") => {
+            vec![Key::Undo]
         }
         _ if command => Vec::new(),
         _ => typed(text.unwrap_or_default()),
@@ -297,6 +305,13 @@ impl ApplicationHandler for Shell {
                 self.pointer = size.and_then(|size| {
                     Viewport::fit(size.width, size.height).to_screen(position.x, position.y)
                 });
+                // Something may be following the pointer: a widget dragged in
+                // the visual editor.
+                if let Some((x, y)) = self.pointer {
+                    if self.app.pointer_move(x, y) {
+                        self.touched();
+                    }
+                }
             }
             WindowEvent::CursorLeft { .. } => self.pointer = None,
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
@@ -388,6 +403,10 @@ mod tests {
             [Key::Backspace]
         );
         assert_eq!(translate(&named(NamedKey::ArrowDown), None, false, false), [Key::Down]);
+        assert_eq!(translate(&named(NamedKey::ArrowDown), None, true, false), [Key::ShiftDown]);
+        // Control-Z or Command-Z undoes; without the modifier it is a letter.
+        assert_eq!(translate(&character("z"), Some("z"), false, true), [Key::Undo]);
+        assert_eq!(translate(&character("z"), Some("z"), false, false), [Key::Char('z')]);
         // Escape is a key of its own, not the character it comes with.
         assert_eq!(
             translate(&named(NamedKey::Escape), Some("\u{1b}"), false, false),

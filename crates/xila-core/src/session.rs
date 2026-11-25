@@ -35,6 +35,8 @@ pub struct View {
     pub card: Card,
     /// True while the user fills in a card that is not saved yet.
     pub is_new: bool,
+    /// True while the stack is open in the visual editor rather than browsed.
+    pub designing: bool,
     /// What the user typed, by column.
     pub edits: BTreeMap<String, String>,
     pub grids: BTreeMap<String, GridState>,
@@ -107,7 +109,12 @@ impl View {
     }
 
     /// What the server needs to know about this view to run an action.
-    fn context(&self, confirmed: bool) -> Context {
+    fn context(
+        &self,
+        confirmed: bool,
+        renderer: &str,
+        input: Option<serde_json::Value>,
+    ) -> Context {
         // The focused grid decides the selected row; a single grid needs no focus.
         let grid = self.focus.as_ref().and_then(|name| self.grids.get(name)).or_else(|| {
             if self.grids.len() == 1 {
@@ -121,6 +128,8 @@ impl View {
             dirty: self.dirty(),
             row: grid.and_then(|g| g.selected_key()).map(str::to_owned),
             confirmed,
+            renderer: renderer.to_owned(),
+            input,
         }
     }
 }
@@ -131,8 +140,10 @@ pub struct Question {
     pub text: String,
     /// What accepting does, in a word: "Delete".
     pub label: String,
-    /// The action to run again once the user has accepted.
+    /// The action to run again once the user has accepted, with what the
+    /// tool that ran it had to say.
     action: String,
+    input: Option<serde_json::Value>,
 }
 
 pub struct Session<A: Api> {
@@ -145,6 +156,8 @@ pub struct Session<A: Api> {
     images: BTreeMap<String, Option<Image>>,
     message: Option<String>,
     question: Option<Question>,
+    /// Which client this is, for the server: `text` unless said otherwise.
+    renderer: &'static str,
     quit: bool,
 }
 
@@ -165,6 +178,7 @@ impl<A: Api> Session<A> {
             images: BTreeMap::new(),
             message: None,
             question: None,
+            renderer: "text",
             quit: false,
         };
         session.fetch_images();
@@ -239,9 +253,20 @@ impl<A: Api> Session<A> {
     pub fn answer(&mut self, accepted: bool) {
         if let Some(question) = self.question.take() {
             if accepted {
-                self.perform(&question.action, true);
+                self.perform(&question.action, true, question.input);
             }
         }
+    }
+
+    /// Says that this client draws in a window. The server then answers
+    /// author mode with the visual editor instead of the forms.
+    pub fn be_graphic(&mut self) {
+        self.renderer = "graphic";
+    }
+
+    /// Leaves the visual editor: the stack is browsed again.
+    pub fn stop_designing(&mut self) {
+        self.view_mut().designing = false;
     }
 
     /// Changes a field that only takes some values to the next of them, or
@@ -313,16 +338,22 @@ impl<A: Api> Session<A> {
 
     /// Asks the server to run an action and applies the effects it answers.
     pub fn run(&mut self, action: &str) {
-        self.perform(action, false);
+        self.perform(action, false, None);
     }
 
-    fn perform(&mut self, action: &str, confirmed: bool) {
+    /// Runs an action for a tool of the client, which says what it wants in
+    /// `input`.
+    pub fn run_with(&mut self, action: &str, input: serde_json::Value) {
+        self.perform(action, false, Some(input));
+    }
+
+    fn perform(&mut self, action: &str, confirmed: bool, input: Option<serde_json::Value>) {
         self.message = None;
         self.question = None;
         let stack = self.view().stack().to_owned();
-        let context = self.view().context(confirmed);
+        let context = self.view().context(confirmed, self.renderer, input.clone());
         let outcome = self.api.act(&stack, action, &context).and_then(|effects| {
-            effects.into_iter().try_for_each(|effect| self.apply(effect, action))
+            effects.into_iter().try_for_each(|effect| self.apply(effect, action, &input))
         });
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
@@ -331,27 +362,37 @@ impl<A: Api> Session<A> {
     }
 
     /// Applies one effect of an action.
-    fn apply(&mut self, effect: Effect, action: &str) -> Result<(), ApiError> {
+    fn apply(
+        &mut self,
+        effect: Effect,
+        action: &str,
+        input: &Option<serde_json::Value>,
+    ) -> Result<(), ApiError> {
         match effect {
             Effect::Show { stack, card } => {
                 if stack == self.view().stack() {
                     self.load_card(card.as_deref(), Move::At)?;
-                } else if let Some(below) = self.views.iter().rposition(|v| v.stack() == stack) {
-                    // The stack is already open underneath: go back to it
-                    // rather than open it a second time.
-                    self.views.truncate(below + 1);
-                    // Its definition may have changed while it was covered.
-                    self.reopen()?;
-                    if let Some(key) = card {
-                        self.load_card(Some(&key), Move::At)?;
-                    }
                 } else {
-                    let view = open(&mut self.api, &stack, card.as_deref())?;
-                    self.views.push(view);
+                    self.bring_up(&stack, card.as_deref())?;
                 }
             }
+            Effect::Design { stack } => {
+                if self.renderer != "graphic" {
+                    self.message = Some("The visual editor needs the graphical client.".into());
+                    return Ok(());
+                }
+                // The stack being browsed is edited where it is, on the card
+                // it shows.
+                if stack != self.view().stack() {
+                    self.bring_up(&stack, None)?;
+                }
+                let view = self.view_mut();
+                view.designing = true;
+                view.edits.clear();
+                view.focus = None;
+            }
             Effect::Back => self.back()?,
-            Effect::Reload => self.refresh()?,
+            Effect::Reload => self.reopen()?,
             Effect::Focus { widget } => self.view_mut().focus = Some(widget),
             Effect::Message { text } => self.message = Some(text),
             Effect::New { values } => {
@@ -365,7 +406,8 @@ impl<A: Api> Session<A> {
                 self.load_grids()?;
             }
             Effect::Confirm { text, label } => {
-                self.question = Some(Question { text, label, action: action.to_owned() });
+                self.question =
+                    Some(Question { text, label, action: action.to_owned(), input: input.clone() });
             }
             Effect::Select { row } => {
                 for grid in self.view_mut().grids.values_mut() {
@@ -375,6 +417,23 @@ impl<A: Api> Session<A> {
                 }
             }
             Effect::Quit => self.quit = true,
+        }
+        Ok(())
+    }
+
+    /// Puts a stack other than the current one on screen: back to it when it
+    /// is already open underneath, rather than opened a second time.
+    fn bring_up(&mut self, stack: &str, card: Option<&str>) -> Result<(), ApiError> {
+        if let Some(below) = self.views.iter().rposition(|v| v.stack() == stack) {
+            self.views.truncate(below + 1);
+            // Its definition may have changed while it was covered.
+            self.reopen()?;
+            if let Some(key) = card {
+                self.load_card(Some(key), Move::At)?;
+            }
+        } else {
+            let view = open(&mut self.api, stack, card)?;
+            self.views.push(view);
         }
         Ok(())
     }
@@ -511,7 +570,15 @@ fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, Ap
         let page = api.grid_rows(stack, &widget.name, card.key.as_deref())?;
         grids.insert(widget.name.clone(), GridState { page, selected: 0 });
     }
-    Ok(View { screen, card, is_new: false, edits: BTreeMap::new(), grids, focus: None })
+    Ok(View {
+        screen,
+        card,
+        is_new: false,
+        designing: false,
+        edits: BTreeMap::new(),
+        grids,
+        focus: None,
+    })
 }
 
 /// What to tell the user about an error.
@@ -739,8 +806,8 @@ mod tests {
             Context {
                 card: Some("1".into()),
                 dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
-                row: None,
-                confirmed: false,
+                renderer: "text".into(),
+                ..Context::default()
             }
         );
     }
@@ -988,6 +1055,70 @@ mod tests {
         session.api.pending.push(Notification::Screen { stack: Some("recipes".into()) });
         assert!(session.poll());
         assert_eq!(session.api.calls, ["card stacks Some(\"1\") at", "grid_rows stacks list"]);
+    }
+
+    #[test]
+    fn the_visual_editor_opens_on_the_stack_in_a_graphical_client() {
+        let design = vec![Effect::Design { stack: "addressbook".into() }];
+        let mut session = on_addressbook(FakeServer::default().answering("author", design.clone()));
+
+        // A client that draws text has no such editor, and says so.
+        session.run("author");
+        assert!(!session.view().designing);
+        assert_eq!(session.message(), Some("The visual editor needs the graphical client."));
+        assert_eq!(session.api.contexts.last().unwrap().renderer, "text");
+
+        // A graphical client says what it is, and edits the stack where it
+        // is, on the card it shows.
+        session.be_graphic();
+        session.edit("city", "Paris".into());
+        session.run("author");
+        assert_eq!(session.api.contexts.last().unwrap().renderer, "graphic");
+        assert!(session.view().designing);
+        assert_eq!(session.view().stack(), "addressbook");
+        assert_eq!(session.view().card.key.as_deref(), Some("1"));
+        assert!(session.view().edits.is_empty(), "nothing is typed in the editor");
+
+        session.stop_designing();
+        assert!(!session.view().designing);
+
+        // From the list of stacks, the stack is opened to be edited.
+        let mut session =
+            Session::start(FakeServer::default().answering("author", design)).unwrap();
+        session.be_graphic();
+        session.run("author");
+        assert_eq!(session.view().stack(), "addressbook");
+        assert!(session.view().designing);
+    }
+
+    #[test]
+    fn a_tool_says_what_it_wants_and_is_asked_again_with_it() {
+        let ask = vec![Effect::Confirm { text: "Take it off?".into(), label: "Remove".into() }];
+        let server = FakeServer::default()
+            .answering("remove_widget", ask)
+            .answering_once_confirmed("remove_widget", vec![Effect::Reload]);
+        let mut session = on_addressbook(server);
+        let input = serde_json::json!({ "widget": "city" });
+
+        session.run_with("remove_widget", input.clone());
+        assert_eq!(session.api.contexts[0].input, Some(input.clone()));
+        assert!(session.question().is_some());
+
+        // Accepting sends the same request again, this time for good.
+        session.api.calls.clear();
+        session.answer(true);
+        let sent = session.api.contexts.last().unwrap();
+        assert!(sent.confirmed);
+        assert_eq!(sent.input, Some(input));
+        // Reloading reads the definition of the screen again, not only the card.
+        assert_eq!(
+            session.api.calls,
+            [
+                "act addressbook remove_widget",
+                "open_stack addressbook",
+                "card addressbook Some(\"1\") at"
+            ]
+        );
     }
 
     #[test]

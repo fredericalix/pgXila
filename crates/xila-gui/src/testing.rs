@@ -19,6 +19,11 @@ pub struct Fake {
     /// The actions asked for, with what the client knew at that time.
     pub actions: Vec<(String, Context)>,
     pub pending: Vec<Notification>,
+    /// What the visual editor did to the address book: the rectangles it
+    /// gave, the widgets it added and those it removed.
+    pub placed: BTreeMap<String, [i32; 4]>,
+    pub added: Vec<serde_json::Value>,
+    pub removed: Vec<String>,
 }
 
 fn desktop() -> Screen {
@@ -67,22 +72,59 @@ fn stacks() -> Screen {
     .unwrap()
 }
 
+impl Fake {
+    /// The address book as the editor left it.
+    fn edited(&self, name: &str) -> Screen {
+        let mut screen = addressbook(name);
+        for widget in &self.added {
+            screen.widgets.push(serde_json::from_value(widget.clone()).unwrap());
+        }
+        screen.widgets.retain(|w| !self.removed.contains(&w.name));
+        for widget in &mut screen.widgets {
+            if let Some([x, y, w, h]) = self.placed.get(&widget.name).copied() {
+                let style =
+                    widget.layout.get("graphic").map(|p| p.style.clone()).unwrap_or_default();
+                let place = xila_core::api::Placement { x, y, w, h, style };
+                widget.layout.insert("graphic".to_owned(), place);
+            }
+        }
+        screen
+    }
+
+    /// The last action asked for, and what the tool said with it.
+    pub fn last(&self) -> (&str, serde_json::Value) {
+        let (name, context) = self.actions.last().expect("an action was asked for");
+        (name.as_str(), context.input.clone().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// How many times an action was asked for.
+    pub fn count(&self, action: &str) -> usize {
+        self.actions.iter().filter(|(name, _)| name == action).count()
+    }
+}
+
 fn addressbook(name: &str) -> Screen {
     serde_json::from_value(serde_json::json!({
-        "stack": { "name": name, "title": "Address book", "kind": "user" },
-        "source": { "has_cards": true, "count": 2 },
+        "stack": { "name": name, "title": "Address book", "kind": "user", "may_edit": true },
+        "source": { "has_cards": true, "count": 2, "managed": true },
         "widgets": [
             { "name": "title", "kind": "text", "ord": 10,
               "props": { "template": "{last_name}, {first_name}", "style": "title" } },
             { "name": "photo", "kind": "image", "ord": 15, "column": "photo" },
-            { "name": "last_name", "kind": "field", "ord": 20, "label": "Last name", "column": "last_name" },
-            { "name": "first_name", "kind": "field", "ord": 30, "label": "First name", "column": "first_name" },
+            { "name": "last_name", "kind": "field", "ord": 20, "label": "Last name",
+              "column": "last_name", "type": "text", "required": true },
+            { "name": "first_name", "kind": "field", "ord": 30, "label": "First name",
+              "column": "first_name", "type": "text", "required": false },
             { "name": "next", "kind": "button", "ord": 90, "label": "Next",
               "action": "next_card",
               "layout": { "graphic": { "x": 0, "y": 0, "w": 0, "h": 0,
                                        "style": { "arrow": "right" } } } }
         ],
-        "actions": [],
+        "actions": [
+            { "name": "next_card", "label": "Next" },
+            { "name": "new_card", "label": "New" },
+            { "name": "undo", "label": "Undo", "for": "editor" }
+        ],
         "keys": [
             { "key": "F3", "label": "Quit", "action": "quit" },
             { "key": "F6", "label": "New", "action": "new_card" },
@@ -226,7 +268,7 @@ impl Api for Fake {
             "stacks" => stacks(),
             "author" => author(),
             "field" => field(),
-            other => addressbook(other),
+            other => self.edited(other),
         })
     }
 
@@ -356,7 +398,59 @@ impl Api for Fake {
             "next_card" => vec![show(stack, Some("2"))],
             "new_card" => vec![Effect::New { values: BTreeMap::new() }],
             "save_card" => vec![Effect::Message { text: "Card saved.".into() }],
-            "author" => vec![show("author", Some("addressbook"))],
+            // The window gets the visual editor, the terminal the forms.
+            "author" if context.renderer == "graphic" => {
+                vec![Effect::Design { stack: "addressbook".into() }]
+            }
+            "author" | "author_form" => vec![show("author", Some("addressbook"))],
+            "place_widgets" => {
+                let input = context.input.clone().unwrap_or_default();
+                for (name, place) in input["placements"].as_object().into_iter().flatten() {
+                    let side = |key: &str| place[key].as_i64().unwrap() as i32;
+                    self.placed.insert(name.clone(), [side("x"), side("y"), side("w"), side("h")]);
+                }
+                vec![Effect::Reload]
+            }
+            "add_widget" => {
+                let input = context.input.clone().unwrap_or_default();
+                let kind = input["kind"].as_str().unwrap().to_owned();
+                let name = format!("{kind}{}", self.added.len() + 1);
+                let mut widget = serde_json::json!({
+                    "name": name, "kind": kind, "ord": 200 + self.added.len(),
+                    "layer": input["layer"],
+                });
+                if kind == "text" {
+                    widget["props"] = serde_json::json!({ "template": "Text" });
+                } else {
+                    widget["label"] = "Button".into();
+                }
+                self.added.push(widget);
+                let place = &input["props"]["placement"];
+                let side = |key: &str| place[key].as_i64().unwrap() as i32;
+                self.placed.insert(name.clone(), [side("x"), side("y"), side("w"), side("h")]);
+                vec![Effect::Reload, Effect::Focus { widget: name }]
+            }
+            "set_widget" => vec![Effect::Reload],
+            "remove_widget" if !context.confirmed => vec![Effect::Confirm {
+                text: "Take it off the screen?".into(),
+                label: "Remove".into(),
+            }],
+            "remove_widget" => {
+                let input = context.input.clone().unwrap_or_default();
+                self.removed.push(input["widget"].as_str().unwrap().to_owned());
+                vec![Effect::Reload, Effect::Message { text: "Removed.".into() }]
+            }
+            "reset_layout" => {
+                self.placed.clear();
+                vec![
+                    Effect::Reload,
+                    Effect::Message { text: "The layout is automatic again.".into() },
+                ]
+            }
+            "undo" => {
+                vec![Effect::Reload, Effect::Message { text: "Undone: “city” moved.".into() }]
+            }
+            "stack_history" => vec![Effect::Message { text: "History.".into() }],
             "edit_field" => vec![show("field", context.row.as_deref())],
             "new_field" => vec![
                 show("field", None),
@@ -402,6 +496,18 @@ pub fn addressbook_session() -> (Session<Fake>, Ui) {
     session.run("open_stacks");
     session.activate("list");
     assert_eq!(session.view().stack(), "addressbook");
+    screen::settle(&mut session, &mut ui, &fonts);
+    (session, ui)
+}
+
+/// A session in the visual editor, on the address book: the client says it
+/// draws in a window, and F11 does the rest.
+pub fn editor_session() -> (Session<Fake>, Ui) {
+    let fonts = Fonts::builtin();
+    let (mut session, mut ui) = addressbook_session();
+    session.be_graphic();
+    session.run("author");
+    assert!(session.view().designing);
     screen::settle(&mut session, &mut ui, &fonts);
     (session, ui)
 }

@@ -474,6 +474,39 @@ BEGIN
 END
 $$;
 
+-- True when the widgets of a background have been placed by hand for a
+-- renderer: at least one of them has a rectangle.
+CREATE FUNCTION xila.has_free_layout(background uuid, wanted text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM xila.layout l JOIN xila.widget w ON w.id = l.widget_id
+        WHERE w.background_id = background AND l.renderer = wanted AND l.w > 0 AND l.h > 0)
+$$;
+
+-- Gives a new field its place in the window when the layout is made by hand:
+-- under the lowest field, with the same left edge and width.
+CREATE FUNCTION xila.place_new_field(bg xila.background, field text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    lowest xila.layout;
+BEGIN
+    IF NOT xila.has_free_layout(bg.id, 'graphic') THEN
+        RETURN;
+    END IF;
+    SELECT l.* INTO lowest
+    FROM xila.layout l JOIN xila.widget w ON w.id = l.widget_id
+    WHERE w.background_id = bg.id AND w.layer = 'background' AND w.kind = 'field'
+      AND l.renderer = 'graphic' AND l.w > 0 AND l.h > 0
+    ORDER BY l.y DESC, l.x
+    LIMIT 1;
+    INSERT INTO xila.layout (widget_id, renderer, x, y, w, h)
+    SELECT w.id, 'graphic', coalesce(lowest.x, 100), coalesce(lowest.y + 20, 44),
+           coalesce(lowest.w, 200), 14
+    FROM xila.widget w
+    WHERE w.background_id = bg.id AND w.layer = 'background' AND w.name = field;
+END
+$$;
+
 -- Adds a field at the end and answers with its name. On a managed stack this
 -- adds a column; name is made from the label when it is not given. On a stack
 -- that shows an existing table, name is a column of that table.
@@ -532,6 +565,9 @@ BEGIN
            coalesce(shown, xila.label_from(col)), col
     FROM xila.widget w
     WHERE w.background_id = bg.id AND w.layer = 'background';
+
+    -- In a layout made by hand, the new field goes under the lowest one.
+    PERFORM xila.place_new_field(bg, col);
 
     -- The first field of a stack becomes the title of its cards.
     UPDATE xila.widget w
@@ -811,8 +847,10 @@ $$;
 --   card    the values of one card, named by card; a deleted card comes back
 --   screen  the definition of the stack, and the columns of its fields
 --   stack   the definition and all the cards
--- Answers with the number of changes undone. All or nothing.
-CREATE FUNCTION xila.rewind(stack text, scope text, since bigint, card text DEFAULT NULL)
+-- Answers with the number of changes undone. All or nothing. This is the
+-- worker of xila.rewind and of xila.undo, which marks its rewinds as undos.
+CREATE FUNCTION xila.do_rewind(stack text, scope text, since bigint, card text,
+                               is_undo boolean)
 RETURNS jsonb
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -911,10 +949,16 @@ BEGIN
         VALUES (coalesce(nullif(current_setting('xila.origin', true), ''), 'user'),
                 target, 'rewind', coalesce(card, scope), 'insert',
                 jsonb_build_object('scope', scope, 'since', since, 'card', card,
-                                   'undone', undone));
+                                   'undone', undone, 'undo', is_undo));
     END IF;
     RETURN jsonb_build_object('undone', undone);
 END
+$$;
+
+CREATE FUNCTION xila.rewind(stack text, scope text, since bigint, card text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE sql AS $$
+    SELECT xila.do_rewind(stack, scope, since, card, false)
 $$;
 
 -- The same, to a moment in time: undoes everything recorded after it.
@@ -926,6 +970,328 @@ LANGUAGE sql AS $$
         coalesce((SELECT min(h.id) FROM xila.history h WHERE h.at > moment),
                  9223372036854775807),
         card)
+$$;
+
+-- Undoes the last change made to the screen of a stack: the most recent line
+-- of its history that is not itself an undo. Called again, it goes one line
+-- further back; any new change starts over from the most recent line.
+--
+-- An undo is a rewind of the screen from that line on. Rewinding from an older
+-- line also takes back the undos made since, and what they had undone: the
+-- changes cancel out, and the screen is as it was before that line.
+--
+-- Only the changes of the current role are undone this way: the History
+-- screen shows who did what before anything of someone else is rewound.
+CREATE FUNCTION xila.undo(stack text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg      xila.background := xila.editable(stack);
+    line    record;
+    reached bigint;        -- every line from this one on is already undone
+    target  record;
+    found   boolean := false;
+    summary text;
+    result  jsonb;
+BEGIN
+    FOR line IN
+        SELECT min(h.id) AS id, min(h.actor::text) AS actor,
+               min((h.after->>'since')::bigint) FILTER (
+                   WHERE h.object_kind = 'rewind'
+                     AND coalesce((h.after->>'undo')::boolean, false)) AS undone_since,
+               bool_or(h.object_kind NOT IN ('card', 'rewind')) AS on_screen,
+               bool_or(h.object_kind = 'stack' AND h.op = 'insert') AS creation
+        FROM xila.history h
+        WHERE h.stack_id = bg.stack_id
+        GROUP BY h.txid
+        ORDER BY 1 DESC
+    LOOP
+        IF line.undone_since IS NOT NULL THEN
+            reached := least(coalesce(reached, line.undone_since), line.undone_since);
+        ELSIF line.on_screen AND (reached IS NULL OR line.id < reached) THEN
+            target := line;
+            found := true;
+            EXIT;
+        END IF;
+    END LOOP;
+
+    -- Creating the stack is not something to undo with a key.
+    IF NOT found OR target.creation THEN
+        RAISE EXCEPTION 'There is nothing left to undo.' USING ERRCODE = 'XL003';
+    END IF;
+    IF target.actor <> session_user::text THEN
+        RAISE EXCEPTION
+            'The last change was made by %: use the history of the stack to rewind it.',
+            target.actor
+            USING ERRCODE = 'XL004';
+    END IF;
+
+    SELECT l.summary INTO summary FROM xila.history_line l WHERE l.id = target.id;
+    result := xila.do_rewind(stack, 'screen', target.id, NULL, true);
+    RETURN result || jsonb_build_object('summary', summary);
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Widgets and their places
+-- ---------------------------------------------------------------------------
+-- What the visual editor does. A widget is named within its stack; one that
+-- belongs to a single card is looked for on the card given, before the
+-- background.
+
+CREATE FUNCTION xila.widget_named(bg xila.background, widget text, card text)
+RETURNS xila.widget
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    result xila.widget;
+BEGIN
+    SELECT w.* INTO result
+    FROM xila.widget w
+    WHERE w.background_id = bg.id AND w.name = widget
+      AND (w.card_key IS NULL OR w.card_key = card)
+    ORDER BY w.card_key NULLS LAST
+    LIMIT 1;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'This screen has nothing named “%”.', widget USING ERRCODE = 'XL002';
+    END IF;
+    RETURN result;
+END
+$$;
+
+-- Sets the rectangle of some widgets for one renderer:
+-- {"city": {"x": 128, "y": 94, "w": 100, "h": 14}}. Styles are kept.
+CREATE FUNCTION xila.place_widgets(stack text, renderer text, placements jsonb,
+                                   card text DEFAULT NULL)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg      xila.background := xila.editable(stack);
+    wanted  text := renderer;
+    entry   record;
+    w       xila.widget;
+    box     integer[];
+    limits  integer[] := CASE renderer WHEN 'text' THEN ARRAY[80, 24] ELSE ARRAY[480, 300] END;
+BEGIN
+    IF wanted IS NULL OR wanted NOT IN ('text', 'graphic') THEN
+        RAISE EXCEPTION 'Unknown renderer: %.', wanted USING ERRCODE = 'XL003';
+    END IF;
+    FOR entry IN SELECT e.key, e.value FROM jsonb_each(coalesce(placements, '{}')) e LOOP
+        w := xila.widget_named(bg, entry.key, card);
+        BEGIN
+            box := ARRAY[(entry.value->>'x')::integer, (entry.value->>'y')::integer,
+                         (entry.value->>'w')::integer, (entry.value->>'h')::integer];
+        EXCEPTION WHEN data_exception THEN
+            box := NULL;
+        END;
+        IF box IS NULL OR array_position(box, NULL) IS NOT NULL
+           OR box[1] < 0 OR box[2] < 0 OR box[3] < 1 OR box[4] < 1
+           OR box[1] + box[3] > limits[1] OR box[2] + box[4] > limits[2] THEN
+            RAISE EXCEPTION 'The place given to “%” does not fit on the screen.', entry.key
+                USING ERRCODE = 'XL003';
+        END IF;
+        INSERT INTO xila.layout AS l (widget_id, renderer, x, y, w, h)
+        VALUES (w.id, wanted, box[1], box[2], box[3], box[4])
+        ON CONFLICT ON CONSTRAINT layout_pkey
+        DO UPDATE SET x = excluded.x, y = excluded.y, w = excluded.w, h = excluded.h;
+    END LOOP;
+END
+$$;
+
+-- Forgets every rectangle of a renderer: the placement is automatic again.
+-- Styles are kept.
+CREATE FUNCTION xila.reset_layout(stack text, renderer text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg     xila.background := xila.editable(stack);
+    wanted text := renderer;
+BEGIN
+    DELETE FROM xila.layout l
+    USING xila.widget w
+    WHERE w.id = l.widget_id AND w.background_id = bg.id
+      AND l.renderer = wanted AND l.style = '{}';
+    UPDATE xila.layout l
+    SET x = 0, y = 0, w = 0, h = 0
+    FROM xila.widget w
+    WHERE w.id = l.widget_id AND w.background_id = bg.id
+      AND l.renderer = wanted AND (l.w <> 0 OR l.h <> 0 OR l.x <> 0 OR l.y <> 0);
+END
+$$;
+
+-- The action of a stack by its name: one of its own, or one shared by every
+-- screen. An empty name is no action.
+CREATE FUNCTION xila.action_named(bg xila.background, action text) RETURNS uuid
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    result uuid;
+BEGIN
+    IF coalesce(action, '') = '' THEN
+        RETURN NULL;
+    END IF;
+    SELECT a.id INTO result
+    FROM xila.action a
+    WHERE a.name = action AND (a.background_id = bg.id OR a.background_id IS NULL)
+    ORDER BY a.background_id NULLS LAST
+    LIMIT 1;
+    IF result IS NULL THEN
+        RAISE EXCEPTION 'This stack has no action named “%”.', action
+            USING ERRCODE = 'XL003', COLUMN = 'action';
+    END IF;
+    RETURN result;
+END
+$$;
+
+-- Adds a text or a button and answers with its name. props may hold "label",
+-- "text" (a template, for a text), "action" (the name of an action of the
+-- stack, for a button) and "placement" (a rectangle for the window). With
+-- card, the widget belongs to that card only.
+CREATE FUNCTION xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}',
+                                card text DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg       xila.background := xila.editable(stack);
+    wanted   text := kind;
+    given    jsonb := coalesce(props, '{}');
+    new_name text;
+    new_id   uuid;
+    n        integer := 0;
+BEGIN
+    IF wanted IS NULL OR wanted NOT IN ('text', 'button') THEN
+        RAISE EXCEPTION
+            'Only texts and buttons are added this way. A field is added with its own dialog.'
+            USING ERRCODE = 'XL003';
+    END IF;
+    IF card IS NOT NULL AND xila.source_of(bg) IS NULL THEN
+        RAISE EXCEPTION 'This stack has no cards.' USING ERRCODE = 'XL003';
+    END IF;
+
+    -- text1, text2... : the first name that nothing on the screen has.
+    LOOP
+        n := n + 1;
+        new_name := wanted || n;
+        EXIT WHEN NOT EXISTS (
+            SELECT FROM xila.widget w WHERE w.background_id = bg.id AND w.name = new_name);
+    END LOOP;
+
+    INSERT INTO xila.widget (background_id, layer, card_key, name, kind, ord, label, action_id,
+                             props)
+    SELECT bg.id, CASE WHEN card IS NULL THEN 'background' ELSE 'card' END, card, new_name,
+           wanted, coalesce(max(w.ord), 0) + 10,
+           CASE WHEN wanted = 'button' THEN coalesce(nullif(btrim(given->>'label'), ''), 'Button')
+           END,
+           CASE WHEN wanted = 'button' THEN xila.action_named(bg, given->>'action') END,
+           CASE WHEN wanted = 'text'
+                THEN jsonb_build_object('template', coalesce(given->>'text', 'Text'))
+                ELSE '{}'::jsonb END
+    FROM xila.widget w
+    WHERE w.background_id = bg.id
+    RETURNING id INTO new_id;
+
+    IF given ? 'placement' THEN
+        PERFORM xila.place_widgets(stack, 'graphic',
+                                   jsonb_build_object(new_name, given->'placement'), card);
+    END IF;
+    RETURN new_name;
+END
+$$;
+
+-- Changes a widget: {"label": "…", "text": "…", "action": "next", "main":
+-- true, "required": true, "layer": "card"}. "layer" moves a text or a button
+-- between the background and the card given.
+CREATE FUNCTION xila.set_widget(stack text, widget text, changes jsonb,
+                                card text DEFAULT NULL)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg       xila.background := xila.editable(stack);
+    w        xila.widget := xila.widget_named(bg, widget, card);
+    is_field boolean := w.kind = 'field' AND w.bound_column IS NOT NULL AND w.card_key IS NULL;
+    unknown  text;
+    to_layer text;
+BEGIN
+    SELECT k INTO unknown FROM jsonb_object_keys(changes) k
+    WHERE k NOT IN ('label', 'text', 'action', 'main', 'required', 'layer') LIMIT 1;
+    IF unknown IS NOT NULL THEN
+        RAISE EXCEPTION 'A widget has no property “%”.', unknown USING ERRCODE = 'XL003';
+    END IF;
+
+    -- What makes a field a field goes through the functions of fields.
+    IF is_field AND changes ?| ARRAY['label', 'required'] THEN
+        PERFORM xila.set_field(stack, w.name, (
+            SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(changes) e
+            WHERE e.key IN ('label', 'required')));
+    ELSIF changes ? 'required' THEN
+        RAISE EXCEPTION 'Only a field can be required.' USING ERRCODE = 'XL003';
+    ELSIF changes ? 'label' THEN
+        UPDATE xila.widget SET label = nullif(btrim(changes->>'label'), '') WHERE id = w.id;
+    END IF;
+
+    IF changes ? 'text' THEN
+        IF w.kind <> 'text' THEN
+            RAISE EXCEPTION 'Only a text has a text.' USING ERRCODE = 'XL003';
+        END IF;
+        UPDATE xila.widget x
+        SET props = x.props || jsonb_build_object('template', coalesce(changes->>'text', ''))
+        WHERE x.id = w.id;
+    END IF;
+
+    IF changes ? 'action' THEN
+        IF w.kind <> 'button' THEN
+            RAISE EXCEPTION 'Only a button has an action.' USING ERRCODE = 'XL003';
+        END IF;
+        UPDATE xila.widget SET action_id = xila.action_named(bg, changes->>'action')
+        WHERE id = w.id;
+    END IF;
+
+    IF changes ? 'main' THEN
+        IF w.kind <> 'button' THEN
+            RAISE EXCEPTION 'Only a button can be the main button.' USING ERRCODE = 'XL003';
+        END IF;
+        IF coalesce((changes->>'main')::boolean, false) THEN
+            INSERT INTO xila.layout AS l (widget_id, renderer, style)
+            VALUES (w.id, 'graphic', '{"variant": "primary"}')
+            ON CONFLICT ON CONSTRAINT layout_pkey
+            DO UPDATE SET style = l.style || '{"variant": "primary"}';
+        ELSE
+            UPDATE xila.layout l SET style = l.style - 'variant'
+            WHERE l.widget_id = w.id AND l.renderer = 'graphic';
+        END IF;
+    END IF;
+
+    IF changes ? 'layer' THEN
+        to_layer := changes->>'layer';
+        IF w.kind NOT IN ('text', 'button') OR w.bound_column IS NOT NULL THEN
+            RAISE EXCEPTION 'Only a text or a button can belong to a single card.'
+                USING ERRCODE = 'XL003';
+        END IF;
+        IF to_layer = 'card' THEN
+            IF card IS NULL THEN
+                RAISE EXCEPTION 'There is no card to put it on.' USING ERRCODE = 'XL003';
+            END IF;
+            UPDATE xila.widget SET layer = 'card', card_key = card WHERE id = w.id;
+        ELSIF to_layer = 'background' THEN
+            UPDATE xila.widget SET layer = 'background', card_key = NULL WHERE id = w.id;
+        ELSE
+            RAISE EXCEPTION 'Unknown layer: %.', to_layer USING ERRCODE = 'XL003';
+        END IF;
+    END IF;
+END
+$$;
+
+-- Removes a widget. A field is removed as by xila.remove_field: on a managed
+-- stack its column goes with it.
+CREATE FUNCTION xila.remove_widget(stack text, widget text, card text DEFAULT NULL)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg xila.background := xila.editable(stack);
+    w  xila.widget := xila.widget_named(bg, widget, card);
+BEGIN
+    IF w.bound_column IS NOT NULL AND w.card_key IS NULL THEN
+        PERFORM xila.remove_field(stack, w.name);
+    ELSE
+        DELETE FROM xila.widget WHERE id = w.id;
+    END IF;
+END
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -983,7 +1349,8 @@ CREATE VIEW xila.own_table WITH (security_invoker = true) AS
 CREATE FUNCTION xila.change_rank(kind text) RETURNS integer
 LANGUAGE sql IMMUTABLE AS $$
     SELECT CASE kind WHEN 'rewind' THEN 0 WHEN 'stack' THEN 1 WHEN 'column' THEN 2
-                     WHEN 'widget' THEN 3 WHEN 'card' THEN 4 ELSE 5 END
+                     WHEN 'widget' THEN 3 WHEN 'card' THEN 4 WHEN 'layout' THEN 5
+                     ELSE 6 END
 $$;
 
 -- One recorded change, in words.
@@ -1027,7 +1394,8 @@ BEGIN
             WHEN before->>'label' IS DISTINCT FROM after->>'label'
                 THEN format('Label of “%s” changed to “%s”', after->>'name', after->>'label')
             WHEN before->'props'->>'template' IS DISTINCT FROM after->'props'->>'template'
-                THEN 'Card title changed'
+                THEN CASE WHEN after->'props'->>'style' = 'title' THEN 'Card title changed'
+                          ELSE format('Text of “%s” changed', after->>'name') END
             WHEN before->>'ord' <> after->>'ord' THEN format('“%s” moved', after->>'name')
             ELSE format('“%s” changed', after->>'name') END;
     WHEN 'card' THEN
@@ -1040,6 +1408,10 @@ BEGIN
         FROM jsonb_each(before) b
         WHERE b.value IS DISTINCT FROM after->b.key;
         RETURN card || ' changed' || coalesce(': ' || cols, '');
+    WHEN 'layout' THEN
+        -- card_title is here the name of the widget, when a single one moved.
+        RETURN CASE WHEN coalesce(card_title, '') = '' THEN 'Layout changed'
+                    ELSE format('“%s” moved', card_title) END;
     ELSE
         RETURN 'Screen changed';
     END CASE;
@@ -1064,6 +1436,9 @@ CREATE VIEW xila.history_line WITH (security_invoker = true) AS
                 ELSE xila.describe_change(m.object_kind, m.op, m.before, m.after,
                          CASE WHEN m.object_kind = 'card'
                               THEN xila.card_title_of(m.stack_id, coalesce(m.after, m.before))
+                              WHEN m.object_kind = 'layout' AND l.changes = 1
+                              THEN (SELECT w.name FROM xila.widget w
+                                    WHERE w.id = (coalesce(m.after, m.before)->>'widget_id')::uuid)
                          END)
            END AS summary
     FROM (

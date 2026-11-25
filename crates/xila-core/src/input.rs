@@ -20,6 +20,13 @@ pub enum Key {
     Delete,
     /// Give up what is being asked: a question, a menu.
     Escape,
+    /// An arrow with the shift key held: in the visual editor, it resizes.
+    ShiftUp,
+    ShiftDown,
+    ShiftLeft,
+    ShiftRight,
+    /// Undo the last change, where there is something to undo.
+    Undo,
     Char(char),
     /// Leave at once: Ctrl-C in a terminal.
     Interrupt,
