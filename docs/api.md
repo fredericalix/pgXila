@@ -647,6 +647,97 @@ Left for later: pictures and the image tool (2c), the script of a widget (2d),
 the Agent button (phase 3), the slider, grid and chart tools, renaming a widget
 from the editor (a field is renamed in its dialog).
 
+### 10.8 Drawing (proposal for step 2c, not implemented yet)
+
+The drawing editor is a tool of the graphical client, like the visual editor:
+a picture is drawn pixel by pixel, with the colours of the palette. Nothing in
+this subsection exists yet.
+
+**Images never change.** A row of `xila.image` is written once. Saving a
+drawing creates a new image, and what showed the old one now points to the new
+one: the column of a card, the icon of a stack, a widget of the background.
+Rewinding therefore needs nothing new: the history of the card, of the stack or
+of the widget holds the old reference, and the old image is still there. Nobody
+can overwrite a picture. Every member of `xila_user` may add images; nobody but
+a superuser may change or delete one. Old versions stay in the database; a way
+to purge those that nothing refers to any more comes later.
+
+**Transparency.** Palette slot 255 is transparent: such a pixel shows what is
+behind the picture. The extra colours of a stack are therefore slots 32 to 254.
+
+**What is drawn.**
+
+| Picture | Where it is kept | Who may draw it | Colours |
+|---------|------------------|-----------------|---------|
+| The icon of a stack | `xila.stack.icon_id` | whoever may edit the stack | the 32 system colours |
+| The picture of a card | a column of the card, of a new field type, `picture` | whoever may write the card | the 32 system colours and those of the stack |
+| A picture of the background | the `image` property of an `image` widget | whoever may edit the stack | the same |
+
+An icon is limited to the system colours because the list of stacks shows the
+icons of several stacks at once, each of which may have its own extra colours.
+
+**Functions.**
+
+| Function | What it does |
+|----------|--------------|
+| `xila.new_image(width int, height int, pixels bytea)` | Adds an image and returns its identifier. An image identical to an existing one is not added twice |
+| `xila.add_field(…, type => 'picture')` | Adds a field whose column refers to an image; it is shown by an `image` widget |
+| `xila.set_stack(stack, '{"icon": "0193…"}')` | Gives the stack its icon |
+| `xila.add_widget(stack, 'image', …)`, `xila.set_widget(stack, widget, '{"image": "0193…"}')` | A picture on the background, and its image |
+| `xila.set_colour(stack text, slot int, rgb text, name text DEFAULT NULL)` | Adds an extra colour to a stack, or changes one. Without a slot, the first free one is taken |
+| `xila.remove_colour(stack text, slot int)` | Removes an extra colour |
+
+The picture of a card is saved like any other value of the card, by
+`xila.save_card`.
+
+**Actions and effects.** Two actions, on every screen:
+
+- `draw`, with `{"target": "card" | "icon" | "widget", "widget": "photo"}` in
+  its input, checks that the current role may draw that picture and answers
+  with a new effect, `{"do": "draw", "target": …, "widget": …, "image":
+  "0193…", "width": 68, "height": 80}`, which opens the drawing editor of a
+  graphical client on that picture, or on an empty one;
+- `save_drawing`, with the same target and `width`, `height` and `pixels` (in
+  hexadecimal), adds the image and points the card, the stack or the widget to
+  it, in one transaction.
+
+`set_colour` and `remove_colour` are actions too, for the Colours window.
+
+**The list of stacks in icons.** A grid may ask to be shown as icons:
+`{"view": "icons", "icon": "icon"}` names the column that holds the image of
+each row. `xila.visible_stack` gets that column. In the window, "My stacks"
+shows each stack as its icon, twice its size, with its title and its number of
+cards, as in the mockups; a stack without an icon gets a generic one. The text
+client keeps its list.
+
+**Reaching the editor.** A click on the picture of a card, or `Enter` when it
+has the focus; `F5` in the visual editor for the icon of the stack; the image
+tool of the visual editor, then "Draw" in Properties, for a picture of the
+background. Leaving the editor saves the drawing if it changed, as leaving a
+card saves what was typed on it.
+
+**In the editor**, drawn by the client, as in the mockup:
+
+- the picture enlarged, with a grid, transparent pixels shown as a checkerboard;
+- tools: pencil, eraser (transparent), fill, line, rectangle (outlined or
+  filled), pipette, selection. A selected area is moved, duplicated or erased;
+- the whole picture is flipped, turned a quarter, or given another size, which
+  keeps what is already drawn;
+- a Colours window: the 32 system colours, the extra colours of the stack with
+  the means to add one and to set its red, green and blue, and the name, the
+  number and the value of the colour in hand;
+- a Preview window: the picture at its real size, on the desktop and on paper;
+- undo, step by step, of what was drawn since the editor was opened; a key to
+  go back to the picture as it was;
+- with the keyboard: the arrows move a cursor over the pixels and the space bar
+  uses the tool there; a letter picks each tool.
+
+Sizes: an icon is 28 by 26 pixels when it is created, a picture of a card or of
+the background has the size of its frame. An image is at most 480 by 300.
+
+Left for later: importing an image from a file, purging unused images, the
+Agent button.
+
 ## 11. Not covered yet
 
 - Author mode beyond section 10 (drawing, scripts): steps 2c and 2d.
