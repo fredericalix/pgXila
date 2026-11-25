@@ -130,7 +130,9 @@ CREATE TABLE xila.action (
                       'last_card', 'save_card', 'new_card', 'delete_card', 'back', 'quit',
                       'author', 'browse', 'new_stack', 'create_stack', 'save_stack',
                       'delete_stack', 'new_field', 'edit_field', 'save_field',
-                      'remove_field', 'move_field', 'history', 'rewind')),
+                      'remove_field', 'move_field', 'history', 'rewind',
+                      'place_widgets', 'reset_layout', 'add_widget', 'set_widget',
+                      'remove_widget', 'undo')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );

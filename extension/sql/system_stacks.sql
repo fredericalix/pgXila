@@ -72,6 +72,19 @@ INSERT INTO xila.action (name, label, handler, args)
 VALUES ('author', 'Author', 'author', '{"for": "editor"}');
 INSERT INTO xila.key_binding (key, action_id) VALUES ('F11', xila.action_id(NULL, 'author'));
 
+-- What the visual editor of the graphical client asks for, on any stack the
+-- current role may change. "author_form" reaches the forms from the editor.
+INSERT INTO xila.action (name, label, handler, args) VALUES
+    ('author_form',   'Stack',        'author',        '{"for": "editor", "form": true}'),
+    ('new_field',     'New field',    'new_field',     '{"for": "editor"}'),
+    ('stack_history', 'History',      'history',       '{"for": "editor", "of": "stack"}'),
+    ('place_widgets', 'Move',         'place_widgets', '{"for": "editor"}'),
+    ('reset_layout',  'Reset layout', 'reset_layout',  '{"for": "editor"}'),
+    ('add_widget',    'New widget',   'add_widget',    '{"for": "editor"}'),
+    ('set_widget',    'Change',       'set_widget',    '{"for": "editor"}'),
+    ('remove_widget', 'Remove',       'remove_widget', '{"for": "editor"}'),
+    ('undo',          'Undo',         'undo',          '{"for": "editor"}');
+
 -- What authors find in the list of stacks.
 INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
     (xila.background_id('stacks'), 'new_stack', 'New stack', 'new_stack', '{"for": "author"}'),

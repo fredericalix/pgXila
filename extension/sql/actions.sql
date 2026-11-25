@@ -6,7 +6,8 @@
 -- Runs an action and answers with the effects the client must apply.
 -- context is the state of the client: {"card": key, "dirty": {col: value},
 -- "row": key of the selected grid row, "confirmed": true once the user has
--- accepted the question of a "confirm" effect}.
+-- accepted the question of a "confirm" effect, "renderer": "text" or
+-- "graphic", "input": what a tool of the client has to say}.
 --
 -- On the author screens, which are cards of views, the key of the card is the
 -- subject of the dialog: the name of a stack, the identifier of a field.
@@ -21,6 +22,7 @@ DECLARE
     dirty   jsonb := coalesce(context->'dirty', '{}');
     picked  text := context->>'row';
     agreed  boolean := coalesce((context->>'confirmed')::boolean, false);
+    input   jsonb := coalesce(context->'input', '{}');
     target  text;
     saved   jsonb;
     field   xila.field;
@@ -28,6 +30,7 @@ DECLARE
     entry   xila.history;
     scope   text;
     shown   text;
+    is_field boolean;
     n       bigint;
 BEGIN
     SELECT s.* INTO info FROM xila.stack s WHERE s.id = bg.stack_id;
@@ -116,6 +119,12 @@ BEGIN
             RAISE EXCEPTION 'No stack is selected.' USING ERRCODE = 'XL002';
         END IF;
         PERFORM xila.editable(target);
+        -- The window has a visual editor; the forms are for the terminal, and
+        -- for the editor itself, which reaches them with {"form": true}.
+        IF context->>'renderer' = 'graphic'
+           AND NOT coalesce((act.args->>'form')::boolean, false) THEN
+            RETURN jsonb_build_array(jsonb_build_object('do', 'design', 'stack', target));
+        END IF;
         RETURN jsonb_build_array(xila.fx_show('author', target));
 
     WHEN 'browse' THEN
@@ -167,11 +176,14 @@ BEGIN
                 edited.title)));
 
     WHEN 'new_field' THEN
-        PERFORM xila.editable(card);
+        -- From the author dialog, whose card is the stack, or from the stack
+        -- itself in the visual editor.
+        target := CASE WHEN info.kind = 'system' THEN card ELSE stack END;
+        PERFORM xila.editable(target);
         RETURN jsonb_build_array(
             xila.fx_show('field'),
             jsonb_build_object('do', 'new',
-                               'values', jsonb_build_object('stack', card, 'type', 'text')));
+                               'values', jsonb_build_object('stack', target, 'type', 'text')));
 
     WHEN 'edit_field' THEN
         IF picked IS NULL THEN
@@ -245,8 +257,73 @@ BEGIN
         RETURN jsonb_build_array(CASE act.args->>'of'
             WHEN 'deleted' THEN xila.fx_show('deleted_stacks')
             WHEN 'cards' THEN xila.fx_show('card_history', stack)
-            ELSE xila.fx_show('history', card)
+            ELSE xila.fx_show('history', CASE WHEN info.kind = 'system' THEN card ELSE stack END)
         END);
+
+    -- The visual editor ---------------------------------------------------
+    -- What the tool says comes in "input". A widget of the card on screen is
+    -- found on that card.
+
+    WHEN 'place_widgets' THEN
+        PERFORM xila.place_widgets(stack, 'graphic', input->'placements', card);
+        RETURN jsonb_build_array(jsonb_build_object('do', 'reload'));
+
+    WHEN 'reset_layout' THEN
+        PERFORM xila.editable(stack);
+        IF NOT agreed THEN
+            RETURN xila.fx_confirm(
+                'Go back to the automatic layout? Every widget loses the place it was given.',
+                'Reset');
+        END IF;
+        PERFORM xila.reset_layout(stack, 'graphic');
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'), xila.fx_message('The layout is automatic again.'));
+
+    WHEN 'add_widget' THEN
+        IF input->>'layer' = 'card' AND card IS NULL THEN
+            RAISE EXCEPTION 'There is no card to put it on.' USING ERRCODE = 'XL003';
+        END IF;
+        target := xila.add_widget(stack, input->>'kind', input->'props',
+                                  CASE WHEN input->>'layer' = 'card' THEN card END);
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'),
+            jsonb_build_object('do', 'focus', 'widget', target));
+
+    WHEN 'set_widget' THEN
+        PERFORM xila.set_widget(stack, input->>'widget', input->'changes', card);
+        RETURN jsonb_build_array(jsonb_build_object('do', 'reload'));
+
+    WHEN 'remove_widget' THEN
+        bg := xila.editable(stack);
+        target := input->>'widget';
+        -- (The name of the stack goes through a variable: the view has a
+        -- column of the same name as the parameter.)
+        shown := stack;
+        SELECT f.* INTO field FROM xila.field f WHERE f.stack = shown AND f.name = target;
+        is_field := FOUND;
+        IF NOT agreed THEN
+            IF is_field AND bg.managed THEN
+                EXECUTE format('SELECT count(*) FROM %s WHERE %I IS NOT NULL',
+                               xila.source_of(bg), field.name)
+                INTO n;
+                RETURN xila.fx_confirm(format(
+                    'Remove the field “%s”? %s. History can bring it back.', field.label,
+                    CASE n WHEN 0 THEN 'No card has a value for it'
+                           WHEN 1 THEN '1 card has a value for it'
+                           ELSE n || ' cards have a value for it' END), 'Remove');
+            END IF;
+            RETURN xila.fx_confirm(format('Take “%s” off the screen?', target), 'Remove');
+        END IF;
+        PERFORM xila.remove_widget(stack, target, card);
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'),
+            xila.fx_message(format('“%s” removed.', target)));
+
+    WHEN 'undo' THEN
+        saved := xila.undo(stack);
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'),
+            xila.fx_message(format('Undone: %s.', saved->>'summary')));
 
     WHEN 'rewind' THEN
         scope := act.args->>'scope';

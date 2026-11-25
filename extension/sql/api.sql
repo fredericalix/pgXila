@@ -163,6 +163,10 @@ LANGUAGE sql STABLE AS $$
                'column', w.bound_column,
                'type', CASE WHEN w.bound_column IS NOT NULL
                             THEN xila.field_type(xila.source_of(bg), w.bound_column) END,
+               'required', CASE WHEN w.bound_column IS NOT NULL THEN (
+                   SELECT c.attnotnull FROM pg_attribute c
+                   WHERE c.attrelid = xila.source_of(bg) AND c.attname = w.bound_column
+                     AND c.attnum > 0 AND NOT c.attisdropped) END,
                'action', a.name))
                || jsonb_build_object(
                'props', xila.resolved_props(w.props),
@@ -250,7 +254,8 @@ BEGIN
                                     'may_edit', xila.may_edit(info.id)),
         'source', jsonb_build_object(
             'has_cards', source IS NOT NULL,
-            'count', xila.card_count(stack)),
+            'count', xila.card_count(stack),
+            'managed', bg.managed),
         'widgets', xila.widgets_json(bg, NULL),
         'actions', (
             SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'label', a.label)
