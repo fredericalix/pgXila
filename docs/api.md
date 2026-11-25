@@ -250,6 +250,11 @@ Every change to a stack, a screen or a card is recorded in `xila.history`:
 | `op` | `insert`, `update` or `delete` |
 | `before`, `after` | the row before and after, as `jsonb` |
 
+History starts empty in a new database: the rows the extension creates itself
+(palette, system stacks) are the baseline. Restoring a backup reloads the
+history it contains and does not record the reload as new changes; see
+`xila.restoring()` in the extension for how a restore is recognised.
+
 Only recording exists today. Rewinding (re-applying `before` images in reverse
 order, for one card, one screen or a whole stack) comes with phase 2, together
 with its API. Changes to the structure of a stack's table, such as adding or

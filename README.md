@@ -101,6 +101,10 @@ To start again from an empty database, remove the volumes:
 docker compose down --volumes
 ```
 
+Backups are those of PostgreSQL: `pg_dump` saves the stacks, their cards and
+the history, and `pg_restore` brings them back. The system stacks are not part
+of a dump; the extension creates them.
+
 The extension has no upgrade script yet: after pulling a new version, rebuild
 the image and start again from an empty database.
 

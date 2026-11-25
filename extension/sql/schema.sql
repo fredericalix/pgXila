@@ -191,6 +191,23 @@ CREATE TABLE xila.history (
 
 CREATE INDEX history_object ON xila.history (stack_id, object_kind, object_key, id);
 
+-- True while a backup is being restored.
+--
+-- A dump carries the history and the triggers of the database it was taken
+-- from. Reloading it must not record the reload as new changes, nor install
+-- again what the dump is about to create. pg_dump output always runs with an
+-- empty search_path, which is how a restore is recognised; a superuser can
+-- also say so with "SET xila.restoring = on" before a bulk load.
+--
+-- Only superusers are believed: for anyone else this is always false, so
+-- nobody can escape history by changing a setting.
+CREATE FUNCTION xila.restoring() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT (SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.rolname = session_user)
+       AND (current_setting('search_path') IN ('', '""')
+            OR coalesce(current_setting('xila.restoring', true), '') = 'on')
+$$;
+
 -- Finds the stack a definition row belongs to.
 CREATE FUNCTION xila.stack_of(kind text, r jsonb) RETURNS uuid
 LANGUAGE sql STABLE AS $$
@@ -208,7 +225,8 @@ $$;
 
 -- Records a change to a definition table and tells the clients about it.
 -- SECURITY DEFINER: the history table is not writable by the roles that make
--- the changes.
+-- the changes. The triggers that call it are created in triggers.sql, once
+-- the extension has written its own rows.
 CREATE FUNCTION xila.record_definition_change() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -240,23 +258,6 @@ BEGIN
     RETURN NULL;
 END
 $$;
-
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.palette
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.stack
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.stack_colour
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.background
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.action
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.widget
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.layout
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
-CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.key_binding
-    FOR EACH ROW EXECUTE FUNCTION xila.record_definition_change();
 
 -- Records a change to a card and tells the clients about it. Installed on the
 -- source table of each stack; the key column is the trigger argument.
@@ -298,7 +299,8 @@ DECLARE
     key_cols name[];
     missing  name;
 BEGIN
-    IF NEW.source_table IS NULL THEN
+    -- During a restore the dump brings the table's key and trigger itself.
+    IF NEW.source_table IS NULL OR xila.restoring() THEN
         RETURN NEW;
     END IF;
 
@@ -333,7 +335,8 @@ BEGIN
     EXECUTE format('DROP TRIGGER IF EXISTS xila_card ON %s', source);
     EXECUTE format(
         'CREATE TRIGGER xila_card AFTER INSERT OR UPDATE OR DELETE ON %s
-             FOR EACH ROW EXECUTE FUNCTION xila.record_card_change(%L)',
+             FOR EACH ROW WHEN (NOT xila.restoring())
+             EXECUTE FUNCTION xila.record_card_change(%L)',
         source, NEW.key_column);
     RETURN NEW;
 END

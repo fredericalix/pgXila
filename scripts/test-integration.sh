@@ -65,3 +65,48 @@ export PGXILA_TEST_SCRATCH_CA="$SCRATCH_CERTS/ca.crt"
 
 # The API tests share one stack: run them one at a time.
 cargo test --workspace -- --ignored --test-threads=1 "$@"
+
+scratch() { # runs a command inside the scratch server, as the postgres user
+    "${COMPOSE[@]}" exec -T -u postgres "$@"
+}
+history_count() {
+    scratch db-scratch psql -X -At -d "${1:-pgxila}" -c "SELECT count(*) FROM xila.history"
+}
+
+echo
+echo "History cannot be escaped by an ordinary role"
+before="$(history_count)"
+scratch -e PGPASSWORD="$PASSWORD" db-scratch \
+    psql -X -q -v ON_ERROR_STOP=1 "host=localhost dbname=pgxila user=$ROLE sslmode=require" <<'SQL'
+SET search_path = '';
+SET xila.restoring = on;
+UPDATE carnet.contacts SET ville = 'Ailleurs' WHERE nom = 'Pascal';
+UPDATE carnet.contacts SET ville = 'Clermont-Ferrand' WHERE nom = 'Pascal';
+SQL
+after="$(history_count)"
+[ "$after" -eq "$((before + 2))" ] || {
+    echo "FAILED: expected 2 new history rows, got $((after - before))" >&2; exit 1; }
+echo "ok"
+
+echo
+echo "A backup is restored with its stacks, its cards and its history"
+summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.background),
+                (SELECT count(*) FROM xila.widget), (SELECT count(*) FROM xila.layout),
+                (SELECT count(*) FROM xila.action), (SELECT count(*) FROM xila.key_binding),
+                (SELECT count(*) FROM xila.palette), (SELECT count(*) FROM xila.history),
+                (SELECT count(*) FROM carnet.contacts),
+                (SELECT count(*) FROM pg_trigger WHERE tgname = 'xila_card'),
+                xila.card('carnet')->'texts'"
+scratch db-scratch sh -c '
+    set -e
+    pg_dump -d pgxila -Fc -f /tmp/pgxila.dump
+    createdb restored
+    pg_restore --exit-on-error -d restored /tmp/pgxila.dump'
+original="$(scratch db-scratch psql -X -At -d pgxila -c "$summary")"
+restored="$(scratch db-scratch psql -X -At -d restored -c "$summary")"
+[ "$original" = "$restored" ] || {
+    echo "FAILED: the restored database differs" >&2
+    echo "  original: $original" >&2
+    echo "  restored: $restored" >&2
+    exit 1; }
+echo "ok ($restored)"

@@ -44,6 +44,7 @@ pub extern "C-unwind" fn _PG_init() {
 extension_sql_file!("../sql/schema.sql", name = "schema", bootstrap);
 extension_sql_file!("../sql/api.sql", name = "api", requires = [xila::version]);
 extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["api"]);
+extension_sql_file!("../sql/triggers.sql", name = "triggers", requires = ["system_stacks"]);
 
 #[pg_schema]
 mod xila {
@@ -341,6 +342,33 @@ mod tests {
             ),
             4
         );
+    }
+
+    #[pg_test]
+    fn history_starts_empty_in_a_new_database() {
+        assert_eq!(number("SELECT count(*) FROM xila.history"), 0);
+    }
+
+    #[pg_test]
+    fn a_restore_does_not_record_what_it_reloads() {
+        create_library_stack();
+        let before = number("SELECT count(*) FROM xila.history");
+
+        // pg_dump output runs with an empty search_path, as a superuser.
+        Spi::run(
+            "SELECT pg_catalog.set_config('search_path', '', true);
+             UPDATE library.books SET year = 1 WHERE title = 'Candide';
+             UPDATE xila.stack SET title = 'Restored' WHERE name = 'library';",
+        )
+        .unwrap();
+        assert_eq!(number("SELECT count(*) FROM xila.history"), before);
+
+        Spi::run(
+            "SET LOCAL search_path = public;
+             UPDATE library.books SET year = 2 WHERE title = 'Candide';",
+        )
+        .unwrap();
+        assert_eq!(number("SELECT count(*) FROM xila.history"), before + 1);
     }
 
     #[pg_test]
