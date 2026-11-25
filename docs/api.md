@@ -38,6 +38,9 @@ the stack's table. The API functions run with the privileges of the caller, so
 `GRANT`, `REVOKE` and row-level security apply unchanged. A stack is listed for
 a user when that user may `SELECT` from its table.
 
+Known limit: a member of `xila_author` may currently write the definition of any
+stack, including the system stacks. Ownership rules come with author mode.
+
 The role the agent tools run under (`xila_agent`) comes with phase 3.
 
 ## 2. Data model
