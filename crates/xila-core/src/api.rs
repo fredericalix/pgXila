@@ -74,6 +74,17 @@ pub struct StackInfo {
     pub name: String,
     pub title: String,
     pub kind: String,
+    /// True when the current role may change the definition of the stack.
+    #[serde(default)]
+    pub may_edit: bool,
+}
+
+impl StackInfo {
+    /// A system stack is one of the screens pgXila itself is made of. It is
+    /// drawn as a dialog, even when it shows a card.
+    pub fn is_system(&self) -> bool {
+        self.kind == "system"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -129,6 +140,56 @@ pub struct Widget {
     /// Placements, by renderer name (`text`, `graphic`).
     #[serde(default)]
     pub layout: BTreeMap<String, Placement>,
+}
+
+/// One of the values a field may take, and how to show it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+}
+
+impl Widget {
+    /// The values this field is limited to, if it is: those of its
+    /// properties, or yes and no for a boolean. Empty for a free field.
+    pub fn choices(&self) -> Vec<Choice> {
+        let listed: Vec<Choice> = self
+            .props
+            .get("choices")
+            .and_then(|choices| serde_json::from_value(choices.clone()).ok())
+            .unwrap_or_default();
+        if listed.is_empty() && self.field_type == Some(FieldType::Boolean) {
+            return vec![
+                Choice { value: "true".into(), label: "Yes".into() },
+                Choice { value: "false".into(), label: "No".into() },
+            ];
+        }
+        listed
+    }
+
+    /// The text to show for a value of this field: the label of the choice
+    /// it matches, or else the value itself.
+    pub fn shown(&self, value: &str) -> String {
+        self.choices()
+            .into_iter()
+            .find(|choice| choice.value == value)
+            .map_or_else(|| value.to_owned(), |choice| choice.label)
+    }
+
+    /// The choice after the given value, or before it, going round.
+    pub fn next_choice(&self, value: &str, forward: bool) -> Option<String> {
+        let choices = self.choices();
+        if choices.is_empty() {
+            return None;
+        }
+        let count = choices.len();
+        let next = match choices.iter().position(|choice| choice.value == value) {
+            Some(at) if forward => (at + 1) % count,
+            Some(at) => (at + count - 1) % count,
+            None => 0,
+        };
+        Some(choices[next].value.clone())
+    }
 }
 
 /// Where a widget is drawn by one renderer.
@@ -230,6 +291,9 @@ pub struct Context {
     /// The selected row of the grid, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row: Option<String>,
+    /// True when the user has accepted the question the action asked.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
 /// What the server asks the client to do after an action.
@@ -250,8 +314,17 @@ pub enum Effect {
     Focus { widget: String },
     /// Show a message to the user.
     Message { text: String },
-    /// Display an empty card, to be saved as a new one.
-    New,
+    /// Display an empty card, to be saved as a new one. Some of its fields
+    /// may be filled in already.
+    New {
+        #[serde(default)]
+        values: BTreeMap<String, String>,
+    },
+    /// Ask the user a question. If they accept, the same action is run again
+    /// with `confirmed` set in its context. `label` names what accepting does.
+    Confirm { text: String, label: String },
+    /// Select the row of the grid that has this key.
+    Select { row: String },
     /// Leave the client.
     Quit,
 }
@@ -298,7 +371,14 @@ pub trait Api {
     fn image(&mut self, id: &str) -> Result<Option<Image>, ApiError>;
     fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError>;
     fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError>;
-    fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError>;
+    /// The rows of a grid. `card` is the key of the card on screen, for a
+    /// grid that lists what belongs to that card.
+    fn grid_rows(
+        &mut self,
+        stack: &str,
+        widget: &str,
+        card: Option<&str>,
+    ) -> Result<GridPage, ApiError>;
     fn act(
         &mut self,
         stack: &str,
@@ -374,7 +454,7 @@ mod tests {
                 Effect::Show { stack: "addressbook".into(), card: Some("42".into()) },
                 Effect::Show { stack: "stacks".into(), card: None },
                 Effect::Message { text: "Card saved.".into() },
-                Effect::New,
+                Effect::New { values: BTreeMap::new() },
                 Effect::Quit,
             ]
         );
@@ -386,11 +466,98 @@ mod tests {
             card: Some("42".into()),
             dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
             row: None,
+            confirmed: false,
         };
         assert_eq!(
             serde_json::to_value(&context).unwrap(),
             serde_json::json!({ "card": "42", "dirty": { "city": "Paris" } })
         );
+        let confirmed = Context { confirmed: true, row: Some("7".into()), ..context };
+        assert_eq!(
+            serde_json::to_value(&confirmed).unwrap(),
+            serde_json::json!({
+                "card": "42", "dirty": { "city": "Paris" }, "row": "7", "confirmed": true
+            })
+        );
+    }
+
+    #[test]
+    fn the_effects_of_author_mode_are_decoded() {
+        let effects: Vec<Effect> = serde_json::from_value(serde_json::json!([
+            { "do": "new", "values": { "stack": "books", "type": "text" } },
+            { "do": "confirm", "text": "Delete this card?", "label": "Delete" },
+            { "do": "select", "row": "42" }
+        ]))
+        .unwrap();
+        assert_eq!(
+            effects,
+            [
+                Effect::New {
+                    values: BTreeMap::from([
+                        ("stack".to_string(), "books".to_string()),
+                        ("type".to_string(), "text".to_string()),
+                    ])
+                },
+                Effect::Confirm { text: "Delete this card?".into(), label: "Delete".into() },
+                Effect::Select { row: "42".into() },
+            ]
+        );
+    }
+
+    fn field(json: serde_json::Value) -> Widget {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_field_may_be_limited_to_some_choices() {
+        let kind = field(serde_json::json!({
+            "name": "type", "kind": "field", "ord": 1, "column": "type", "type": "text",
+            "props": { "choices": [
+                { "value": "text", "label": "Text" },
+                { "value": "date", "label": "Date" }
+            ] }
+        }));
+        assert_eq!(kind.shown("date"), "Date");
+        assert_eq!(kind.shown("picture"), "picture", "an unknown value is shown as it is");
+        assert_eq!(kind.next_choice("text", true).as_deref(), Some("date"));
+        assert_eq!(kind.next_choice("date", true).as_deref(), Some("text"), "it goes round");
+        assert_eq!(kind.next_choice("text", false).as_deref(), Some("date"));
+        assert_eq!(kind.next_choice("", true).as_deref(), Some("text"));
+
+        let free = field(serde_json::json!({
+            "name": "city", "kind": "field", "ord": 1, "column": "city", "type": "text"
+        }));
+        assert!(free.choices().is_empty());
+        assert_eq!(free.next_choice("Paris", true), None);
+    }
+
+    #[test]
+    fn a_boolean_field_is_a_choice_between_yes_and_no() {
+        let read = field(serde_json::json!({
+            "name": "read", "kind": "field", "ord": 1, "column": "read", "type": "boolean"
+        }));
+        assert_eq!(read.shown("true"), "Yes");
+        assert_eq!(read.shown("false"), "No");
+        assert_eq!(read.shown(""), "");
+        assert_eq!(read.next_choice("", true).as_deref(), Some("true"));
+        assert_eq!(read.next_choice("true", true).as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn a_screen_says_whether_it_may_be_edited() {
+        let info: StackInfo = serde_json::from_value(serde_json::json!({
+            "name": "books", "title": "Books", "kind": "user", "may_edit": true
+        }))
+        .unwrap();
+        assert!(info.may_edit);
+        assert!(!info.is_system());
+        // An older server does not say: nothing may be edited.
+        let info: StackInfo = serde_json::from_value(serde_json::json!({
+            "name": "desktop", "title": "Main menu", "kind": "system"
+        }))
+        .unwrap();
+        assert!(!info.may_edit);
+        assert!(info.is_system());
     }
 
     #[test]

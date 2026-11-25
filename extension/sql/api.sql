@@ -59,7 +59,8 @@ LANGUAGE sql STABLE AS $$
     WHERE a.attrelid = source AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped
 $$;
 
--- Replaces {name} placeholders by the matching entry of vals.
+-- Replaces {name} placeholders by the matching entry of vals. A placeholder
+-- that names nothing, such as a field that was removed, is left empty.
 CREATE FUNCTION xila.fill_template(template text, vals jsonb) RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
@@ -69,8 +70,83 @@ BEGIN
     FOR entry IN SELECT key, value FROM jsonb_each_text(vals) LOOP
         result := replace(result, '{' || entry.key || '}', coalesce(entry.value, ''));
     END LOOP;
-    RETURN result;
+    RETURN regexp_replace(result, '\{[a-z_][a-z0-9_]*\}', '', 'g');
 END
+$$;
+
+-- The properties of a widget as the client receives them. A field may take
+-- its choices from a table: {"choices_from": {"schema", "table", "value",
+-- "label"}}. They are read here and added to "choices".
+CREATE FUNCTION xila.resolved_props(props jsonb) RETURNS jsonb
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    src   jsonb := props->'choices_from';
+    rel   regclass;
+    found jsonb;
+BEGIN
+    IF src IS NULL THEN
+        RETURN props;
+    END IF;
+    rel := to_regclass(format('%I.%I', src->>'schema', src->>'table'));
+    IF rel IS NOT NULL THEN
+        EXECUTE format(
+            'SELECT jsonb_agg(jsonb_build_object(''value'', t.%1$I::text, ''label'', t.%2$I::text)
+                              ORDER BY t.%2$I::text)
+             FROM %3$s AS t',
+            src->>'value', coalesce(src->>'label', src->>'value'), rel)
+        INTO found;
+    END IF;
+    RETURN (props - 'choices_from')
+        || jsonb_build_object('choices', coalesce(props->'choices', '[]') || coalesce(found, '[]'));
+END
+$$;
+
+-- Whether an action is offered to the current role on a stack. An action may
+-- be kept for authors ({"for": "author"}) or for those who may change the
+-- stack on screen ({"for": "editor"}).
+CREATE FUNCTION xila.offered(args jsonb, stack uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT CASE args->>'for'
+        WHEN 'author' THEN pg_has_role('xila_author', 'USAGE')
+        WHEN 'editor' THEN xila.may_edit(stack)
+        ELSE true
+    END
+$$;
+
+-- The identifier of the background of a stack, and of one of its actions.
+-- A NULL stack names the actions shared by every screen.
+CREATE FUNCTION xila.background_id(stack text) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT b.id FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id WHERE s.name = stack
+$$;
+
+CREATE FUNCTION xila.action_id(stack text, action text) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT a.id FROM xila.action a
+    WHERE a.name = action AND a.background_id IS NOT DISTINCT FROM xila.background_id(stack)
+$$;
+
+-- The effects an action answers with.
+CREATE FUNCTION xila.fx_show(stack text, card text DEFAULT NULL) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_strip_nulls(jsonb_build_object('do', 'show', 'stack', stack, 'card', card))
+$$;
+
+CREATE FUNCTION xila.fx_message(message text) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_build_object('do', 'message', 'text', message)
+$$;
+
+CREATE FUNCTION xila.fx_confirm(question text, label text) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_build_array(
+        jsonb_build_object('do', 'confirm', 'text', question, 'label', label))
+$$;
+
+-- "1 change", "3 changes".
+CREATE FUNCTION xila.counted(n bigint, one text, many text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN n = 1 THEN '1 ' || one ELSE n || ' ' || many END
 $$;
 
 -- The widgets of a background as JSON: those of the background layer when
@@ -89,7 +165,7 @@ LANGUAGE sql STABLE AS $$
                             THEN xila.field_type(xila.source_of(bg), w.bound_column) END,
                'action', a.name))
                || jsonb_build_object(
-               'props', w.props,
+               'props', xila.resolved_props(w.props),
                'layout', coalesce((
                    SELECT jsonb_object_agg(l.renderer, jsonb_build_object(
                        'x', l.x, 'y', l.y, 'w', l.w, 'h', l.h, 'style', l.style))
@@ -170,7 +246,8 @@ BEGIN
     END IF;
 
     RETURN jsonb_build_object(
-        'stack', jsonb_build_object('name', info.name, 'title', info.title, 'kind', info.kind),
+        'stack', jsonb_build_object('name', info.name, 'title', info.title, 'kind', info.kind,
+                                    'may_edit', xila.may_edit(info.id)),
         'source', jsonb_build_object(
             'has_cards', source IS NOT NULL,
             'count', xila.card_count(stack)),
@@ -179,7 +256,8 @@ BEGIN
             SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'label', a.label)
                                       ORDER BY a.name), '[]')
             FROM xila.action a
-            WHERE a.background_id = bg.id OR a.background_id IS NULL),
+            WHERE (a.background_id = bg.id OR a.background_id IS NULL)
+              AND xila.offered(a.args, bg.stack_id)),
         -- A key bound on this screen wins over the same key bound everywhere.
         'keys', (
             SELECT coalesce(jsonb_agg(jsonb_build_object(
@@ -188,7 +266,8 @@ BEGIN
             FROM (
                 SELECT DISTINCT ON (kb.key) kb.key, a.label, a.name AS action
                 FROM xila.key_binding kb JOIN xila.action a ON a.id = kb.action_id
-                WHERE kb.background_id = bg.id OR kb.background_id IS NULL
+                WHERE (kb.background_id = bg.id OR kb.background_id IS NULL)
+                  AND xila.offered(a.args, bg.stack_id)
                 ORDER BY kb.key, kb.background_id NULLS LAST) k),
         'colours', (
             SELECT coalesce(jsonb_agg(jsonb_build_object('slot', c.slot, 'rgb', c.rgb)
@@ -203,7 +282,8 @@ $$;
 
 -- Reads one card. move is 'first', 'last', 'at', 'next' or 'previous'; the
 -- last three are relative to key. When key no longer exists, the first card
--- is returned. 'next' and 'previous' stop at the ends.
+-- is returned, except for a view, where it is an error. 'next' and 'previous'
+-- stop at the ends.
 CREATE FUNCTION xila.card(stack text, key text DEFAULT NULL, move text DEFAULT 'first')
 RETURNS jsonb
 LANGUAGE plpgsql STABLE AS $$
@@ -213,6 +293,10 @@ DECLARE
     found  jsonb;
     vals   jsonb;
     extras jsonb;
+    -- The cards of a view are the subjects of a dialog: showing another one
+    -- because the one asked for is gone would be showing the wrong subject.
+    strict boolean := source IS NOT NULL AND move = 'at' AND key IS NOT NULL
+                      AND (SELECT c.relkind IN ('v', 'm') FROM pg_class c WHERE c.oid = source);
 BEGIN
     IF move NOT IN ('first', 'last', 'at', 'next', 'previous') THEN
         RAISE EXCEPTION 'Unknown move: %.', move USING ERRCODE = 'XL002';
@@ -232,12 +316,16 @@ BEGIN
             WHERE o._pos = CASE $2
                 WHEN 'first' THEN 1
                 WHEN 'last' THEN o._count
-                WHEN 'at' THEN coalesce((SELECT _pos FROM current), 1)
+                WHEN 'at' THEN coalesce((SELECT _pos FROM current), $3)
                 WHEN 'next' THEN least(coalesce((SELECT _pos FROM current), 0) + 1, o._count)
                 WHEN 'previous' THEN greatest(coalesce((SELECT _pos FROM current), 2) - 1, 1)
             END
             $q$, xila.card_order(bg), source, bg.key_column)
-        INTO found USING key, move;
+        INTO found USING key, move, CASE WHEN strict THEN NULL ELSE 1 END::bigint;
+    END IF;
+
+    IF found IS NULL AND strict THEN
+        RAISE EXCEPTION 'This no longer exists.' USING ERRCODE = 'XL002';
     END IF;
 
     IF found IS NULL THEN
@@ -364,16 +452,27 @@ END
 $$;
 
 -- A page of rows of a grid widget.
+--
+-- The properties of the widget name the table or view to list, its key and
+-- its columns. Two more are optional:
+--   "where": {"stack": "name"}  keeps the rows whose column "stack" equals
+--                               the column "name" of the card on screen;
+--   "order": ["ord", "name"]    sorts by these columns instead of the key,
+--                               from last to first with "descending": true.
 CREATE FUNCTION xila.grid_rows(stack text, widget text, first integer DEFAULT 0,
-                               count integer DEFAULT 100)
+                               count integer DEFAULT 100, card text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
-    bg     xila.background := xila.background_of(stack);
-    props  jsonb;
-    rel    regclass;
-    cols   text;
-    result jsonb;
+    bg      xila.background := xila.background_of(stack);
+    source  regclass := xila.source_of(bg);
+    props   jsonb;
+    rel     regclass;
+    cols    text;
+    filter  text := 'true';
+    sorting text;
+    vals    jsonb;
+    result  jsonb;
 BEGIN
     SELECT w.props INTO props
     FROM xila.widget w
@@ -391,89 +490,45 @@ BEGIN
     SELECT string_agg(format('%1$L, t.%1$I::text', c->>'column'), ', ') INTO cols
     FROM jsonb_array_elements(props->'columns') c;
 
+    IF props ? 'where' THEN
+        IF source IS NOT NULL AND card IS NOT NULL THEN
+            EXECUTE format('SELECT to_jsonb(t) FROM %s AS t WHERE t.%I::text = $1',
+                           source, bg.key_column)
+            INTO vals USING card;
+        END IF;
+        IF vals IS NULL THEN
+            filter := 'false';
+        ELSE
+            SELECT string_agg(format('t.%I::text IS NOT DISTINCT FROM ($3->>%L)', w.key, w.value),
+                              ' AND ')
+            INTO filter
+            FROM jsonb_each_text(props->'where') w;
+        END IF;
+    END IF;
+
+    SELECT string_agg(format('t.%I', c)
+                      || CASE WHEN coalesce((props->>'descending')::boolean, false)
+                              THEN ' DESC' ELSE '' END, ', ')
+    INTO sorting
+    FROM jsonb_array_elements_text(
+             coalesce(props->'order', jsonb_build_array(props->>'key'))) c;
+
     EXECUTE format($q$
         SELECT jsonb_build_object(
-            'total', (SELECT count(*) FROM %1$s),
+            'total', (SELECT count(*) FROM %1$s AS t WHERE %4$s),
             'rows', coalesce((
                 SELECT jsonb_agg(r.line ORDER BY r.n)
                 FROM (
-                    SELECT row_number() OVER (ORDER BY t.%2$I) AS n,
+                    SELECT row_number() OVER (ORDER BY %5$s) AS n,
                            jsonb_build_object('key', t.%2$I::text,
                                               'cells', jsonb_build_object(%3$s)) AS line
-                    FROM %1$s t
-                    ORDER BY t.%2$I
+                    FROM %1$s AS t
+                    WHERE %4$s
+                    ORDER BY %5$s
                     OFFSET $1 LIMIT $2) r), '[]'))
-        $q$, rel, props->>'key', cols)
-    INTO result USING greatest(first, 0), greatest(count, 0);
+        $q$, rel, props->>'key', cols, filter, sorting)
+    INTO result USING greatest(first, 0), greatest(count, 0), coalesce(vals, '{}'::jsonb);
     RETURN result;
-END
-$$;
-
--- ---------------------------------------------------------------------------
--- Actions
--- ---------------------------------------------------------------------------
-
--- Runs an action and answers with the effects the client must apply.
--- context is the state of the client: {"card": key, "dirty": {col: value},
--- "row": key of the selected grid row}.
-CREATE FUNCTION xila.act(stack text, action text, context jsonb DEFAULT '{}') RETURNS jsonb
-LANGUAGE plpgsql AS $$
-DECLARE
-    bg      xila.background := xila.background_of(stack);
-    act     xila.action;
-    card    text := context->>'card';
-    dirty   jsonb := coalesce(context->'dirty', '{}');
-    target  text;
-    saved   jsonb;
-BEGIN
-    SELECT a.* INTO act
-    FROM xila.action a
-    WHERE a.name = action AND (a.background_id = bg.id OR a.background_id IS NULL)
-    ORDER BY a.background_id NULLS LAST
-    LIMIT 1;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'The action “%” does not exist.', action USING ERRCODE = 'XL002';
-    END IF;
-
-    CASE act.handler
-    WHEN 'quit' THEN
-        RETURN jsonb_build_array(jsonb_build_object('do', 'quit'));
-
-    WHEN 'back' THEN
-        RETURN jsonb_build_array(jsonb_build_object('do', 'back'));
-
-    WHEN 'open_stack' THEN
-        -- The stack named by the action, or else the selected grid row.
-        target := coalesce(act.args->>'stack', context->>'row');
-        IF target IS NULL THEN
-            RAISE EXCEPTION 'No stack is selected.' USING ERRCODE = 'XL002';
-        END IF;
-        PERFORM xila.background_of(target);
-        RETURN jsonb_build_array(jsonb_build_object('do', 'show', 'stack', target));
-
-    WHEN 'new_card' THEN
-        RETURN jsonb_build_array(jsonb_build_object('do', 'new'));
-
-    WHEN 'save_card' THEN
-        IF card IS NULL OR dirty <> '{}' THEN
-            saved := xila.save_card(stack, card, dirty);
-            RETURN jsonb_build_array(
-                jsonb_build_object('do', 'show', 'stack', stack, 'card', saved->>'key'),
-                jsonb_build_object('do', 'message', 'text', 'Card saved.'));
-        END IF;
-        RETURN jsonb_build_array(
-            jsonb_build_object('do', 'message', 'text', 'Nothing to save.'));
-
-    WHEN 'next_card', 'previous_card', 'first_card', 'last_card' THEN
-        -- Leaving a card saves what was typed on it.
-        IF dirty <> '{}' THEN
-            saved := xila.save_card(stack, card, dirty);
-            card := saved->>'key';
-        END IF;
-        target := xila.card(stack, card, split_part(act.handler, '_', 1))->>'key';
-        RETURN jsonb_build_array(
-            jsonb_build_object('do', 'show', 'stack', stack, 'card', target));
-    END CASE;
 END
 $$;
 

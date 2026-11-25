@@ -78,8 +78,17 @@ impl View {
         self.screen.widgets.iter().chain(self.card.widgets.iter())
     }
 
+    /// The key of the card on screen, unless it is not saved yet.
+    fn card_key(&self) -> Option<&str> {
+        if self.is_new {
+            None
+        } else {
+            self.card.key.as_deref()
+        }
+    }
+
     /// What the server needs to know about this view to run an action.
-    fn context(&self) -> Context {
+    fn context(&self, confirmed: bool) -> Context {
         // The focused grid decides the selected row; a single grid needs no focus.
         let grid = self.focus.as_ref().and_then(|name| self.grids.get(name)).or_else(|| {
             if self.grids.len() == 1 {
@@ -89,11 +98,22 @@ impl View {
             }
         });
         Context {
-            card: if self.is_new { None } else { self.card.key.clone() },
+            card: self.card_key().map(str::to_owned),
             dirty: self.dirty(),
             row: grid.and_then(|g| g.selected_key()).map(str::to_owned),
+            confirmed,
         }
     }
+}
+
+/// A question an action asks before it goes on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub text: String,
+    /// What accepting does, in a word: "Delete".
+    pub label: String,
+    /// The action to run again once the user has accepted.
+    action: String,
 }
 
 pub struct Session<A: Api> {
@@ -105,6 +125,7 @@ pub struct Session<A: Api> {
     /// not exist, so that it is not asked for again.
     images: BTreeMap<String, Option<Image>>,
     message: Option<String>,
+    question: Option<Question>,
     quit: bool,
 }
 
@@ -121,6 +142,7 @@ impl<A: Api> Session<A> {
             views: vec![home],
             images: BTreeMap::new(),
             message: None,
+            question: None,
             quit: false,
         };
         session.fetch_images();
@@ -185,6 +207,38 @@ impl<A: Api> Session<A> {
         self.quit
     }
 
+    /// The question waiting for an answer, if any. While there is one, the
+    /// client asks it and does nothing else.
+    pub fn question(&self) -> Option<&Question> {
+        self.question.as_ref()
+    }
+
+    /// Answers the pending question: accepting runs its action for good.
+    pub fn answer(&mut self, accepted: bool) {
+        if let Some(question) = self.question.take() {
+            if accepted {
+                self.perform(&question.action, true);
+            }
+        }
+    }
+
+    /// Changes a field that only takes some values to the next of them, or
+    /// to the previous one. Returns false when the field takes any value.
+    pub fn cycle(&mut self, widget: &str, forward: bool) -> bool {
+        let view = self.view();
+        let next = view
+            .widgets()
+            .find(|w| w.name == widget)
+            .and_then(|w| Some((w.column.clone()?, w.next_choice(view.value(w.column.as_deref()?), forward)?)));
+        match next {
+            Some((column, value)) => {
+                self.edit(&column, value);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Records what the user typed in a field.
     pub fn edit(&mut self, column: &str, text: String) {
         self.view_mut().edits.insert(column.to_owned(), text);
@@ -238,47 +292,82 @@ impl<A: Api> Session<A> {
 
     /// Asks the server to run an action and applies the effects it answers.
     pub fn run(&mut self, action: &str) {
+        self.perform(action, false);
+    }
+
+    fn perform(&mut self, action: &str, confirmed: bool) {
         self.message = None;
+        self.question = None;
         let stack = self.view().stack().to_owned();
-        let context = self.view().context();
-        let outcome = self
-            .api
-            .act(&stack, action, &context)
-            .and_then(|effects| effects.into_iter().try_for_each(|effect| self.apply(effect)));
+        let context = self.view().context(confirmed);
+        let outcome = self.api.act(&stack, action, &context).and_then(|effects| {
+            effects.into_iter().try_for_each(|effect| self.apply(effect, action))
+        });
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
         }
         self.fetch_images();
     }
 
-    fn apply(&mut self, effect: Effect) -> Result<(), ApiError> {
+    /// Applies one effect of an action.
+    fn apply(&mut self, effect: Effect, action: &str) -> Result<(), ApiError> {
         match effect {
             Effect::Show { stack, card } => {
                 if stack == self.view().stack() {
                     self.load_card(card.as_deref(), Move::At)?;
+                } else if let Some(below) = self.views.iter().rposition(|v| v.stack() == stack) {
+                    // The stack is already open underneath: go back to it
+                    // rather than open it a second time.
+                    self.views.truncate(below + 1);
+                    // Its definition may have changed while it was covered.
+                    self.reopen()?;
+                    if let Some(key) = card {
+                        self.load_card(Some(&key), Move::At)?;
+                    }
                 } else {
                     let view = open(&mut self.api, &stack, card.as_deref())?;
                     self.views.push(view);
                 }
             }
-            Effect::Back => {
-                if self.views.len() > 1 {
-                    self.views.pop();
-                    // What is underneath may have changed in the meantime.
-                    self.refresh()?;
-                }
-            }
+            Effect::Back => self.back()?,
             Effect::Reload => self.refresh()?,
             Effect::Focus { widget } => self.view_mut().focus = Some(widget),
             Effect::Message { text } => self.message = Some(text),
-            Effect::New => {
+            Effect::New { values } => {
                 let view = self.view_mut();
                 view.card = Card { count: view.card.count, ..Card::default() };
                 view.is_new = true;
-                view.edits.clear();
+                view.edits = values;
                 view.focus = None;
+                // A grid that lists what belongs to the card has nothing to
+                // list for a card that does not exist yet.
+                self.load_grids()?;
+            }
+            Effect::Confirm { text, label } => {
+                self.question = Some(Question { text, label, action: action.to_owned() });
+            }
+            Effect::Select { row } => {
+                for grid in self.view_mut().grids.values_mut() {
+                    if let Some(at) = grid.page.rows.iter().position(|r| r.key == row) {
+                        grid.selected = at;
+                    }
+                }
             }
             Effect::Quit => self.quit = true,
+        }
+        Ok(())
+    }
+
+    /// Returns to the previous screen. A screen that no longer exists, such
+    /// as a stack that was just deleted, is skipped.
+    fn back(&mut self) -> Result<(), ApiError> {
+        while self.views.len() > 1 {
+            self.views.pop();
+            // What is underneath may have changed in the meantime.
+            match self.reopen() {
+                Err(ApiError::User { code, .. }) if code == "XL002" && self.views.len() > 1 => {}
+                outcome => return outcome,
+            }
         }
         Ok(())
     }
@@ -292,7 +381,7 @@ impl<A: Api> Session<A> {
         view.card = card;
         view.is_new = false;
         view.edits.clear();
-        Ok(())
+        self.load_grids()
     }
 
     /// Reads again what the current view shows, keeping the user's edits.
@@ -304,11 +393,24 @@ impl<A: Api> Session<A> {
             let card = self.api.card(&stack, key.as_deref(), to)?;
             self.view_mut().card = card;
         }
+        self.load_grids()
+    }
+
+    /// Reads the rows of the grids of the current view, keeping the selected
+    /// row where it was.
+    fn load_grids(&mut self) -> Result<(), ApiError> {
+        let stack = self.view().stack().to_owned();
+        let card = self.view().card_key().map(str::to_owned);
         let names: Vec<String> = self.view().grids.keys().cloned().collect();
         for name in names {
-            let page = self.api.grid_rows(&stack, &name)?;
+            let page = self.api.grid_rows(&stack, &name, card.as_deref())?;
             let grid = self.view_mut().grids.get_mut(&name).expect("the grid was just listed");
-            grid.selected = grid.selected.min(page.rows.len().saturating_sub(1));
+            let selected = grid.selected_key().map(str::to_owned);
+            // The selection follows its row when the rows move around it.
+            grid.selected = selected
+                .and_then(|key| page.rows.iter().position(|r| r.key == key))
+                .unwrap_or(grid.selected)
+                .min(page.rows.len().saturating_sub(1));
             grid.page = page;
         }
         Ok(())
@@ -341,6 +443,10 @@ impl<A: Api> Session<A> {
                     if stack == self.view().stack() {
                         changed = true;
                         self.reopen()
+                    } else if !self.view().grids.is_empty() {
+                        // A list may show that stack: its fields, its title.
+                        changed = true;
+                        self.refresh()
                     } else {
                         Ok(())
                     }
@@ -361,7 +467,15 @@ impl<A: Api> Session<A> {
     fn reopen(&mut self) -> Result<(), ApiError> {
         let stack = self.view().stack().to_owned();
         let screen = self.api.open_stack(&stack)?;
-        self.view_mut().screen = screen;
+        let view = self.view_mut();
+        // The grids follow the definition: new ones appear, old ones go.
+        let mut grids = BTreeMap::new();
+        for widget in screen.widgets.iter().filter(|w| w.kind == WidgetKind::Grid) {
+            let state = view.grids.remove(&widget.name).unwrap_or_default();
+            grids.insert(widget.name.clone(), state);
+        }
+        view.grids = grids;
+        view.screen = screen;
         self.refresh()
     }
 }
@@ -373,7 +487,7 @@ fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, Ap
     let card = api.card(stack, card, to)?;
     let mut grids = BTreeMap::new();
     for widget in screen.widgets.iter().filter(|w| w.kind == WidgetKind::Grid) {
-        let page = api.grid_rows(stack, &widget.name)?;
+        let page = api.grid_rows(stack, &widget.name, card.key.as_deref())?;
         grids.insert(widget.name.clone(), GridState { page, selected: 0 });
     }
     Ok(View { screen, card, is_new: false, edits: BTreeMap::new(), grids, focus: None })
@@ -401,12 +515,31 @@ mod tests {
         pending: Vec<Notification>,
         /// The images asked for, in order.
         images: Vec<String>,
+        /// The card each call for the rows of a grid was made for.
+        grid_cards: Vec<Option<String>>,
+        /// Stacks that no longer exist.
+        gone: Vec<String>,
     }
 
     impl FakeServer {
         fn answering(mut self, action: &str, effects: Vec<Effect>) -> Self {
             self.effects.insert(action.to_owned(), Ok(effects));
             self
+        }
+
+        /// What an action answers once the user has accepted its question.
+        fn answering_once_confirmed(self, action: &str, effects: Vec<Effect>) -> Self {
+            self.answering(&format!("{action} (confirmed)"), effects)
+        }
+
+        fn gone_if_missing(&self, stack: &str) -> Result<(), ApiError> {
+            if self.gone.iter().any(|gone| gone == stack) {
+                return Err(ApiError::User {
+                    code: "XL002".into(),
+                    message: format!("The stack “{stack}” does not exist."),
+                });
+            }
+            Ok(())
         }
 
         fn failing(mut self, action: &str, message: &str) -> Self {
@@ -470,11 +603,13 @@ mod tests {
 
         fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
             self.calls.push(format!("open_stack {stack}"));
+            self.gone_if_missing(stack)?;
             Ok(screen(stack, stack == "stacks"))
         }
 
         fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError> {
             self.calls.push(format!("card {stack} {key:?} {}", to.as_str()));
+            self.gone_if_missing(stack)?;
             let key = key.unwrap_or("1").to_owned();
             Ok(Card {
                 values: BTreeMap::from([
@@ -488,8 +623,14 @@ mod tests {
             })
         }
 
-        fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
+        fn grid_rows(
+            &mut self,
+            stack: &str,
+            widget: &str,
+            card: Option<&str>,
+        ) -> Result<GridPage, ApiError> {
             self.calls.push(format!("grid_rows {stack} {widget}"));
+            self.grid_cards.push(card.map(str::to_owned));
             let row = |key: &str| GridRow { key: key.into(), cells: BTreeMap::new() };
             Ok(GridPage { total: 2, rows: vec![row("addressbook"), row("recipes")] })
         }
@@ -502,7 +643,9 @@ mod tests {
         ) -> Result<Vec<Effect>, ApiError> {
             self.calls.push(format!("act {stack} {action}"));
             self.contexts.push(context.clone());
-            self.effects.get(action).cloned().unwrap_or(Ok(vec![]))
+            let confirmed = format!("{action} (confirmed)");
+            let name = if context.confirmed { confirmed.as_str() } else { action };
+            self.effects.get(name).cloned().unwrap_or(Ok(vec![]))
         }
 
         fn notifications(&mut self) -> Vec<Notification> {
@@ -561,6 +704,7 @@ mod tests {
                 card: Some("1".into()),
                 dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
                 row: None,
+                confirmed: false,
             }
         );
     }
@@ -601,7 +745,12 @@ mod tests {
         assert_eq!(session.view().stack(), "stacks");
         assert_eq!(
             session.api.calls,
-            ["act addressbook back", "card stacks Some(\"1\") at", "grid_rows stacks list"]
+            [
+                "act addressbook back",
+                "open_stack stacks",
+                "card stacks Some(\"1\") at",
+                "grid_rows stacks list"
+            ]
         );
 
         // There is nothing behind the first screen.
@@ -635,7 +784,7 @@ mod tests {
     #[test]
     fn a_new_card_is_empty_and_is_sent_without_a_key() {
         let mut session =
-            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New]));
+            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New { values: BTreeMap::new() }]));
         session.run("new_card");
         assert!(session.view().is_new);
         assert_eq!(session.view().value("city"), "");
@@ -646,6 +795,131 @@ mod tests {
         let sent = session.api.contexts.last().unwrap();
         assert_eq!(sent.card, None);
         assert_eq!(sent.dirty["city"], "Lyon");
+    }
+
+    #[test]
+    fn a_new_card_may_come_with_some_fields_filled_in() {
+        let values = BTreeMap::from([("city".to_string(), "London".to_string())]);
+        let mut session =
+            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New { values }]));
+        session.run("new_card");
+        assert_eq!(session.view().value("city"), "London");
+
+        session.run("save_card");
+        let sent = session.api.contexts.last().unwrap();
+        assert_eq!(sent.card, None);
+        assert_eq!(sent.dirty["city"], "London", "what was filled in is sent like what is typed");
+    }
+
+    #[test]
+    fn an_action_may_ask_before_it_goes_on() {
+        let ask =
+            vec![Effect::Confirm { text: "Delete this card?".into(), label: "Delete".into() }];
+        let server = FakeServer::default()
+            .answering("delete", ask)
+            .answering_once_confirmed("delete", vec![Effect::Message { text: "Card deleted.".into() }]);
+        let mut session = on_addressbook(server);
+
+        session.run("delete");
+        let question = session.question().expect("a question is pending");
+        assert_eq!((question.text.as_str(), question.label.as_str()), ("Delete this card?", "Delete"));
+        assert_eq!(session.message(), None);
+
+        // Refusing does nothing at all.
+        session.answer(false);
+        assert_eq!(session.question(), None);
+        assert_eq!(session.api.calls, ["act addressbook delete"]);
+
+        // Accepting runs the same action again, and says so.
+        session.run("delete");
+        session.answer(true);
+        assert_eq!(session.question(), None);
+        assert_eq!(session.message(), Some("Card deleted."));
+        let sent: Vec<bool> = session.api.contexts.iter().map(|c| c.confirmed).collect();
+        assert_eq!(sent, [false, false, true]);
+    }
+
+    #[test]
+    fn another_action_drops_a_pending_question() {
+        let ask = vec![Effect::Confirm { text: "Sure?".into(), label: "Yes".into() }];
+        let mut session = on_addressbook(FakeServer::default().answering("delete", ask));
+        session.run("delete");
+        session.run("next_card");
+        assert_eq!(session.question(), None);
+    }
+
+    #[test]
+    fn showing_a_stack_that_is_open_underneath_goes_back_to_it() {
+        let server = FakeServer::default()
+            .answering("author", vec![Effect::Show { stack: "author".into(), card: None }])
+            .answering("browse", vec![Effect::Show { stack: "addressbook".into(), card: None }]);
+        let mut session = on_addressbook(server);
+        session.run("author");
+        assert_eq!(session.view().stack(), "author");
+
+        session.run("browse");
+        assert_eq!(session.view().stack(), "addressbook");
+        // The pile did not grow: going back leads to the list of stacks.
+        let mut session = {
+            session.api.effects.insert("back".into(), Ok(vec![Effect::Back]));
+            session
+        };
+        session.run("back");
+        assert_eq!(session.view().stack(), "stacks");
+    }
+
+    #[test]
+    fn going_back_skips_a_screen_that_no_longer_exists() {
+        let server = FakeServer::default()
+            .answering("author", vec![Effect::Show { stack: "author".into(), card: None }])
+            .answering("delete_stack", vec![Effect::Back]);
+        let mut session = on_addressbook(server);
+        session.run("author");
+
+        // The stack underneath the dialog was deleted by the dialog.
+        session.api.gone.push("addressbook".into());
+        session.run("delete_stack");
+        assert_eq!(session.view().stack(), "stacks");
+        assert_eq!(session.message(), None);
+    }
+
+    #[test]
+    fn a_grid_lists_what_belongs_to_the_card_on_screen() {
+        let server = FakeServer::default()
+            .answering("author", vec![Effect::Show { stack: "stacks".into(), card: Some("7".into()) }]);
+        let mut session = Session::start(server).unwrap();
+        assert_eq!(session.api.grid_cards, [Some("1".to_string())]);
+
+        // Another card: the rows are read again for it.
+        session.run("author");
+        assert_eq!(session.api.grid_cards.last(), Some(&Some("7".to_string())));
+
+        // A card that does not exist yet has no rows of its own.
+        session.api.effects.insert("new".into(), Ok(vec![Effect::New { values: BTreeMap::new() }]));
+        session.run("new");
+        assert_eq!(session.api.grid_cards.last(), Some(&None));
+    }
+
+    #[test]
+    fn a_row_can_be_selected_by_the_server() {
+        let server = FakeServer::default()
+            .answering("down", vec![Effect::Reload, Effect::Select { row: "recipes".into() }]);
+        let mut session = Session::start(server).unwrap();
+        session.run("down");
+        assert_eq!(session.view().grids["list"].selected_key(), Some("recipes"));
+        // Reading the rows again keeps the selection on its row.
+        session.api.effects.insert("again".into(), Ok(vec![Effect::Reload]));
+        session.run("again");
+        assert_eq!(session.view().grids["list"].selected_key(), Some("recipes"));
+    }
+
+    #[test]
+    fn a_change_to_another_stack_refreshes_a_list_that_may_show_it() {
+        let mut session = Session::start(FakeServer::default()).unwrap();
+        session.api.calls.clear();
+        session.api.pending.push(Notification::Screen { stack: Some("recipes".into()) });
+        assert!(session.poll());
+        assert_eq!(session.api.calls, ["card stacks Some(\"1\") at", "grid_rows stacks list"]);
     }
 
     #[test]

@@ -122,8 +122,13 @@ impl Api for Server {
         self.call("SELECT xila.card($1, $2, $3)", &[&stack, &key, &to.as_str()])
     }
 
-    fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
-        self.call("SELECT xila.grid_rows($1, $2)", &[&stack, &widget])
+    fn grid_rows(
+        &mut self,
+        stack: &str,
+        widget: &str,
+        card: Option<&str>,
+    ) -> Result<GridPage, ApiError> {
+        self.call("SELECT xila.grid_rows($1, $2, 0, 100, $3)", &[&stack, &widget, &card])
     }
 
     fn act(
