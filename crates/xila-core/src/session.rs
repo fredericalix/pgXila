@@ -205,6 +205,11 @@ impl<A: Api> Session<A> {
         &self.api
     }
 
+    /// The same, to change it: a test makes its server behave otherwise.
+    pub fn api_mut(&mut self) -> &mut A {
+        &mut self.api
+    }
+
     pub fn hello(&self) -> &Hello {
         &self.hello
     }
@@ -374,12 +379,12 @@ impl<A: Api> Session<A> {
     }
 
     /// Runs an action for a tool of the client, which says what it wants in
-    /// `input`.
-    pub fn run_with(&mut self, action: &str, input: serde_json::Value) {
-        self.perform(action, false, Some(input));
+    /// `input`. Returns false when the server refused: the message says why.
+    pub fn run_with(&mut self, action: &str, input: serde_json::Value) -> bool {
+        self.perform(action, false, Some(input))
     }
 
-    fn perform(&mut self, action: &str, confirmed: bool, input: Option<serde_json::Value>) {
+    fn perform(&mut self, action: &str, confirmed: bool, input: Option<serde_json::Value>) -> bool {
         self.message = None;
         self.question = None;
         let stack = self.view().stack().to_owned();
@@ -387,10 +392,12 @@ impl<A: Api> Session<A> {
         let outcome = self.api.act(&stack, action, &context).and_then(|effects| {
             effects.into_iter().try_for_each(|effect| self.apply(effect, action, &input))
         });
+        let done = outcome.is_ok();
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
         }
         self.fetch_images();
+        done
     }
 
     /// Applies one effect of an action.
@@ -1214,8 +1221,7 @@ mod tests {
 
     #[test]
     fn the_icons_of_a_list_are_read_with_its_rows() {
-        let mut server = FakeServer::default();
-        server.icons = true;
+        let server = FakeServer { icons: true, ..FakeServer::default() };
         let session = Session::start(server).unwrap();
         // One of the two rows has an icon; it is asked for once.
         assert_eq!(session.api.images, ["icon-of-recipes"]);

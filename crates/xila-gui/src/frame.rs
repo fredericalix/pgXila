@@ -4,7 +4,7 @@
 //! here first, by the client itself, pixel by pixel; the window only enlarges
 //! the result by a whole factor.
 
-use xila_core::api::Image;
+use xila_core::api::{Image, TRANSPARENT};
 
 pub const WIDTH: i32 = 480;
 pub const HEIGHT: i32 = 300;
@@ -227,12 +227,21 @@ impl Frame {
 
     /// Draws an image of the database, top left corner at (x, y).
     pub fn blit(&mut self, image: &Image, x: i32, y: i32) {
-        let area = Rect::new(x, y, i32::from(image.width), i32::from(image.height))
+        self.blit_scaled(image, x, y, 1);
+    }
+
+    /// Copies an image with each of its pixels enlarged to a square of
+    /// `scale` pixels. A transparent pixel leaves what is there.
+    pub fn blit_scaled(&mut self, image: &Image, x: i32, y: i32, scale: i32) {
+        let scale = scale.max(1);
+        let area = Rect::new(x, y, i32::from(image.width) * scale, i32::from(image.height) * scale)
             .intersection(&self.clip);
         for row in area.y..area.bottom() {
             for column in area.x..area.right() {
-                if let Some(slot) = image.pixel((column - x) as u16, (row - y) as u16) {
-                    self.pixels[(row * WIDTH + column) as usize] = slot;
+                let source = (((column - x) / scale) as u16, ((row - y) / scale) as u16);
+                match image.pixel(source.0, source.1) {
+                    Some(TRANSPARENT) | None => {}
+                    Some(slot) => self.pixels[(row * WIDTH + column) as usize] = slot,
                 }
             }
         }

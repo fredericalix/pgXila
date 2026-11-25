@@ -14,9 +14,12 @@ use crate::chrome::{
     WindowStyle, BUTTON_HEIGHT,
 };
 use crate::design::{self, Designer};
+use crate::draw::{self, Painter};
 use crate::font::Fonts;
 use crate::frame::{Frame, Rect};
-use crate::layout::{self, FieldKind, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW};
+use crate::layout::{
+    self, is_icon_view, FieldKind, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW, TILE,
+};
 use crate::palette::slot;
 
 /// Longest text a field accepts when its widget sets no limit.
@@ -36,6 +39,8 @@ pub struct Ui {
     pressed: Option<String>,
     /// What the visual editor remembers, while a stack is open in it.
     pub designer: Designer,
+    /// What the drawing editor remembers, while a picture is open in it.
+    pub painter: Painter,
 }
 
 /// Where everything is on the screen, for one view.
@@ -69,7 +74,9 @@ impl Geometry {
 fn focus_of(view: &View, layout: &GraphicLayout) -> Option<String> {
     let remembered = view.focus.as_ref().filter(|name| layout.focus_order.contains(name));
     let first_input = layout.focus_order.iter().find(|name| {
-        layout.item(name).is_some_and(|item| !matches!(item.part, Part::Button { .. }))
+        layout
+            .item(name)
+            .is_some_and(|item| !matches!(item.part, Part::Button { .. } | Part::Picture))
     });
     remembered.or(first_input).or(layout.focus_order.first()).cloned()
 }
@@ -161,6 +168,13 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         return;
     }
 
+    // A picture open in the drawing editor: the keys are those of the editor.
+    if session.view().drawing.is_some() {
+        draw::handle_key(session, &mut ui.painter, key);
+        settle(session, ui, fonts);
+        return;
+    }
+
     // A stack open in the visual editor: the keys are those of the editor.
     if session.view().designing {
         design::handle_key(session, &mut ui.designer, fonts, key);
@@ -173,6 +187,14 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
     sync_cursor(session, ui, &layout, &focus);
 
     let on_grid = matches!(part_of(&layout, &focus), Some(Part::Grid));
+    let on_picture = matches!(part_of(&layout, &focus), Some(Part::Picture));
+    let icon_list = focus
+        .as_deref()
+        .filter(|_| on_grid)
+        .and_then(|name| Some((widget(session.view(), name)?, layout.item(name)?)))
+        .filter(|(definition, _)| is_icon_view(definition));
+    let on_icons = icon_list.is_some();
+    let icons_across = icon_list.map_or(1, |(_, item)| tiles_across(item.area) as isize);
     let on_button = matches!(part_of(&layout, &focus), Some(Part::Button { .. }));
     let on_choice = matches!(
         part_of(&layout, &focus),
@@ -190,8 +212,17 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
                 session.say("This key is not active on this screen.");
             }
         }
+        // A list shown as icons is walked in two directions.
+        Key::Left if on_icons => session.select_row(&name, -1),
+        Key::Right if on_icons => session.select_row(&name, 1),
+        Key::Up if on_icons => session.select_row(&name, -icons_across),
+        Key::Down if on_icons => session.select_row(&name, icons_across),
         Key::Up if on_grid => session.select_row(&name, -1),
         Key::Down if on_grid => session.select_row(&name, 1),
+        // The picture of a card: Enter or the space bar draws it.
+        Key::Enter | Key::Char(' ') if on_picture => {
+            session.run_with("draw", serde_json::json!({ "target": "card", "widget": name }));
+        }
         Key::Tab | Key::Down => move_focus(session, &layout, &focus, 1),
         Key::BackTab | Key::Up => move_focus(session, &layout, &focus, -1),
         Key::Enter if on_grid || on_button => session.activate(&name),
@@ -226,6 +257,11 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
 /// After anything that may have changed the card, the stack or the focus:
 /// makes the focus and the cursor agree with what is on screen.
 pub fn settle<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) {
+    // The drawing editor follows what the session says is being drawn.
+    draw::settle(session, &mut ui.painter);
+    if session.view().drawing.is_some() {
+        return;
+    }
     // In the visual editor nothing is typed on the card: there is no field
     // to keep the cursor in, but a selection to keep up to date.
     if session.view().designing {
@@ -299,6 +335,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
         return;
     }
 
+    if session.view().drawing.is_some() {
+        draw::pointer_down(session, &mut ui.painter, fonts, x, y);
+        settle(session, ui, fonts);
+        return;
+    }
     if session.view().designing {
         design::pointer_down(session, &mut ui.designer, fonts, x, y);
         settle(session, ui, fonts);
@@ -349,10 +390,25 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
             settle(session, ui, fonts);
             ui.cursor = field_cursor_at(fonts, area, &text, first, x);
         }
+        // The picture of a card: a click draws it.
+        Part::Picture => {
+            let of_a_card = widget(session.view(), &item.widget)
+                .is_some_and(|w| w.column.is_some())
+                && session.view().screen.source.has_cards;
+            if of_a_card {
+                session.set_focus(Some(item.widget.clone()));
+                session.run_with(
+                    "draw",
+                    serde_json::json!({ "target": "card", "widget": item.widget }),
+                );
+            }
+        }
         Part::Grid => {
             session.set_focus(Some(item.widget.clone()));
             let Some(state) = session.view().grids.get(&item.widget) else { return };
-            let Some(row) = grid_row_at(area, state, y) else { return };
+            let icons = widget(session.view(), &item.widget).is_some_and(is_icon_view);
+            let row = if icons { tile_at(area, state, x, y) } else { grid_row_at(area, state, y) };
+            let Some(row) = row else { return };
             // A click chooses a row; a click on the chosen row opens it.
             if row == state.selected {
                 session.activate(&item.widget);
@@ -368,6 +424,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
 /// The pointer was released. A button acts when the pointer is released on
 /// it, so that one can change one's mind by moving away.
 pub fn pointer_up<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, x: i32, y: i32) {
+    if session.view().drawing.is_some() && session.question().is_none() {
+        draw::pointer_up(session, &mut ui.painter, x, y);
+        settle(session, ui, fonts);
+        return;
+    }
     if session.view().designing && session.question().is_none() {
         design::pointer_up(session, &mut ui.designer, fonts, x, y);
         settle(session, ui, fonts);
@@ -391,14 +452,20 @@ pub fn pointer_move<A: Api>(
     x: i32,
     y: i32,
 ) -> bool {
-    session.view().designing
-        && session.question().is_none()
-        && design::pointer_move(session, &mut ui.designer, fonts, x, y)
+    if session.question().is_some() {
+        return false;
+    }
+    if session.view().drawing.is_some() {
+        return draw::pointer_move(session, &mut ui.painter, x, y);
+    }
+    session.view().designing && design::pointer_move(session, &mut ui.designer, fonts, x, y)
 }
 
 /// Time passes. Returns true when the screen must be drawn again.
 pub fn tick<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) -> bool {
-    session.view().designing && design::tick(session, &mut ui.designer, fonts)
+    session.view().drawing.is_none()
+        && session.view().designing
+        && design::tick(session, &mut ui.designer, fonts)
 }
 
 /// What to say about the position in the stack.
@@ -428,6 +495,12 @@ pub fn draw<A: Api>(
     blink: bool,
 ) {
     let view = session.view();
+    if view.drawing.is_some() && ui.painter.canvas.is_some() {
+        draw::draw(session, &ui.painter, fonts, frame, clock, blink);
+        let hint = draw::hint(&ui.painter);
+        draw_over(session, fonts, frame, Some(&hint), draw::KEYS.into_iter());
+        return;
+    }
     if view.designing {
         design::draw(session, &ui.designer, fonts, frame, clock, blink);
         draw_over(session, fonts, frame, design::hint(&ui.designer), design::KEYS.into_iter());
@@ -561,6 +634,9 @@ fn draw_stack<A: Api>(
                 }
             }
             Part::Picture => {
+                if focused {
+                    frame.outline(area.inset(-1), slot::BLUE);
+                }
                 frame.outline(area, slot::INK);
                 let inside = area.inset(1);
                 let clip = frame.clip_to(inside);
@@ -568,7 +644,11 @@ fn draw_stack<A: Api>(
                     .and_then(|w| view.image_id(w))
                     .and_then(|id| session.image(id));
                 match image {
-                    Some(image) => frame.blit(image, inside.x, inside.y),
+                    Some(image) => {
+                        // What is transparent in a picture shows the paper.
+                        frame.fill(inside, slot::CREAM);
+                        frame.blit(image, inside.x, inside.y);
+                    }
                     None => {
                         // An empty frame, waiting for a picture.
                         frame.fill(inside, slot::ICE);
@@ -581,7 +661,11 @@ fn draw_stack<A: Api>(
                 if let (Some(definition), Some(state)) =
                     (widget(view, &item.widget), view.grids.get(&item.widget))
                 {
-                    draw_grid(frame, fonts, area, definition, state, focused);
+                    if is_icon_view(definition) {
+                        draw_icons(frame, fonts, session, area, definition, state, focused);
+                    } else {
+                        draw_grid(frame, fonts, area, definition, state, focused);
+                    }
                 }
             }
             Part::Button { label, look } => {
@@ -662,6 +746,180 @@ fn grid_row_at(area: Rect, state: &GridState, y: i32) -> Option<usize> {
     let line = ((y - top) / GRID_ROW) as usize;
     let row = grid_first(area, state) + line;
     (line < grid_capacity(area) && row < state.page.rows.len()).then_some(row)
+}
+
+/// How many tiles of a list shown as icons fit side by side, and one under
+/// the other.
+fn tiles_across(area: Rect) -> usize {
+    (area.w / TILE.0).max(1) as usize
+}
+
+fn tiles_down(area: Rect) -> usize {
+    (area.h / TILE.1).max(1) as usize
+}
+
+/// The first row of tiles shown, so that the selected one stays in sight.
+fn first_tile_row(area: Rect, state: &GridState) -> usize {
+    (state.selected / tiles_across(area) + 1).saturating_sub(tiles_down(area))
+}
+
+/// The rectangle of a tile on screen, by its place among those in sight.
+fn tile_area(area: Rect, place: usize) -> Rect {
+    let across = tiles_across(area);
+    // The tiles share the width, so that they are centred as a whole.
+    let pitch = area.w / across as i32;
+    Rect::new(
+        area.x + (place % across) as i32 * pitch + (pitch - TILE.0) / 2,
+        area.y + (place / across) as i32 * TILE.1,
+        TILE.0,
+        TILE.1,
+    )
+}
+
+/// The row of a list shown as icons under a point, if there is one.
+fn tile_at(area: Rect, state: &GridState, x: i32, y: i32) -> Option<usize> {
+    let first = first_tile_row(area, state) * tiles_across(area);
+    let in_sight = tiles_across(area) * tiles_down(area);
+    (0..in_sight)
+        .find(|place| tile_area(area, *place).contains(x, y))
+        .map(|place| first + place)
+        .filter(|row| *row < state.page.rows.len())
+}
+
+/// The icon of a row that has none: a pile of cards.
+fn generic_icon() -> crate::frame::Sprite {
+    crate::frame::Sprite::from_art(
+        &[
+            "......####################..",
+            "......#sssssssssssssssssss#.",
+            "...####################sss#.",
+            "...#ssssssssssssssssss#sss#.",
+            "####################ss#sss#.",
+            "#aaaaaaaaaaaaaaaaaa#ss#sss#.",
+            "#aaaaaaaaaaaaaaaaaa#ss#sss#.",
+            "#aaaaaaaaaaaaaaaaaa#ss#sss#.",
+            "####################ss#sss#.",
+            "#oooooooooooooooooo#ss#sss#.",
+            "#oiiiiioooooooooooo#ss#sss#.",
+            "#oiiiiiooggggggggoo#ss#sss#.",
+            "#oiiiiioooooooooooo#ss#sss#.",
+            "#oiiiiiooggggggggoo#ss#sss#.",
+            "#oiiiiioooooooooooo#ss#sss#.",
+            "#oiiiiiooggggggggoo#ss#sss#.",
+            "#oiiiiioooooooooooo#ss#sss#.",
+            "#oooooooooooooooooo#ss#sss#.",
+            "#ogggggoooooooooooo#ss#sss#.",
+            "#oooooooooooooooooo#ss#####.",
+            "#oooooooooooooooooo#ss#.....",
+            "#oooooooooooooooooo####.....",
+            "#oooooooooooooooooo#........",
+            "####################........",
+        ],
+        &[
+            ('#', slot::INK),
+            ('s', slot::OCHRE),
+            ('a', slot::AMBER),
+            ('o', slot::CREAM),
+            ('i', slot::ICE),
+            ('g', slot::SILVER),
+        ],
+    )
+}
+
+/// A list shown as icons, as on a desktop: each row is an icon at twice its
+/// size, with the text of its first column under it and that of the second,
+/// with its heading, under that ("12 cards").
+fn draw_icons<A: Api>(
+    frame: &mut Frame,
+    fonts: &Fonts,
+    session: &Session<A>,
+    area: Rect,
+    definition: &Widget,
+    state: &GridState,
+    focused: bool,
+) {
+    const ICON: (i32, i32) = (56, 52);
+    let columns = grid_columns(definition, area);
+    let icon_column = definition.props.get("icon").and_then(|v| v.as_str()).unwrap_or_default();
+    if state.page.rows.is_empty() {
+        let empty = definition.props.get("empty").and_then(|v| v.as_str()).unwrap_or("No rows.");
+        fonts.regular.draw(frame, area.x + 6, area.y + 14, empty, slot::GREY);
+        return;
+    }
+
+    let first = first_tile_row(area, state) * tiles_across(area);
+    let in_sight = tiles_across(area) * tiles_down(area);
+    for (place, (index, row)) in
+        state.page.rows.iter().enumerate().skip(first).take(in_sight).enumerate()
+    {
+        let tile = tile_area(area, place);
+        let cell = |column: Option<&Column>| {
+            column.and_then(|c| row.cells.get(c.name)).and_then(|v| v.as_deref()).unwrap_or("")
+        };
+
+        // The icon, enlarged, in the middle of its box; a generic one if the
+        // row has none.
+        let image =
+            row.cells.get(icon_column).and_then(|v| v.as_deref()).and_then(|id| session.image(id));
+        match image {
+            Some(image) => {
+                let scale = if i32::from(image.width) * 2 <= ICON.0
+                    && i32::from(image.height) * 2 <= ICON.1
+                {
+                    2
+                } else {
+                    1
+                };
+                let (w, h) = (i32::from(image.width) * scale, i32::from(image.height) * scale);
+                let clip = frame.clip_to(Rect::new(
+                    tile.x + (TILE.0 - ICON.0) / 2,
+                    tile.y + 4,
+                    ICON.0,
+                    ICON.1,
+                ));
+                frame.blit_scaled(
+                    image,
+                    tile.x + (TILE.0 - w) / 2,
+                    tile.y + 4 + (ICON.1 - h) / 2,
+                    scale,
+                );
+                frame.set_clip(clip);
+            }
+            None => {
+                let sprite = generic_icon();
+                let x = tile.x + (TILE.0 - sprite.width * 2) / 2;
+                let y = tile.y + 4 + (ICON.1 - sprite.height * 2) / 2;
+                for (at, pixel) in sprite.pixels.iter().enumerate() {
+                    if let Some(colour) = pixel {
+                        let (px, py) = (at as i32 % sprite.width, at as i32 / sprite.width);
+                        frame.fill(Rect::new(x + px * 2, y + py * 2, 2, 2), *colour);
+                    }
+                }
+            }
+        }
+
+        // The title, on a bar when the row is selected, and the line under it.
+        let title = cell(columns.first());
+        let width = fonts.bold.width(title).min(TILE.0 - 6);
+        let title_x = tile.x + (TILE.0 - width) / 2;
+        let title_y = tile.y + 4 + ICON.1 + 4;
+        let colour = if index == state.selected {
+            let bar = Rect::new(title_x - 3, title_y - 1, width + 6, 12);
+            frame.fill(bar, if focused { slot::BLUE } else { slot::SILVER });
+            slot::WHITE
+        } else {
+            slot::INK
+        };
+        let clip = frame.clip_to(Rect::new(title_x, title_y, width, 11));
+        fonts.bold.draw(frame, title_x, title_y + 9, title, colour);
+        frame.set_clip(clip);
+
+        if let Some(second) = columns.get(1) {
+            let line = format!("{} {}", cell(Some(second)), second.label.to_lowercase());
+            let x = tile.x + (TILE.0 - fonts.regular.width(&line)) / 2;
+            fonts.regular.draw(frame, x, title_y + 21, &line, slot::GREY);
+        }
+    }
 }
 
 /// A list of rows under a header, the selected row highlighted.
@@ -808,36 +1066,67 @@ mod tests {
     }
 
     #[test]
-    fn a_list_is_browsed_with_the_arrows_or_the_pointer() {
+    fn a_list_of_icons_is_browsed_with_the_arrows_or_the_pointer() {
         let mut session = Session::start(Fake::default()).unwrap();
         let mut ui = Ui::default();
         press(&mut session, &mut ui, &[Key::Enter]);
         let frame = render(&session, &ui);
         let list = area_of(&session, "list");
-        // The first row is selected and highlighted.
-        assert_eq!(frame.pixel(list.x + 2, list.y + 1 + GRID_HEADER + 2), Some(slot::BLUE));
-        assert_eq!(frame.pixel(list.x + 2, list.y + 3), Some(slot::SAND));
+        let (first, second) = (tile_area(list, 0), tile_area(list, 1));
+        // The first stack is selected: its title is on a blue bar.
+        let title_of = |tile: Rect| Rect::new(tile.x, tile.y + 58, tile.w, 14);
+        assert!(has_slot(&frame, title_of(first), slot::BLUE));
+        assert!(!has_slot(&frame, title_of(second), slot::BLUE));
 
-        // A click on the second row chooses it; a click on it again opens it.
-        let second = list.y + 1 + GRID_HEADER + GRID_ROW + 4;
-        click(&mut session, &mut ui, list.x + 30, second);
+        // A click on the second one chooses it; a click on it again opens it.
+        let (x, y) = centre(second);
+        click(&mut session, &mut ui, x, y);
         assert_eq!(session.view().grids["list"].selected, 1);
         assert_eq!(session.view().stack(), "stacks");
-        click(&mut session, &mut ui, list.x + 30, second);
+        click(&mut session, &mut ui, x, y);
         assert_eq!(session.view().stack(), "recipes");
         assert_eq!(actions(&session).last().unwrap().1.row.as_deref(), Some("recipes"));
     }
 
     #[test]
-    fn a_click_under_the_last_row_of_a_list_does_nothing() {
+    fn a_click_beside_the_icons_of_a_list_does_nothing() {
         let mut session = Session::start(Fake::default()).unwrap();
         let mut ui = Ui::default();
-        press(&mut session, &mut ui, &[Key::Enter, Key::Down]);
+        press(&mut session, &mut ui, &[Key::Enter, Key::Right]);
         let list = area_of(&session, "list");
-        click(&mut session, &mut ui, list.x + 30, list.bottom() - 4);
-        click(&mut session, &mut ui, list.x + 30, list.y + 4);
+        // Where a third and a fourth stack would be.
+        for place in [2, 4] {
+            let (x, y) = centre(tile_area(list, place));
+            click(&mut session, &mut ui, x, y);
+        }
         assert_eq!(session.view().stack(), "stacks");
         assert_eq!(session.view().grids["list"].selected, 1);
+    }
+
+    #[test]
+    fn a_list_of_rows_is_browsed_with_the_arrows_or_the_pointer() {
+        let (mut session, mut ui) = author_session();
+        let frame = render(&session, &ui);
+        let list = area_of(&session, "fields");
+        // The first row is selected; the list has no focus, so its bar is grey.
+        assert_eq!(frame.pixel(list.x + 2, list.y + 1 + GRID_HEADER + 2), Some(slot::SILVER));
+        assert_eq!(frame.pixel(list.x + 2, list.y + 3), Some(slot::SAND));
+
+        // A click on the second row chooses it; a click on it again opens it.
+        let second = list.y + 1 + GRID_HEADER + GRID_ROW + 4;
+        click(&mut session, &mut ui, list.x + 30, second);
+        assert_eq!(session.view().grids["fields"].selected, 1);
+        assert_eq!(session.view().stack(), "author");
+        assert_eq!(render(&session, &ui).pixel(list.x + 2, second), Some(slot::BLUE));
+        // A click under the last row, or on the header, does nothing.
+        click(&mut session, &mut ui, list.x + 30, list.bottom() - 4);
+        click(&mut session, &mut ui, list.x + 30, list.y + 4);
+        assert_eq!(session.view().grids["fields"].selected, 1);
+        assert_eq!(session.view().stack(), "author");
+
+        click(&mut session, &mut ui, list.x + 30, second);
+        assert_eq!(session.view().stack(), "field");
+        assert_eq!(actions(&session).last().unwrap().1.row.as_deref(), Some("f2"));
     }
 
     /// A session in author mode on the address book.
