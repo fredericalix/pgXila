@@ -246,7 +246,12 @@ pub struct KeyBinding {
 pub struct Colour {
     pub slot: u8,
     pub rgb: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
+
+/// The palette slot of a pixel that shows what is behind the picture.
+pub const TRANSPARENT: u8 = 255;
 
 /// Answer of `xila.card()`: one card. Values travel as text.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -352,6 +357,18 @@ pub enum Effect {
     Select { row: String },
     /// Open the visual editor on a stack. Only the graphical client has one.
     Design { stack: String },
+    /// Open the drawing editor on a picture: the icon of the stack, the
+    /// picture of the card on screen, or a picture of the background. `image`
+    /// is what the picture shows now, if anything.
+    Draw {
+        target: String,
+        #[serde(default)]
+        widget: Option<String>,
+        #[serde(default)]
+        image: Option<String>,
+        width: u16,
+        height: u16,
+    },
     /// Leave the client.
     Quit,
 }
@@ -531,7 +548,8 @@ mod tests {
             { "do": "new", "values": { "stack": "books", "type": "text" } },
             { "do": "confirm", "text": "Delete this card?", "label": "Delete" },
             { "do": "select", "row": "42" },
-            { "do": "design", "stack": "books" }
+            { "do": "design", "stack": "books" },
+            { "do": "draw", "target": "card", "widget": "photo", "width": 68, "height": 80 }
         ]))
         .unwrap();
         assert_eq!(
@@ -546,6 +564,13 @@ mod tests {
                 Effect::Confirm { text: "Delete this card?".into(), label: "Delete".into() },
                 Effect::Select { row: "42".into() },
                 Effect::Design { stack: "books".into() },
+                Effect::Draw {
+                    target: "card".into(),
+                    widget: Some("photo".into()),
+                    image: None,
+                    width: 68,
+                    height: 80
+                },
             ]
         );
     }

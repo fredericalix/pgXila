@@ -37,6 +37,8 @@ pub struct View {
     pub is_new: bool,
     /// True while the stack is open in the visual editor rather than browsed.
     pub designing: bool,
+    /// The picture open in the drawing editor, if one is.
+    pub drawing: Option<Drawing>,
     /// What the user typed, by column.
     pub edits: BTreeMap<String, String>,
     pub grids: BTreeMap<String, GridState>,
@@ -134,6 +136,19 @@ impl View {
     }
 }
 
+/// A picture open in the drawing editor of the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drawing {
+    /// What the picture is: `icon`, `card` or `widget`.
+    pub target: String,
+    /// The widget that shows it, unless it is the icon of the stack.
+    pub widget: Option<String>,
+    /// The image it shows now, if any: what the drawing starts from.
+    pub image: Option<String>,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// A question an action asks before it goes on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
@@ -208,13 +223,25 @@ impl<A: Api> Session<A> {
     /// An image that cannot be read is simply not drawn.
     fn fetch_images(&mut self) {
         let view = self.views.last().expect("a session always has a view");
-        let wanted: Vec<String> = view
+        let pictures = view
             .widgets()
             .filter(|widget| widget.kind == WidgetKind::Image)
-            .filter_map(|widget| view.image_id(widget))
-            .filter(|id| !self.images.contains_key(*id))
-            .map(str::to_owned)
-            .collect();
+            .filter_map(|widget| view.image_id(widget));
+        // A list shown as icons has one image for each of its rows.
+        let icons =
+            view.screen.widgets.iter().filter(|w| w.kind == WidgetKind::Grid).flat_map(|widget| {
+                let column = widget.props.get("icon").and_then(|v| v.as_str());
+                let rows = view.grids.get(&widget.name).map(|grid| grid.page.rows.as_slice());
+                rows.unwrap_or_default()
+                    .iter()
+                    .filter_map(move |row| row.cells.get(column?).and_then(|cell| cell.as_deref()))
+            });
+        let mut wanted: Vec<String> = Vec::new();
+        for id in pictures.chain(icons) {
+            if !id.is_empty() && !self.images.contains_key(id) && !wanted.iter().any(|w| w == id) {
+                wanted.push(id.to_owned());
+            }
+        }
         for id in wanted {
             let image = self.api.image(&id).ok().flatten();
             self.images.insert(id, image);
@@ -267,6 +294,11 @@ impl<A: Api> Session<A> {
     /// Leaves the visual editor: the stack is browsed again.
     pub fn stop_designing(&mut self) {
         self.view_mut().designing = false;
+    }
+
+    /// Leaves the drawing editor.
+    pub fn stop_drawing(&mut self) {
+        self.view_mut().drawing = None;
     }
 
     /// Changes a field that only takes some values to the next of them, or
@@ -392,6 +424,20 @@ impl<A: Api> Session<A> {
                 view.focus = None;
             }
             Effect::Back => self.back()?,
+            Effect::Draw { target, widget, image, width, height } => {
+                if self.renderer != "graphic" {
+                    self.message = Some("Drawing needs the graphical client.".into());
+                    return Ok(());
+                }
+                // The drawing starts from the image the picture shows now.
+                if let Some(id) = &image {
+                    if !self.images.contains_key(id) {
+                        let read = self.api.image(id)?;
+                        self.images.insert(id.clone(), read);
+                    }
+                }
+                self.view_mut().drawing = Some(Drawing { target, widget, image, width, height });
+            }
             Effect::Reload => self.reopen()?,
             Effect::Focus { widget } => self.view_mut().focus = Some(widget),
             Effect::Message { text } => self.message = Some(text),
@@ -575,6 +621,7 @@ fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, Ap
         card,
         is_new: false,
         designing: false,
+        drawing: None,
         edits: BTreeMap::new(),
         grids,
         focus: None,
@@ -610,6 +657,8 @@ mod tests {
         gone: Vec<String>,
         /// The version of the API the server claims, when not the current one.
         api: Option<u32>,
+        /// True when the list of stacks is shown as icons.
+        icons: bool,
     }
 
     impl FakeServer {
@@ -695,7 +744,14 @@ mod tests {
         fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
             self.calls.push(format!("open_stack {stack}"));
             self.gone_if_missing(stack)?;
-            Ok(screen(stack, stack == "stacks"))
+            let mut screen = screen(stack, stack == "stacks");
+            if self.icons {
+                for widget in screen.widgets.iter_mut().filter(|w| w.kind == WidgetKind::Grid) {
+                    widget.props.insert("view".into(), "icons".into());
+                    widget.props.insert("icon".into(), "icon".into());
+                }
+            }
+            Ok(screen)
         }
 
         fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError> {
@@ -723,7 +779,13 @@ mod tests {
             self.calls.push(format!("grid_rows {stack} {widget}"));
             self.grid_cards.push(card.map(str::to_owned));
             let row = |key: &str| GridRow { key: key.into(), cells: BTreeMap::new() };
-            Ok(GridPage { total: 2, rows: vec![row("addressbook"), row("recipes")] })
+            let mut rows = vec![row("addressbook"), row("recipes")];
+            if self.icons {
+                // One stack has an icon, the other has none.
+                rows[0].cells.insert("icon".into(), None);
+                rows[1].cells.insert("icon".into(), Some("icon-of-recipes".into()));
+            }
+            Ok(GridPage { total: 2, rows })
         }
 
         fn act(
@@ -1119,6 +1181,45 @@ mod tests {
                 "card addressbook Some(\"1\") at"
             ]
         );
+    }
+
+    #[test]
+    fn the_drawing_editor_opens_on_a_picture_with_its_image() {
+        let draw = vec![Effect::Draw {
+            target: "card".into(),
+            widget: Some("photo".into()),
+            image: Some("portrait".into()),
+            width: 68,
+            height: 80,
+        }];
+        let mut session = on_addressbook(FakeServer::default().answering("draw", draw));
+        session.api.images.clear();
+
+        // A terminal has no drawing editor, and says so.
+        session.run("draw");
+        assert_eq!(session.view().drawing, None);
+        assert_eq!(session.message(), Some("Drawing needs the graphical client."));
+
+        session.be_graphic();
+        session.run("draw");
+        let drawing = session.view().drawing.clone().expect("the editor is open");
+        assert_eq!((drawing.target.as_str(), drawing.width, drawing.height), ("card", 68, 80));
+        // The image it starts from was read.
+        assert!(session.api.images.contains(&"portrait".to_string()));
+        assert!(session.image("portrait").is_some());
+
+        session.stop_drawing();
+        assert_eq!(session.view().drawing, None);
+    }
+
+    #[test]
+    fn the_icons_of_a_list_are_read_with_its_rows() {
+        let mut server = FakeServer::default();
+        server.icons = true;
+        let session = Session::start(server).unwrap();
+        // One of the two rows has an icon; it is asked for once.
+        assert_eq!(session.api.images, ["icon-of-recipes"]);
+        assert!(session.image("icon-of-recipes").is_some());
     }
 
     #[test]

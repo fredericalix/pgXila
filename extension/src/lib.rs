@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(rows["rows"][0]["key"], "library");
         assert_eq!(
             rows["rows"][0]["cells"],
-            serde_json::json!({ "title": "Library", "cards": "3" })
+            serde_json::json!({ "title": "Library", "cards": "3", "icon": null })
         );
 
         let effects = json(r#"SELECT xila.act('stacks', 'open', '{"row": "library"}')"#);
@@ -1023,7 +1023,7 @@ mod tests {
         become_role("dan");
         assert_eq!(
             json("SELECT xila.grid_rows('stacks', 'list')")["rows"][0]["cells"],
-            serde_json::json!({ "title": "Books", "cards": "2" })
+            serde_json::json!({ "title": "Books", "cards": "2", "icon": null })
         );
         // The right to read the table without the right to use its schema is
         // not access either.
@@ -1607,6 +1607,305 @@ mod tests {
         // step is checked by the integration tests.)
         let (state, message) = error_of("SELECT xila.act('books', 'undo')");
         assert_eq!((state.as_str(), message.as_str()), ("XL003", "There is nothing left to undo."));
+    }
+
+    // ----------------------------------------------------------------------
+    // Drawing
+    // ----------------------------------------------------------------------
+
+    /// A picture of 2 by 2 pixels, as the hexadecimal text the client sends.
+    const DOTS: &str = "0018ff07";
+
+    /// Adds an image and gives its identifier.
+    fn new_image(width: u32, height: u32, hex: &str) -> String {
+        text(&format!("SELECT xila.new_image({width}, {height}, '\\x{hex}')::text")).unwrap()
+    }
+
+    #[pg_test]
+    fn an_image_is_added_once_and_never_changed() {
+        create_people();
+        become_role("dan");
+        // Anyone who uses pgXila may add a picture.
+        let first = new_image(2, 2, DOTS);
+        assert_eq!(new_image(2, 2, DOTS), first, "the same picture is not added twice");
+        assert_ne!(new_image(4, 1, DOTS), first, "the same pixels in another shape");
+        assert_ne!(new_image(2, 2, "0018ff08"), first);
+        assert_eq!(number("SELECT count(*) FROM xila.image"), 3);
+
+        // Nobody changes or deletes one, not even an author.
+        become_role("ada");
+        for statement in ["UPDATE xila.image SET pixels = pixels", "DELETE FROM xila.image"] {
+            let (state, _) = error_of_statement(statement);
+            assert_eq!(state, "42501", "{statement}");
+        }
+        // What is not a picture is refused.
+        for wrong in [
+            "SELECT xila.new_image(3, 2, '\\x0018ff07')",
+            "SELECT xila.new_image(0, 0, '\\x')",
+            "SELECT xila.new_image(481, 1, NULL)",
+        ] {
+            let (state, _) = error_of(wrong);
+            assert_eq!(state, "XL003", "{wrong}");
+        }
+    }
+
+    #[pg_test]
+    fn a_picture_is_a_field_like_another() {
+        create_books_as_ada();
+        assert_eq!(
+            text("SELECT xila.add_field('books', 'Cover', 'picture')").as_deref(),
+            Some("cover")
+        );
+        // Its column refers to an image; it is shown by an image widget, and
+        // it is not what titles the cards.
+        assert_eq!(
+            text("SELECT xila.is_picture('books.cards', 'cover')::text").as_deref(),
+            Some("true")
+        );
+        let screen = json("SELECT xila.open_stack('books')");
+        let cover = widget_of(&screen, "cover");
+        assert_eq!(
+            (cover["kind"].as_str(), cover["column"].as_str()),
+            (Some("image"), Some("cover"))
+        );
+        assert_eq!(
+            text("SELECT type FROM xila.field WHERE stack = 'books' AND name = 'cover'").as_deref(),
+            Some("picture")
+        );
+        assert_eq!(json("SELECT xila.card('books')")["texts"]["heading"], "Candide");
+
+        // The picture of a card is saved like its other values.
+        let image = new_image(2, 2, DOTS);
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+        let saved =
+            json(&format!(r#"SELECT xila.save_card('books', '{key}', '{{"cover": "{image}"}}')"#));
+        assert_eq!(saved["values"]["cover"], image.as_str());
+        // ...and must be a picture that exists.
+        let (state, _) = error_of(&format!(
+            r#"SELECT xila.save_card('books', '{key}',
+                   '{{"cover": "00000000-0000-7000-8000-000000000009"}}')"#
+        ));
+        assert_eq!(state, "XL003");
+
+        // Removed and brought back, the field is a picture again, with the
+        // picture each card had.
+        let before = last_change();
+        Spi::run("SELECT xila.remove_field('books', 'cover')").unwrap();
+        Spi::run(&format!("SELECT xila.rewind('books', 'screen', {})", before + 1)).unwrap();
+        assert_eq!(
+            text("SELECT xila.is_picture('books.cards', 'cover')::text").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{key}', 'at')"))["values"]["cover"],
+            image.as_str()
+        );
+    }
+
+    #[pg_test]
+    fn a_stack_has_an_icon_in_the_colours_of_the_system() {
+        create_books_as_ada();
+        let icon = new_image(2, 2, DOTS);
+        Spi::run(&format!(r#"SELECT xila.set_stack('books', '{{"icon": "{icon}"}}')"#)).unwrap();
+        assert_eq!(
+            text("SELECT icon FROM xila.visible_stack WHERE name = 'books'").as_deref(),
+            Some(icon.as_str())
+        );
+        // The list of stacks is shown as icons, and gives the icon of each row.
+        let list = widget_of(&json("SELECT xila.open_stack('stacks')"), "list");
+        assert_eq!(list["props"]["view"], "icons");
+        let rows = json("SELECT xila.grid_rows('stacks', 'list')");
+        assert_eq!(rows["rows"][0]["cells"]["icon"], icon.as_str());
+
+        // A colour of the stack has no meaning in the list of every stack.
+        let tinted = new_image(2, 2, "00182007");
+        let (state, message) =
+            error_of(&format!(r#"SELECT xila.set_stack('books', '{{"icon": "{tinted}"}}')"#));
+        assert_eq!(
+            (state.as_str(), message.as_str()),
+            ("XL003", "An icon is drawn with the 32 system colours only.")
+        );
+        let (state, _) = error_of(
+            r#"SELECT xila.set_stack('books', '{"icon": "00000000-0000-7000-8000-000000000009"}')"#,
+        );
+        assert_eq!(state, "XL002");
+        // No icon again.
+        Spi::run(r#"SELECT xila.set_stack('books', '{"icon": ""}')"#).unwrap();
+        assert_eq!(text("SELECT icon FROM xila.visible_stack WHERE name = 'books'"), None);
+    }
+
+    #[pg_test]
+    fn a_stack_has_colours_of_its_own() {
+        create_books_as_ada();
+        assert_eq!(
+            number("SELECT xila.set_colour('books', NULL, '#AB12cd', 'heather')::bigint"),
+            32
+        );
+        assert_eq!(number("SELECT xila.set_colour('books', NULL, '#102030')::bigint"), 33);
+        assert_eq!(number("SELECT xila.set_colour('books', 200, '#ffffff')::bigint"), 200);
+        // Changing one keeps its name unless another is given.
+        Spi::run("SELECT xila.set_colour('books', 32, '#000001')").unwrap();
+        assert_eq!(
+            json("SELECT xila.open_stack('books')->'colours'"),
+            serde_json::json!([
+                { "slot": 32, "rgb": "#000001", "name": "heather" },
+                { "slot": 33, "rgb": "#102030" },
+                { "slot": 200, "rgb": "#ffffff" }
+            ])
+        );
+        Spi::run("SELECT xila.remove_colour('books', 33)").unwrap();
+        assert_eq!(number("SELECT xila.set_colour('books', NULL, '#111111')::bigint"), 33);
+
+        for wrong in [
+            "SELECT xila.set_colour('books', NULL, 'red')",
+            "SELECT xila.set_colour('books', 31, '#000000')",
+            "SELECT xila.set_colour('books', 255, '#000000')",
+        ] {
+            let (state, _) = error_of(wrong);
+            assert_eq!(state, "XL003", "{wrong}");
+        }
+        become_role("bob");
+        let (state, _) = error_of("SELECT xila.set_colour('books', NULL, '#000000')");
+        assert_eq!(state, "XL004");
+    }
+
+    #[pg_test]
+    fn a_picture_of_the_background_is_a_widget_with_an_image() {
+        create_books_as_ada();
+        assert_eq!(
+            text(
+                r#"SELECT xila.add_widget('books', 'image',
+                       '{"placement": {"x": 300, "y": 40, "w": 50, "h": 50}}')"#
+            )
+            .as_deref(),
+            Some("image1")
+        );
+        let image = new_image(2, 2, DOTS);
+        Spi::run(&format!(
+            r#"SELECT xila.set_widget('books', 'image1', '{{"image": "{image}"}}')"#
+        ))
+        .unwrap();
+        let logo = widget_of(&json("SELECT xila.open_stack('books')"), "image1");
+        assert_eq!(logo["kind"], "image");
+        assert_eq!(logo["props"]["image"], image.as_str());
+        assert_eq!(logo.get("column"), None);
+        // A field has no image of its own, and the image must exist.
+        let (state, _) = error_of(&format!(
+            r#"SELECT xila.set_widget('books', 'year', '{{"image": "{image}"}}')"#
+        ));
+        assert_eq!(state, "XL003");
+        let (state, _) =
+            error_of(r#"SELECT xila.set_widget('books', 'image1', '{"image": "not an image"}')"#);
+        assert_eq!(state, "XL002");
+    }
+
+    #[pg_test]
+    fn drawing_goes_through_two_actions() {
+        create_books_as_ada();
+        Spi::run(
+            r#"SELECT xila.add_field('books', 'Cover', 'picture');
+               SELECT xila.add_widget('books', 'image');
+               GRANT USAGE ON SCHEMA books TO xila_user;
+               GRANT SELECT ON books.cards TO xila_user;
+               GRANT UPDATE ON books.cards TO dan;"#,
+        )
+        .unwrap();
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+        let act = |action: &str, context: String| {
+            json(&format!("SELECT xila.act('books', '{action}', '{context}')"))
+        };
+        let picture = |target: &str, widget: &str| {
+            format!(
+                r#"{{"renderer": "graphic", "card": "{key}",
+                    "input": {{"target": "{target}", "widget": "{widget}",
+                               "width": 2, "height": 2, "pixels": "{DOTS}"}}}}"#
+            )
+        };
+        let cover_of = |key: &str| {
+            json(&format!("SELECT xila.card('books', '{key}', 'at')"))["values"]["cover"]
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        // A terminal cannot draw.
+        let effects = act("draw", r#"{"input": {"target": "icon"}}"#.to_owned());
+        assert_eq!(effects[0]["text"], "Drawing needs the graphical client.");
+
+        // The picture of a card: empty at first, at the size of a portrait.
+        assert_eq!(
+            act("draw", picture("card", "cover")),
+            serde_json::json!([
+                { "do": "draw", "target": "card", "widget": "cover", "width": 68, "height": 80 }
+            ])
+        );
+        let effects = act("save_drawing", picture("card", "cover"));
+        assert_eq!(effects[1]["text"], "Picture saved.");
+        let first = cover_of(&key).expect("the card has a picture");
+        // Drawing it again starts from that image, at its size.
+        let again = act("draw", picture("card", "cover"));
+        assert_eq!(again[0]["image"], first.as_str());
+        assert_eq!((again[0]["width"].as_i64(), again[0]["height"].as_i64()), (Some(2), Some(2)));
+
+        // Saving another drawing points the card to a new image: the old one
+        // is still there, and so the history of the card can go back to it.
+        act("save_drawing", picture("card", "cover").replace(DOTS, "01010101"));
+        let second = cover_of(&key).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(number(&format!("SELECT count(*) FROM xila.image WHERE id = '{first}'")), 1);
+        let change = number(
+            "SELECT max(id) FROM xila.card_history_line
+             WHERE stack = 'books' AND summary LIKE '%changed: cover'",
+        );
+        Spi::run(&format!("SELECT xila.rewind('books', 'card', {change}, '{key}')")).unwrap();
+        assert_eq!(cover_of(&key), Some(first));
+
+        // The icon of the stack, and a picture of the background.
+        assert_eq!(
+            act("draw", picture("icon", ""))[0],
+            serde_json::json!(
+                { "do": "draw", "target": "icon", "widget": "", "width": 28, "height": 26 }
+            )
+        );
+        act("save_drawing", picture("icon", ""));
+        assert!(text("SELECT icon FROM xila.visible_stack WHERE name = 'books'").is_some());
+        act("save_drawing", picture("widget", "image1"));
+        let logo = widget_of(&json("SELECT xila.open_stack('books')"), "image1");
+        assert!(logo["props"]["image"].is_string());
+
+        // A picture of a card is not drawn as one of the background, nor the
+        // other way round, and a card that is not saved has no picture yet.
+        for (target, widget) in [("widget", "cover"), ("card", "image1")] {
+            let (state, _) = error_of(&format!(
+                "SELECT xila.act('books', 'draw', '{}')",
+                picture(target, widget)
+            ));
+            assert_eq!(state, "XL003", "{target} {widget}");
+        }
+        let (state, message) = error_of(
+            r#"SELECT xila.act('books', 'draw', '{"renderer": "graphic",
+                   "input": {"target": "card", "widget": "cover"}}')"#,
+        );
+        assert_eq!(
+            (state.as_str(), message.as_str()),
+            ("XL003", "Save the card before drawing its picture.")
+        );
+
+        // Who may write the card may draw its picture, author or not; the
+        // icon and the background belong to those who may edit the stack.
+        become_role("dan");
+        let effects = act("save_drawing", picture("card", "cover").replace(DOTS, "02020202"));
+        assert_eq!(effects[1]["text"], "Picture saved.");
+        for target in ["icon", "widget"] {
+            let (state, _) = error_of(&format!(
+                "SELECT xila.act('books', 'draw', '{}')",
+                picture(target, "image1")
+            ));
+            assert_eq!(state, "XL004", "{target}");
+        }
+        become_role("bob");
+        let (state, _) =
+            error_of(&format!("SELECT xila.act('books', 'draw', '{}')", picture("card", "cover")));
+        assert_eq!(state, "XL004", "bob may read the cards, not write them");
     }
 
     #[pg_test]
