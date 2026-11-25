@@ -333,9 +333,160 @@ shown before any connection exists.
   known) is the alternative. The language of pgXila itself comes later and would
   replace Lua behind the same `xila.script` rows.
 
-## 10. Not covered yet
+## 10. Author mode (proposal for step 2a, not implemented yet)
 
-- Author mode API (creating stacks, editing widgets, drawing images): phase 2.
+Phase 2 is delivered in four steps: 2a, building a stack with forms, ownership
+and rewinding, in both clients; 2b, the visual editor of a background; 2c, the
+drawing editor; 2d, scripts. This section is the proposal for step 2a. Nothing
+in it exists yet.
+
+### 10.1 Ownership
+
+A stack belongs to the role that created it (`xila.stack.owner`). Its definition
+may be changed by that role and by the members of that role, and by nobody else:
+sharing the right to edit a stack is a `GRANT` of the owner role. The system
+stacks, and the actions and keys available on every screen, may only be changed
+by a superuser.
+
+This is enforced by row-level security on the definition tables (`stack`,
+`background`, `action`, `widget`, `layout`, `key_binding`, `stack_colour`), not
+by the functions below: it also holds for someone who writes the rows in SQL.
+Everyone may still read every definition.
+
+Who may read or write the *cards* of a stack stays a matter of privileges on its
+table. `xila.share_stack` grants them.
+
+Not changed in 2a: any author may still change the palette, and any author may
+still write any image. Images get an owner and a history with the drawing
+editor, in 2c.
+
+### 10.2 Where a new stack keeps its cards
+
+A stack created from the client gets a schema of its own, named like the stack,
+and a table `cards` in it, both owned by the author:
+
+```sql
+CREATE TABLE addressbook.cards (id uuid PRIMARY KEY DEFAULT uuidv7());
+```
+
+Authors do not get the right to create schemas in the database. One narrow
+`SECURITY DEFINER` function creates the schema for them, after checking the name
+and that the caller is an author.
+
+pgXila only alters tables it has created. A background says so with a new
+column, `managed`:
+
+- **managed** (a stack created empty): a field is a widget and its column.
+  Adding, renaming or removing the field alters the table.
+- **not managed** (a stack created from an existing table): the table is never
+  altered. The author chooses which columns are shown, their labels and their
+  order. Removing a field only takes it off the screen.
+
+### 10.3 Author functions
+
+They run with the privileges of the caller. They are what the dialogs of 10.6
+call, what can be called directly in SQL, and what the agent will be given as
+tools in phase 3.
+
+| Function | What it does |
+|----------|--------------|
+| `xila.create_stack(name text, title text, source regclass DEFAULT NULL)` | Creates a stack. Without `source`: the schema, the table, an empty screen with its browsing buttons and keys. With `source`: a screen with one field per column of that table, which the caller must own |
+| `xila.set_stack(stack text, changes jsonb)` | Changes `title`, or `card_title`, the template written at the top of each card, such as `{last_name}, {first_name}` |
+| `xila.delete_stack(stack text)` | Removes the stack and its screens. The table and the cards are left in place; rewinding brings the stack back |
+| `xila.share_stack(stack text, role name, access text)` | `access` is `none`, `read` or `write`: grants or revokes the privileges on the table of the stack. Not recorded in history |
+| `xila.add_field(stack text, label text, type text DEFAULT 'text', name text DEFAULT NULL)` | Adds a field at the end. `type` is `text`, `number`, `date` or `boolean`. Without `name`, an identifier is made from the label. On a stack that is not managed, `name` is an existing column to show |
+| `xila.set_field(stack text, field text, changes jsonb)` | Changes `label`, `name` (renames the column too) or `required` (`NOT NULL`; refused, with the number of cards concerned, while some cards have no value) |
+| `xila.move_field(stack text, field text, by integer)` | Moves a field up (`-1`) or down (`1`) in the logical order |
+| `xila.remove_field(stack text, field text)` | Removes a field. On a managed stack the column is dropped; its values are saved in history, so that rewinding restores them |
+| `xila.rewind(stack text, scope text, before bigint, card text DEFAULT NULL)` | Undoes the recorded change `before` and all those after it; see 10.5 |
+
+The type of an existing field cannot be changed in 2a. Pictures as a field type
+come with the drawing editor.
+
+### 10.4 Additions to the screen model
+
+The author dialogs are system stacks, drawn by both clients like any other
+screen. They need a few additions, which every stack can use:
+
+- **Read-only source.** A background may name a view instead of a table. Its
+  cards can be shown and browsed, not saved. A key that no longer exists gives
+  an empty screen instead of the first card.
+- **Grid of the card on screen.** A grid may list only the rows that belong to
+  the current card: `{"where": {"stack": "name"}}` keeps the rows whose column
+  `stack` equals the column `name` of the card. `"order"` names the columns to
+  sort by. `xila.grid_rows` gets a fifth parameter, the key of the card.
+- **Choices.** `{"choices": [{"value": "date", "label": "Date"}]}` in the
+  `props` of a field limits it to those values. The client shows the labels.
+- **Check box.** A field bound to a `boolean` column is drawn as a check box.
+- **Effect `new` with values.** `{"do": "new", "values": {"type": "text"}}`
+  shows an empty card with some fields already filled in.
+- **Effect `confirm`.** `{"do": "confirm", "text": "…", "label": "Delete"}`
+  asks a question. If the user accepts, the client runs the same action again
+  with `"confirmed": true` in its context.
+- **`may_edit`.** The `stack` object of a screen definition says whether the
+  current role may change the stack. The keys that lead to author mode are only
+  listed when it may.
+- **Dialogs.** A system stack is drawn as a dialog: its title, its fields, its
+  grid, its buttons, without the sheet of paper and the position of the card.
+
+New handlers, behind the same `xila.act`: `author` (open author mode on the
+current stack or the selected one), `new_stack`, `create_stack`, `save_stack`,
+`delete_stack`, `new_field`, `edit_field`, `save_field`, `remove_field`,
+`move_field`, `history`, `rewind`, and `delete_card`, which removes the card on
+screen after a confirmation. Each one reads the context and calls a function of
+10.3.
+
+### 10.5 History and rewinding
+
+- **Structure.** The author functions record what they do to a table as history
+  rows of kind `column`: added, renamed, made required, dropped. A dropped
+  column is recorded with the value it had on each card.
+- **One gesture, one line.** Changes of the same transaction are one entry for
+  the user: "Field “Birthday” added", "Card “Lovelace, Ada” changed".
+  `xila.history_line` is the view that lists them.
+- **Scopes.** `xila.rewind` undoes, newest first, the changes from `before`
+  on, within a scope:
+
+  | Scope | What is undone |
+  |-------|----------------|
+  | `card` | the values of one card, named by `card`; a deleted card comes back |
+  | `screen` | the definition: widgets, layouts, actions, keys, title, and the columns that go with the fields. Cards keep their other values |
+  | `stack` | the definition and all the cards |
+
+- **Nothing is lost.** A rewind is recorded as new changes. Rewinding a rewind
+  brings back what it had undone, including the values of a column.
+- **All or nothing.** A rewind is one transaction. If a step cannot be undone,
+  for example because the table was altered by hand in the meantime, nothing is
+  changed and the message says which step failed.
+- **Who may rewind.** `card`: whoever may write the card. `screen` and `stack`:
+  whoever may edit the stack.
+- **Who may read history.** The definition changes of a stack: whoever may open
+  it. The card changes: whoever may read the whole table; when the table uses
+  row-level security, only those who may edit the stack, so that history never
+  shows a row that the table hides. This is enforced by row-level security on
+  `xila.history`, which nobody writes directly.
+
+### 10.6 Screens
+
+| Screen | Reached by | Content and keys |
+|--------|-----------|------------------|
+| My stacks | | New for authors: `F6` New stack, `F11` Author mode on the selected stack |
+| New stack | `F6` on My stacks | Title, name (made from the title when left empty), start from an empty stack or from one of the caller's tables. `Enter` creates it and opens author mode |
+| Author mode | `F11` on a stack or on My stacks | Title, card title, who it is shared with (nobody, everyone may read, everyone may write), the list of fields with label, name, type and required. `F6` New field, `Enter` Edit, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
+| Field | `F6` or `Enter` in author mode | Label, name, type, required. `Enter` saves. Button Remove, with a confirmation that says how many cards have a value |
+| History | `F10` in author mode | The changes of the stack, newest first: when, who, what. `F6` Rewind the screen to before the selected change, `F7` Rewind the whole stack |
+| History of a card | `F10` on a card | The versions of that card. `Enter` brings the selected version back |
+
+A stack created from the client has `F6` New, `F7` Previous, `F8` Next, `Enter`
+Save, `F10` History and a button Delete.
+
+Left for later steps: placing widgets by hand and their styles (2b); pictures
+and icons (2c); scripts and handlers written by authors (2d); creating a stack
+from a description with the agent (phase 3).
+
+## 11. Not covered yet
+
+- Author mode beyond section 10 (visual editor, drawing, scripts): steps 2b to 2d.
 - Agent API, audit log, validation of proposed actions: phase 3.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.
