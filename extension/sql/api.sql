@@ -35,7 +35,7 @@ $$;
 CREATE FUNCTION xila.source_of(bg xila.background) RETURNS regclass
 LANGUAGE sql STABLE AS $$
     SELECT CASE WHEN bg.source_table IS NOT NULL
-                THEN to_regclass(format('%I.%I', bg.source_schema, bg.source_table)) END
+                THEN xila.relation(bg.source_schema, bg.source_table)::regclass END
 $$;
 
 -- "ORDER BY" expression of the cards of a background: the order columns,
@@ -231,9 +231,7 @@ CREATE VIEW xila.visible_stack AS
     FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id
     WHERE s.kind = 'user'
       AND CASE WHEN b.source_table IS NULL THEN true
-               ELSE has_table_privilege(
-                        to_regclass(format('%I.%I', b.source_schema, b.source_table))::oid,
-                        'SELECT')
+               ELSE xila.may_read(xila.relation(b.source_schema, b.source_table))
           END;
 
 CREATE FUNCTION xila.open_stack(stack text) RETURNS jsonb
@@ -245,7 +243,7 @@ DECLARE
 BEGIN
     SELECT * INTO info FROM xila.stack WHERE id = bg.stack_id;
 
-    IF source IS NOT NULL AND NOT has_table_privilege(source, 'SELECT') THEN
+    IF source IS NOT NULL AND NOT xila.may_read(source) THEN
         RAISE EXCEPTION 'You do not have access to the stack “%”.', stack USING ERRCODE = 'XL004';
     END IF;
 
@@ -306,6 +304,9 @@ DECLARE
 BEGIN
     IF move NOT IN ('first', 'last', 'at', 'next', 'previous') THEN
         RAISE EXCEPTION 'Unknown move: %.', move USING ERRCODE = 'XL002';
+    END IF;
+    IF source IS NOT NULL AND NOT xila.may_read(source) THEN
+        RAISE EXCEPTION 'You do not have access to the stack “%”.', stack USING ERRCODE = 'XL004';
     END IF;
 
     IF source IS NULL THEN

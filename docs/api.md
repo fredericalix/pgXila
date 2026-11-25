@@ -1,8 +1,8 @@
 # pgXila SQL API
 
 This document describes the contract between the pgXila extension and its
-clients, as implemented for phase 1 and for step 2a of author mode. API
-version: 2.
+clients, as implemented for phase 1 and for steps 2a and 2b of author mode.
+API version: 2.
 
 A pgXila client is an ordinary PostgreSQL client. It connects over TLS 1.3 with
 SCRAM-SHA-256, calls SQL functions of the `xila` schema, and listens on
@@ -140,14 +140,14 @@ it calls `xila.open_stack` and receives one JSON document.
 {
   "stack": { "name": "addressbook", "title": "Address book", "kind": "user",
              "may_edit": false },
-  "source": { "has_cards": true, "count": 12 },
+  "source": { "has_cards": true, "count": 12, "managed": true },
   "widgets": [
     { "name": "title", "kind": "text", "layer": "background", "ord": 10,
       "props": { "template": "{last_name}, {first_name}", "style": "title" },
       "layout": { "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } } },
     { "name": "last_name", "kind": "field", "layer": "background", "ord": 20,
-      "label": "Last name", "column": "last_name", "type": "text",
-      "props": { "required": true }, "layout": {} },
+      "label": "Last name", "column": "last_name", "type": "text", "required": true,
+      "props": {}, "layout": {} },
     { "name": "next", "kind": "button", "layer": "background", "ord": 100,
       "label": "Next", "action": "next_card", "props": {}, "layout": {} }
   ],
@@ -173,7 +173,10 @@ the stack window, on the 480 by 300 screen.
 ### The graphic renderer
 
 `may_edit` says whether the current role may change the definition of the
-stack.
+stack, and `managed` whether pgXila created its table and may alter it. A field
+says whether it is `required`. An action kept for some users says for whom
+(`"for": "editor"`): such an action serves the author screens, not the buttons
+of a stack.
 
 The graphical client shows one stack at a time, in a window whose size follows
 its content. Without any `graphic` layout row, it places the widgets itself:
@@ -188,12 +191,20 @@ its content. Without any `graphic` layout row, it places the widgets itself:
 - **A system stack** is drawn as a static screen even when it shows a card: it
   is a dialog. The window is wider when its grid has more than two columns.
 
-A `graphic` layout row changes that for one widget:
+A `graphic` layout row changes that for one widget. Without a size (`w` and
+`h` at zero), the widget keeps its automatic place and only `style` is used.
+With a size, the widget is drawn exactly in that rectangle, and the layout of
+the card is said to be made by hand:
 
-- with a size (`w` and `h` greater than zero), the widget is drawn exactly in
-  that rectangle and takes no part in the automatic placement;
-- without a size, the widget keeps its automatic place and only `style` is
-  used.
+- the sheet of paper is drawn behind everything that is not a button, and goes
+  down to under the lowest of those widgets;
+- the header of the sheet is where the `title` text is, and a ruled line runs
+  under each field and each line of text;
+- a widget that has no rectangle goes under those that have one.
+
+The visual editor (section 10.7) writes the rectangle of every widget at once,
+where the automatic placement had put them, so that a layout looks the same
+when it stops being automatic.
 
 | Style key | Applies to | Meaning |
 |-----------|-----------|---------|
@@ -273,7 +284,9 @@ SELECT xila.act('addressbook', 'next_card',
 `context` is the state of the client: `card` is the key of the card on screen
 (null for a card not saved yet), `dirty` holds what the user typed and has not
 saved, `row` is the key of the selected grid row, and `confirmed` is true once
-the user has accepted the question the action asked. The server looks up the
+the user has accepted the question the action asked. `renderer` says which
+client this is, `text` or `graphic`, and `input` holds what a tool of the
+client, such as the visual editor, has to say. The server looks up the
 action, runs its handler, and answers with effects that the client applies in
 order:
 
@@ -285,12 +298,13 @@ order:
 |--------|---------|
 | `show` | Display a stack, at a given card if `card` is present. A stack that is already open underneath comes back to the front instead of being opened twice |
 | `back` | Return to the previous screen. A screen that no longer exists is skipped |
-| `reload` | Read the current card and the rows of its grids again |
-| `focus` | Put the cursor in a widget |
+| `reload` | Read the current screen again: its definition, its card and the rows of its grids |
+| `focus` | Put the cursor in a widget; in the visual editor, select it |
 | `message` | Show a message to the user |
 | `new` | Display an empty card, to be saved as a new one. `values`, if present, fills some of its fields in; they are sent back like what the user types |
 | `confirm` | Ask the question in `text`. If the user accepts (`label` says what accepting does), the client runs the same action again with `"confirmed": true` in its context |
 | `select` | Select the row of the grid whose key is `row` |
+| `design` | Open the visual editor on the stack named by `stack`. Only sent to a graphical client |
 | `quit` | Leave the client |
 
 The handlers:
@@ -305,9 +319,10 @@ The handlers:
 | `history` | Shows the history of the cards of the stack (`{"of": "cards"}`), of the stack edited in author mode, or the deleted stacks (`{"of": "deleted"}`) |
 | `rewind` | Asks, then rewinds from the selected line of a history; `args` gives the scope (section 10.5) |
 | `back`, `quit` | Ask the client to go back, or to leave |
-| `author`, `browse` | Enter author mode on the current stack or on the selected one; open the stack being edited |
+| `author`, `browse` | Enter author mode on the current stack or on the selected one (the visual editor for a graphical client, the author dialog for a text client, or for anyone with `{"form": true}`); open the stack being edited |
 | `new_stack`, `create_stack`, `save_stack`, `delete_stack` | The dialogs of a stack in author mode |
 | `new_field`, `edit_field`, `save_field`, `remove_field`, `move_field` | The dialogs of a field in author mode |
+| `place_widgets`, `reset_layout`, `add_widget`, `set_widget`, `remove_widget`, `undo` | What the visual editor asks for, with its request in `input`; see section 10.7 |
 
 The author handlers read the context and call the functions of section 10.3.
 On the author screens the key of the card is the subject of the dialog: the
@@ -391,7 +406,7 @@ its question is drawn by the clients as well.
 
 Phase 2 is delivered in four steps: 2a, building a stack with forms, ownership
 and rewinding, in both clients; 2b, the visual editor of a background; 2c, the
-drawing editor; 2d, scripts. This section describes step 2a, which is
+drawing editor; 2d, scripts. This section describes steps 2a and 2b, which are
 implemented.
 
 ### 10.1 Ownership
@@ -459,6 +474,12 @@ tools in phase 3.
 | `xila.set_field(stack text, field text, changes jsonb)` | Changes `label`, `name` (renames the column too) or `required` (`NOT NULL`; refused, with the number of cards concerned, while some cards have no value) |
 | `xila.move_field(stack text, field text, by integer)` | Moves a field up (`-1`) or down (`1`) in the logical order |
 | `xila.remove_field(stack text, field text)` | Removes a field. On a managed stack the column is dropped; its values are saved in history, so that rewinding restores them |
+| `xila.place_widgets(stack text, renderer text, placements jsonb, card text DEFAULT NULL)` | Sets the rectangle of some widgets for one renderer: `{"city": {"x": 128, "y": 94, "w": 100, "h": 14}}`. Styles are kept. A widget of a single card is looked for on `card` |
+| `xila.reset_layout(stack text, renderer text)` | Forgets every rectangle of that renderer: the placement is automatic again. Styles are kept |
+| `xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}', card text DEFAULT NULL)` | Adds a `text` or a `button` and returns its name (`text1`, `button1`…). `props` may hold `label`, `text` (a template), `action` (the name of an action of the stack) and `placement`. With `card`, the widget is on that card only |
+| `xila.set_widget(stack text, widget text, changes jsonb, card text DEFAULT NULL)` | Changes `label`, `text`, `action`, `main` (the main button of the screen), `required` (for a field) or `layer` (`background` or `card`, to move a text or a button from one to the other) |
+| `xila.remove_widget(stack text, widget text, card text DEFAULT NULL)` | Removes a widget. A field is removed as by `xila.remove_field` |
+| `xila.undo(stack text)` | Undoes the last change made to the screen of the stack; see 10.7. Returns `{"undone": n, "summary": "…"}` |
 | `xila.rewind(stack text, scope text, since bigint, card text DEFAULT NULL)` | Undoes the recorded change `since` and all those after it; see 10.5. Returns `{"undone": n}` |
 | `xila.rewind_to(stack text, scope text, moment timestamptz, card text DEFAULT NULL)` | The same, for everything recorded after a moment in time |
 
@@ -537,8 +558,8 @@ the dialog, and what is typed on it goes to an action, never to the view:
 | Screen | Reached by | Content and keys |
 |--------|-----------|------------------|
 | My stacks | | For authors: `F6` New stack, `F10` Deleted stacks, `F11` Author mode on the selected stack |
-| New stack | `F6` on My stacks | Title, name (made from the title when left empty), start from an empty stack or from one of the caller's tables. `Enter` creates it and opens author mode |
-| Author mode | `F11` on a stack one may change, or on My stacks | Title, card title, the list of fields with label, name, type and required. `Enter` saves, or opens the selected field. `F6` New field, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
+| New stack | `F6` on My stacks | Title, name (made from the title when left empty), start from an empty stack or from one of the caller's tables. `Enter` creates it and opens author mode: the visual editor in the window, the author dialog in the terminal |
+| Author mode | `F11` on a stack one may change, or on My stacks, in the text client; `F4` in the visual editor | Title, card title, the list of fields with label, name, type and required. `Enter` saves, or opens the selected field. `F6` New field, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
 | Field | `F6` or `Enter` in author mode | Label, name, type, required. `Enter` saves. Button Remove, with a confirmation that says how many cards have a value |
 | History | `F10` in author mode | The changes of the stack, newest first: when, who, what. `F6` Rewind the screen from the selected line on, `F7` or `Enter` Rewind the whole stack |
 | History of the cards | `F10` on a stack | The changes made to its cards. `F6` or `Enter` rewinds the card of the selected line, from that change on |
@@ -546,92 +567,89 @@ the dialog, and what is typed on it goes to an action, never to the view:
 
 `Escape` leaves a screen like `F12`, and gives up a question.
 
-Left for later steps: placing widgets by hand and their styles (2b); pictures
-and icons (2c); scripts and handlers written by authors (2d); creating a stack
-from a description with the agent (phase 3); sharing the cards of a stack from
-the client.
+Left for later steps: pictures and icons (2c); scripts and handlers written by
+authors (2d); creating a stack from a description with the agent (phase 3);
+sharing the cards of a stack from the client.
 
-### 10.7 Visual editor (proposal for step 2b, not implemented yet)
+### 10.7 The visual editor
 
 The visual editor is a tool of the graphical client: the background of a stack
 is shown with its widgets, which are selected, moved and resized with the
-pointer or the keyboard. Nothing in this subsection exists yet.
+pointer or the keyboard. It is the author mode of the window; the text client
+has the dialogs of 10.6.
 
-**Entering it.** The client says which renderer it is in the context of every
-action: `"renderer": "graphic"` or `"text"`. The `author` handler answers a
-graphical client with a new effect, `{"do": "design", "stack": "books"}`, which
-opens the editor on that stack, and a text client with the author dialog as
-today. From the editor, a key opens that dialog (title, list of fields,
-history, deletion); `F11` goes back to browsing.
+**Entering it.** The `author` handler answers a graphical client with the
+effect `{"do": "design", "stack": "books"}`, and so does `create_stack`. From
+the editor, `F4` opens the author dialog (title, list of fields, deletion),
+`F10` the history of the stack, and `F11` goes back to browsing.
 
 **What the editor sends.** Like everything else, an action, with what the tool
-has to say in a new member of the context, `input`. The handlers below are
-actions available on every stack one may change; each calls the function of
-the same name, which can also be called in SQL and will be a tool of the agent.
+has to say in the `input` of the context. These actions are available on every
+stack one may change; each calls the function of the same name (10.3).
 
-| Function | What it does |
-|----------|--------------|
-| `xila.place_widgets(stack text, renderer text, placements jsonb, card text DEFAULT NULL)` | Sets the rectangle of some widgets for one renderer: `{"city": {"x": 128, "y": 94, "w": 100, "h": 14}}`. Styles are kept |
-| `xila.reset_layout(stack text, renderer text)` | Forgets every rectangle of that renderer: the placement is automatic again. Styles are kept |
-| `xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}', card text DEFAULT NULL)` | Adds a `text` or a `button` and returns its name. `props` may hold `label`, `text` (a template), `action` (the name of an action of the stack) and `placement`. With `card`, the widget is on that card only |
-| `xila.set_widget(stack text, widget text, changes jsonb, card text DEFAULT NULL)` | Changes `label`, `text`, `action`, `main` (the main button of the screen) or `layer` (`background` or `card`, to move a text or a button from one to the other) |
-| `xila.remove_widget(stack text, widget text, card text DEFAULT NULL)` | Removes a widget. A field is removed as by `xila.remove_field` |
-| `xila.undo(stack text)` | Undoes the last change made to the screen of the stack; see below |
+| Action | `input` |
+|--------|---------|
+| `place_widgets` | `{"placements": {"city": {"x": 128, "y": 94, "w": 100, "h": 14}}}` |
+| `add_widget` | `{"kind": "text", "layer": "background", "props": {"placement": {…}}}`; with `"layer": "card"`, the widget goes on the card of the context |
+| `set_widget` | `{"widget": "city", "changes": {"label": "Town"}}` |
+| `remove_widget` | `{"widget": "city"}`; asks first |
+| `reset_layout` | nothing; asks first |
+| `undo` | nothing |
 
-Fields are still created by `xila.add_field`: the field tool of the editor opens
-the Field dialog. The screen definition also says, for each field, whether it is
-`required`, and for the stack whether its table is `managed`.
+`author_form`, `new_field` and `stack_history` open the author dialog, the Field
+dialog and the history of the stack from the editor. Fields are created by
+`xila.add_field`: the field tool opens the Field dialog.
 
 **Automatic or free.** A stack is laid out automatically until one of its
-widgets is moved. At that moment the editor sends the rectangle of *every*
-widget, where the automatic placement had put it: from then on the layout is
-free, and what is on screen is what is in the database. `xila.reset_layout`
-goes back. In a free layout:
-
-- a field added later goes under the lowest field, with the same left edge and
-  width;
-- the sheet of paper is drawn behind everything that is not a button;
-- a widget without a rectangle (one added in SQL) is placed automatically, as
-  described in section 3.
-
-The text renderer is not concerned: its placement stays automatic unless `text`
-layout rows say otherwise.
+widgets is given a place. At that moment the editor sends the rectangle of
+*every* widget, where the automatic placement had put it: from then on the
+layout is made by hand, and what is on screen is what is in the database (see
+section 3 for how such a layout is drawn). `xila.reset_layout` goes back. A
+field added later goes under the lowest field, with the same left edge and
+width. The text renderer is not concerned.
 
 **The card layer.** A text or a button may belong to one card only (`layer =
 'card'`): a note on the card of Ada. The editor creates widgets on the layer
 chosen in its tool palette, and shows those of the card on screen with the
-others. Fields always belong to the background.
+others, with a violet dotted line around them. Fields always belong to the
+background.
 
 **Undo.** `xila.undo` rewinds the most recent line of the history of the
-*screen* that is not itself an undo. Pressed again, it goes one line further
-back; any new change starts over from the most recent line. It only undoes
-changes made by the current role: when the last change is someone else's, it
-refuses and points to the History screen. An undo is a rewind like any other,
-recorded, and can be rewound from the History screen.
+*screen* that is not itself an undo. Called again, it goes one line further
+back; any new change starts over from the most recent line. It does not undo
+the creation of the stack, and it only undoes changes made by the current role:
+when the last change is someone else's, it refuses and points to the history of
+the stack. An undo is a rewind like any other, recorded and marked as an undo,
+and can be rewound from the History screen.
 
-**In the editor** (drawn by the client, as in the mockup):
+**In the editor**, drawn by the client:
 
 - a tool palette in the left margin: pointer, field, text, button; the layer
   for new widgets (background or card); grid and guides on or off;
 - the background with a dotted grid. Fields show the name of their column, in
-  grey, instead of the values of a card;
-- selection handles; moving and resizing snap to a grid of 4 pixels, and to the
-  edges and centres of the other widgets, shown by a guide line;
-- a floating Properties window: name, kind, label or text, action, column and
-  type (read only), required, position and size as numbers. It keeps away from
-  the selected widget, can be moved, and hidden with a key;
+  grey, instead of the values of a card, and the title shows its template;
+- selection handles; moving and resizing snap to the edges and centres of the
+  other widgets, shown by a red guide line, and otherwise to a grid of 4 pixels;
+- a floating Properties window: label or text, action, required, main button,
+  on every card or on this one, position and size as numbers. It sits in the
+  corner that leaves the selected widget in sight, can be moved, and is hidden
+  with a key. With nothing selected, it says whether the layout is automatic
+  and offers to reset it;
 - with the keyboard: `Tab` selects the next widget, the arrows move it by one
-  pixel, `Shift` and the arrows resize it, `Delete` removes it after a
-  confirmation;
-- keys: `F2` Undo, `F4` Stack (the author dialog), `F6` New widget, `F7`
-  Properties, `F10` History, `F11` Browse, `F12` Back.
+  pixel and `Shift` with the arrows resize it (several presses are saved as one
+  change), `Enter` goes to its properties, `Delete` removes it after a
+  confirmation, `Escape` lets go of the tool, then of the selection, then
+  leaves the editor;
+- keys: `F2` Undo (also Control-Z, or Command-Z on a Mac), `F4` Stack, `F6` New
+  widget, `F7` Properties, `F10` History, `F11` Browse, `F12` Back.
 
 Left for later: pictures and the image tool (2c), the script of a widget (2d),
-the Agent button (phase 3), the slider, grid and chart tools.
+the Agent button (phase 3), the slider, grid and chart tools, renaming a widget
+from the editor (a field is renamed in its dialog).
 
 ## 11. Not covered yet
 
-- Author mode beyond section 10 (visual editor, drawing, scripts): steps 2b to 2d.
+- Author mode beyond section 10 (drawing, scripts): steps 2c and 2d.
 - Agent API, audit log, validation of proposed actions: phase 3.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.

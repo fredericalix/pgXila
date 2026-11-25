@@ -18,8 +18,8 @@ pgXila is made of two parts:
 ## Status
 
 Early development. Phase 1 is done: one vertical slice, from the database to
-two clients. Phase 2, author mode, has its first step: a stack can be built from
-the client, without SQL.
+two clients. Phase 2, author mode, has its first two steps: a stack is built
+from the client, without SQL, and laid out with a visual editor.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -35,11 +35,14 @@ the client, without SQL.
   a field and write it back. Both draw the same screens from the same rows;
 - **author mode**, in both clients: create a stack, add, rename, order and
   remove its fields, and delete it. A stack belongs to its author;
+- **the visual editor**, in the graphical client: move and resize the widgets
+  of a card with the pointer or the keyboard, add texts and buttons, on every
+  card or on one only, and undo;
 - **rewinding**: a card, the screen of a stack or a whole stack goes back to
   before any recorded change, a deleted stack or a removed field included.
 
-Not there yet: placing widgets by hand, drawing pictures and scripts (the next
-steps of author mode), the agent and multiple instances. A stack can also be
+Not there yet: drawing pictures and scripts (the next steps of author mode), the
+agent and multiple instances. A stack can also be
 built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
 The interface is in English.
 
@@ -179,13 +182,18 @@ them.
 
 ## Author mode
 
-An author builds a stack from either client, with forms:
+An author builds a stack from either client. In the terminal, author mode is a
+set of forms. In the window it is a visual editor, from which the same forms
+are one key away (`F4`).
+
+### The forms
 
 | Where | Key | What it does |
 |-------|-----|--------------|
 | My stacks | `F6` | New stack: a title is enough. The stack gets a table of its own |
 | My stacks | `F11` | Author mode on the selected stack |
 | A stack | `F11` | Author mode on that stack, for those who may change it |
+| The visual editor | `F4` | The forms of the stack being edited |
 | Author mode | `F6` | New field: a label and a type (text, number, date, yes or no) |
 | Author mode | Enter | Saves the title, or opens the selected field |
 | Author mode | `F7`, `F8` | Moves the selected field up or down |
@@ -197,6 +205,31 @@ An author builds a stack from either client, with forms:
 Removing a field drops its column, and deleting a stack removes its screens;
 both ask first, and both can be undone from the history. Nothing is ever lost: a
 rewind is itself recorded and can be rewound.
+
+### The visual editor
+
+In the graphical client, `F11` on a stack shows its background with its widgets
+as things to arrange. Fields show the name of their column instead of a value.
+
+- **Select** a widget with a click, or with `Tab`. **Move** it by dragging it,
+  or with the arrows; **resize** it by a handle, or with `Shift` and the arrows.
+  It snaps to its neighbours, with a red guide line, and to a grid.
+- **The tool palette**, on the left: the pointer, then a field, a text and a
+  button to add; then whether new widgets go on every card or on the card on
+  screen only; then the grid and the guides, on or off. `F6` adds a widget
+  without the pointer.
+- **Properties**, in a small window that can be moved and hidden (`F7`): the
+  label of a field or a button, the words of a text, what a button does, the
+  position and the size as numbers.
+- `F2`, Control-Z or Command-Z **undoes** the last change, then the one before.
+  `Delete` removes the selected widget, after a confirmation.
+- `F11` goes back to browsing, `F10` opens the history of the stack.
+
+The layout of a stack is automatic until a widget is moved. From then on every
+widget stays where it was put; Properties, with nothing selected, offers to go
+back to the automatic layout.
+
+### Who may change a stack
 
 A stack belongs to the role that created it. Only that role and its members may
 change it, and PostgreSQL enforces this on the tables themselves. A new stack is

@@ -11,11 +11,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use xila_core::api::WidgetKind;
 use xila_core::input::Key;
 use xila_core::login::open_session;
 use xila_core::server::Server;
 use xila_gui::app::{App, Options};
 use xila_gui::chrome::{content_of, window_around};
+use xila_gui::design::{palette_cells, Cell, Tool};
 use xila_gui::font::Fonts;
 use xila_gui::frame::{Frame, Rect, HEIGHT, WIDTH};
 use xila_gui::layout::layout;
@@ -231,6 +233,47 @@ fn the_pointer_opens_a_stack_and_browses_it() {
     assert_eq!(app.session().unwrap().view().card.position, 1);
 }
 
+fn designing(app: &App<Server>) -> bool {
+    app.session().unwrap().view().designing
+}
+
+/// The rectangle the server holds for a widget in the window, if it has one.
+fn place_of(app: &App<Server>, widget: &str) -> Option<(i32, i32, i32, i32)> {
+    let view = app.session().unwrap().view();
+    let widget = view.widgets().find(|w| w.name == widget)?;
+    let place = widget.layout.get("graphic").filter(|place| place.w > 0)?;
+    Some((place.x, place.y, place.w, place.h))
+}
+
+/// Where a widget is in the content of its window, whatever the size of the
+/// window and so wherever the window is on the screen.
+fn content_place(app: &App<Server>, widget: &str) -> Rect {
+    let view = app.session().unwrap().view();
+    let layout = layout(&view.screen, &view.card.widgets, &Fonts::builtin());
+    layout.item(widget).unwrap_or_else(|| panic!("no widget {widget}")).area
+}
+
+fn field_names(app: &App<Server>) -> Vec<String> {
+    let view = app.session().unwrap().view();
+    let fields = view.screen.widgets.iter().filter(|w| w.kind == WidgetKind::Field);
+    fields.map(|w| w.name.clone()).collect()
+}
+
+/// Adds a field from the editor: F6, Field, then the dialog.
+fn add_field(app: &mut App<Server>, label: &str, spaces_on_type: usize) {
+    app.key(Key::F(6));
+    app.key(Key::Enter);
+    assert_eq!(stack(app), "field", "{:?}", app.session().unwrap().message());
+    type_text(app, label);
+    app.key(Key::Tab);
+    app.key(Key::Tab);
+    for _ in 0..spaces_on_type {
+        app.key(Key::Char(' '));
+    }
+    app.key(Key::Enter);
+    assert!(designing(app), "{:?}", app.session().unwrap().message());
+}
+
 #[test]
 #[ignore = "needs the scratch server: use scripts/test-integration.sh"]
 fn an_author_builds_a_stack_in_the_window() {
@@ -246,50 +289,84 @@ fn an_author_builds_a_stack_in_the_window() {
     assert!(count(&dialog, area_of(&app, "create"), slot::YELLOW) > 300);
     app.key(Key::Enter);
 
-    // Author mode on the new stack, which has no field yet.
-    assert_eq!(stack(&app), "author", "{:?}", app.session().unwrap().message());
-    assert_eq!(value(&app, "title"), "Window test");
-    render(&app, "author-empty");
+    // The new stack opens in the visual editor. It has no field yet.
+    assert_eq!(stack(&app), "window_test", "{:?}", app.session().unwrap().message());
+    assert!(designing(&app));
+    render(&app, "editor-empty");
 
-    // F6: a field. Its label is typed, its type chosen with the space bar,
-    // "required" ticked with the pointer.
-    app.key(Key::F(6));
-    assert_eq!(stack(&app), "field");
-    type_text(&mut app, "Opened on");
-    app.key(Key::Tab);
-    app.key(Key::Tab);
-    app.key(Key::Char(' '));
-    app.key(Key::Char(' '));
-    assert_eq!(value(&app, "type"), "date");
-    let field = render(&app, "field-new");
-    assert!(count(&field, area_of(&app, "type"), slot::INK) > 60);
+    // Two fields, each through the Field dialog: a date and a text.
+    add_field(&mut app, "Opened on", 2);
+    add_field(&mut app, "Place", 0);
+    assert_eq!(field_names(&app), ["opened_on", "place"]);
+    assert_eq!(place_of(&app, "place"), None, "the layout is automatic");
+    let editor = render(&app, "editor-two-fields");
+    assert!(count(&editor, area_of(&app, "place"), slot::SILVER) > 10, "the name of the column");
+
+    // The second field is dragged 40 pixels down with the pointer.
+    let before = content_place(&app, "place");
+    let on_screen = area_of(&app, "place");
+    let (x, y) = (on_screen.x + on_screen.w / 2, on_screen.y + on_screen.h / 2);
+    app.pointer_down(x, y);
+    app.pointer_move(x, y + 20);
+    render(&app, "editor-dragging");
+    app.pointer_move(x, y + 40);
+    app.pointer_up(x, y + 40);
+    let after = content_place(&app, "place");
+    assert!((after.y - (before.y + 40)).abs() <= 2, "{before:?} {after:?}");
+    assert_eq!((after.x, after.w, after.h), (before.x, before.w, before.h));
+    assert_eq!(place_of(&app, "place"), Some((after.x, after.y, after.w, after.h)));
+    // The server now holds the place of every widget, not only of that one.
+    for widget in ["heading", "opened_on", "place", "previous", "next", "new", "delete"] {
+        assert!(place_of(&app, widget).is_some(), "{widget}");
+    }
+    render(&app, "editor-moved");
+
+    // F2 undoes it: the layout is automatic again.
+    app.key(Key::F(2));
+    assert_eq!(app.session().unwrap().message(), Some("Undone: Layout changed."));
+    assert_eq!(place_of(&app, "place"), None);
+    assert_eq!(content_place(&app, "place"), before);
+
+    // A text, with the tool of the palette, then its words in Properties.
+    let (_, text_tool) =
+        palette_cells().into_iter().find(|(cell, _)| *cell == Cell::Tool(Tool::Text)).unwrap();
+    click(&mut app, text_tool);
+    let place = area_of(&app, "place");
+    app.pointer_down(place.x, place.bottom() + 30);
+    app.pointer_up(place.x, place.bottom() + 30);
+    assert!(place_of(&app, "text1").is_some(), "{:?}", app.session().unwrap().message());
     app.key(Key::Enter);
-    assert_eq!(stack(&app), "author", "{:?}", app.session().unwrap().message());
+    type_text(&mut app, " here");
+    app.key(Key::Enter);
+    let view = app.session().unwrap().view();
+    let text = view.widgets().find(|w| w.name == "text1").unwrap();
+    assert_eq!(text.props["template"], "Text here");
+    render(&app, "editor-text");
 
-    let author = render(&app, "author-one-field");
-    let rows = &app.session().unwrap().view().grids["fields"].page.rows;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].cells["name"].as_deref(), Some("opened_on"));
-    assert_eq!(rows[0].cells["type_label"].as_deref(), Some("Date"));
-    assert!(count(&author, area_of(&app, "fields"), slot::INK) > 200);
+    // F4: the forms of the stack, with its two fields; Escape comes back.
+    app.key(Key::F(4));
+    assert_eq!(stack(&app), "author");
+    assert_eq!(app.session().unwrap().view().grids["fields"].page.rows.len(), 2);
+    app.key(Key::Escape);
+    assert!(designing(&app));
 
-    // Deleting the stack asks in a window of its own; Escape gives up.
+    // F11 shows the stack as its users see it, and F11 again edits it.
+    app.key(Key::F(11));
+    assert_eq!(stack(&app), "window_test");
+    assert!(!designing(&app));
+    render(&app, "built-stack");
+    assert_eq!(app.session().unwrap().view().card.count, 0);
+    app.key(Key::F(11));
+    assert!(designing(&app));
+
+    // The stack is deleted from its forms; the question is asked in a window.
+    app.key(Key::F(4));
     let delete = area_of(&app, "delete_stack");
     click(&mut app, delete);
     assert!(app.session().unwrap().question().is_some());
     render(&app, "delete-question");
     app.key(Key::Escape);
     assert!(app.session().unwrap().question().is_none());
-    assert_eq!(stack(&app), "author");
-
-    // F11 shows the stack as its users see it: one field, no card yet.
-    app.key(Key::F(11));
-    assert_eq!(stack(&app), "window_test");
-    render(&app, "built-stack");
-    assert_eq!(app.session().unwrap().view().card.count, 0);
-
-    // Back in author mode, the stack is deleted for good this time.
-    app.key(Key::F(11));
     click(&mut app, delete);
     app.key(Key::Enter);
     assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());

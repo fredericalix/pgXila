@@ -955,7 +955,6 @@ mod tests {
     #[pg_test]
     fn history_is_read_by_those_who_may_read_the_cards() {
         create_books_as_ada();
-        Spi::run("GRANT USAGE ON SCHEMA books TO dan").unwrap();
 
         // Without access to the table: nothing of the stack.
         become_role("dan");
@@ -963,7 +962,8 @@ mod tests {
 
         // With access to the whole table: its changes, cards included.
         become_role("ada");
-        Spi::run("GRANT SELECT, UPDATE ON books.cards TO dan").unwrap();
+        Spi::run("GRANT USAGE ON SCHEMA books TO dan; GRANT SELECT, UPDATE ON books.cards TO dan;")
+            .unwrap();
         become_role("dan");
         assert_eq!(number("SELECT count(*) FROM xila.card_history_line WHERE stack = 'books'"), 2);
         assert_eq!(number("SELECT count(*) FROM xila.history_line WHERE stack = 'books'"), 1);
@@ -996,6 +996,41 @@ mod tests {
              SELECT id, 'card', 'x', 'delete' FROM xila.stack WHERE name = 'books'",
         );
         assert_eq!(state, "42501");
+    }
+
+    #[pg_test]
+    fn a_private_stack_does_not_break_the_screens_of_the_others() {
+        // A stack made in author mode is private: nobody else may even use
+        // its schema. For the others it is simply not there.
+        create_books_as_ada();
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.visible_stack"), 0);
+        assert_eq!(json("SELECT xila.grid_rows('stacks', 'list')")["total"], 0);
+        for query in ["SELECT xila.open_stack('books')", "SELECT xila.card('books')"] {
+            let (state, message) = error_of(query);
+            assert_eq!(state, "XL004", "{query}");
+            assert_eq!(message, "You do not have access to the stack “books”.");
+        }
+        assert_eq!(number("SELECT count(*) FROM xila.history_line"), 0);
+        assert_eq!(number("SELECT count(*) FROM xila.card_history_line"), 0);
+        // Its definition is no secret, like every definition.
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+
+        // Once its author lets them in, it is listed.
+        become_role("ada");
+        Spi::run("GRANT USAGE ON SCHEMA books TO dan; GRANT SELECT ON books.cards TO dan;")
+            .unwrap();
+        become_role("dan");
+        assert_eq!(
+            json("SELECT xila.grid_rows('stacks', 'list')")["rows"][0]["cells"],
+            serde_json::json!({ "title": "Books", "cards": "2" })
+        );
+        // The right to read the table without the right to use its schema is
+        // not access either.
+        become_role("ada");
+        Spi::run("REVOKE USAGE ON SCHEMA books FROM dan").unwrap();
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.visible_stack"), 0);
     }
 
     #[pg_test]
@@ -1489,6 +1524,12 @@ mod tests {
                 { "do": "new", "values": { "stack": "books", "type": "text" } }
             ])
         );
+        // A stack created in the window opens in the editor.
+        let effects = json(
+            r#"SELECT xila.act('new_stack', 'create',
+                   '{"renderer": "graphic", "dirty": {"title": "Maps"}}')"#,
+        );
+        assert_eq!(effects[1], serde_json::json!({ "do": "design", "stack": "maps" }));
     }
 
     #[pg_test]

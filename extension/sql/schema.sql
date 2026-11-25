@@ -513,6 +513,28 @@ LANGUAGE sql STABLE AS $$
                 ELSE coalesce(xila.is_mine(xila.last_owner(stack)), false) END
 $$;
 
+-- A table by its names, or NULL. Unlike a lookup by name (to_regclass or a
+-- cast to regclass), this never raises an error for a role that may not use
+-- the schema: where pgXila asks whether someone has access, the answer to give
+-- is "no", not an error.
+CREATE FUNCTION xila.relation(in_schema name, named name) RETURNS oid
+LANGUAGE sql STABLE AS $$
+    SELECT c.oid
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = in_schema AND c.relname = named
+$$;
+
+-- True when the current role may read a table: use its schema, and select
+-- from it.
+CREATE FUNCTION xila.may_read(relation oid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT coalesce((
+        SELECT has_schema_privilege(c.relnamespace, 'USAGE')
+           AND has_table_privilege(c.oid, 'SELECT')
+        FROM pg_catalog.pg_class c
+        WHERE c.oid = relation), false)
+$$;
+
 -- History holds old versions of cards, so reading it follows the table:
 --   * changes to a definition: whoever may open the stack;
 --   * changes to cards, and the values of a dropped column: whoever may read
@@ -526,12 +548,12 @@ LANGUAGE sql STABLE AS $$
         ELSE coalesce((
             SELECT CASE
                 WHEN b.source_table IS NULL THEN kind NOT IN ('card', 'column')
-                WHEN NOT has_table_privilege(c.oid, 'SELECT') THEN false
+                WHEN NOT xila.may_read(c.oid) THEN false
                 ELSE kind NOT IN ('card', 'column') OR NOT c.relrowsecurity
             END
             FROM xila.background b
             LEFT JOIN pg_catalog.pg_class c
-                   ON c.oid = to_regclass(format('%I.%I', b.source_schema, b.source_table))
+                   ON c.oid = xila.relation(b.source_schema, b.source_table)
             WHERE b.stack_id = stack), false)
     END
 $$;

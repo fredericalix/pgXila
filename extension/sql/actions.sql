@@ -148,9 +148,13 @@ BEGIN
         END IF;
         target := xila.create_stack(dirty->>'title', dirty->>'name',
                                     to_regclass(nullif(dirty->>'source', '')));
+        -- Author mode on the new stack: the visual editor in the window, the
+        -- forms in the terminal.
         RETURN jsonb_build_array(
             jsonb_build_object('do', 'back'),
-            xila.fx_show('author', target),
+            CASE WHEN context->>'renderer' = 'graphic'
+                 THEN jsonb_build_object('do', 'design', 'stack', target)
+                 ELSE xila.fx_show('author', target) END,
             xila.fx_message('Stack created. F6 adds a field.'));
 
     WHEN 'save_stack' THEN

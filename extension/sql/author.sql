@@ -1394,7 +1394,8 @@ BEGIN
             WHEN before->>'label' IS DISTINCT FROM after->>'label'
                 THEN format('Label of “%s” changed to “%s”', after->>'name', after->>'label')
             WHEN before->'props'->>'template' IS DISTINCT FROM after->'props'->>'template'
-                THEN 'Card title changed'
+                THEN CASE WHEN after->'props'->>'style' = 'title' THEN 'Card title changed'
+                          ELSE format('Text of “%s” changed', after->>'name') END
             WHEN before->>'ord' <> after->>'ord' THEN format('“%s” moved', after->>'name')
             ELSE format('“%s” changed', after->>'name') END;
     WHEN 'card' THEN
