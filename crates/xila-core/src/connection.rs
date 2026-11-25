@@ -54,6 +54,8 @@ pub enum ConnectError {
     NoSystemRoots,
     #[error("TLS configuration error: {0}")]
     Tls(#[from] rustls::Error),
+    #[error("cannot start the network runtime: {0}")]
+    Runtime(#[source] std::io::Error),
     #[error(transparent)]
     Postgres(#[from] tokio_postgres::Error),
 }
