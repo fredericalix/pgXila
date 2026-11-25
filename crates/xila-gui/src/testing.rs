@@ -24,6 +24,12 @@ pub struct Fake {
     pub placed: BTreeMap<String, [i32; 4]>,
     pub added: Vec<serde_json::Value>,
     pub removed: Vec<String>,
+    /// The extra colours the address book was given, by slot.
+    pub tints: BTreeMap<u8, String>,
+    /// The pictures that were saved: what they are of, and the picture.
+    pub drawings: Vec<(String, Image)>,
+    /// True when the server refuses to save a drawing.
+    pub refuses_drawings: bool,
 }
 
 fn desktop() -> Screen {
@@ -59,7 +65,7 @@ fn stacks() -> Screen {
         "source": { "has_cards": false, "count": 1 },
         "widgets": [
             { "name": "list", "kind": "grid", "ord": 10, "action": "open",
-              "props": { "columns": [
+              "props": { "view": "icons", "icon": "icon", "columns": [
                   { "column": "title", "label": "Stack" },
                   { "column": "cards", "label": "Cards", "align": "right" } ] } }
         ],
@@ -80,6 +86,11 @@ impl Fake {
             screen.widgets.push(serde_json::from_value(widget.clone()).unwrap());
         }
         screen.widgets.retain(|w| !self.removed.contains(&w.name));
+        screen.colours = self
+            .tints
+            .iter()
+            .map(|(slot, rgb)| xila_core::api::Colour { slot: *slot, rgb: rgb.clone(), name: None })
+            .collect();
         for widget in &mut screen.widgets {
             if let Some([x, y, w, h]) = self.placed.get(&widget.name).copied() {
                 let style =
@@ -251,8 +262,14 @@ impl Api for Fake {
         Ok(Vec::new())
     }
 
-    /// A portrait whose first two pixels are red and green, to recognise it.
+    /// A portrait whose first two pixels are red and green, to recognise it,
+    /// and the icon of a stack: an orange square with a transparent corner.
     fn image(&mut self, id: &str) -> Result<Option<Image>, ApiError> {
+        if id == "icon" {
+            let mut pixels = vec![slot::AMBER; 28 * 26];
+            pixels[0] = xila_core::api::TRANSPARENT;
+            return Ok(Some(Image { width: 28, height: 26, pixels }));
+        }
         if id != "portrait" {
             return Ok(None);
         }
@@ -368,16 +385,21 @@ impl Api for Fake {
             };
             return Ok(GridPage { total: rows.len() as u64, rows });
         }
-        let row = |key: &str, title: &str, cards: &str| GridRow {
+        let row = |key: &str, title: &str, cards: &str, icon: Option<&str>| GridRow {
             key: key.into(),
             cells: BTreeMap::from([
                 ("title".to_owned(), Some(title.to_owned())),
                 ("cards".to_owned(), Some(cards.to_owned())),
+                ("icon".to_owned(), icon.map(str::to_owned)),
             ]),
         };
+        // One stack has an icon of its own, the other has none.
         Ok(GridPage {
             total: 2,
-            rows: vec![row("addressbook", "Address book", "2"), row("recipes", "Recipes", "2")],
+            rows: vec![
+                row("addressbook", "Address book", "2", Some("icon")),
+                row("recipes", "Recipes", "2", None),
+            ],
         })
     }
 
@@ -451,6 +473,58 @@ impl Api for Fake {
                 vec![Effect::Reload, Effect::Message { text: "Undone: “city” moved.".into() }]
             }
             "stack_history" => vec![Effect::Message { text: "History.".into() }],
+            // Drawing: the picture of the card, the icon of the stack, or a
+            // picture of the background.
+            "draw" => {
+                let input = context.input.clone().unwrap_or_default();
+                let target = input["target"].as_str().unwrap_or_default().to_owned();
+                let widget = input["widget"].as_str().map(str::to_owned);
+                let (image, width, height) = match target.as_str() {
+                    "icon" => (None, 28, 26),
+                    "card" if context.card.as_deref() == Some("1") => {
+                        (Some("portrait".to_owned()), 68, 80)
+                    }
+                    "card" => (None, 68, 80),
+                    _ => (None, 48, 48),
+                };
+                vec![Effect::Draw { target, widget, image, width, height }]
+            }
+            "save_drawing" if self.refuses_drawings => {
+                return Err(ApiError::User {
+                    code: "XL003".into(),
+                    message: "An icon is drawn with the 32 system colours only.".into(),
+                })
+            }
+            "save_drawing" => {
+                let input = context.input.clone().unwrap_or_default();
+                let hex = input["pixels"].as_str().unwrap_or_default();
+                let pixels = (0..hex.len() / 2)
+                    .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap())
+                    .collect();
+                let image = Image {
+                    width: input["width"].as_u64().unwrap() as u16,
+                    height: input["height"].as_u64().unwrap() as u16,
+                    pixels,
+                };
+                self.drawings.push((input["target"].as_str().unwrap().to_owned(), image));
+                vec![Effect::Reload, Effect::Message { text: "Picture saved.".into() }]
+            }
+            "set_colour" => {
+                let input = context.input.clone().unwrap_or_default();
+                let slot = match input["slot"].as_u64() {
+                    Some(slot) => slot as u8,
+                    None => (32..255).find(|slot| !self.tints.contains_key(slot)).unwrap(),
+                };
+                self.tints.insert(slot, input["rgb"].as_str().unwrap().to_owned());
+                vec![Effect::Reload]
+            }
+            "remove_colour" => {
+                let input = context.input.clone().unwrap_or_default();
+                self.tints.remove(&(input["slot"].as_u64().unwrap() as u8));
+                vec![Effect::Reload]
+            }
+            // The server answered with the screen as it now is.
+            "refresh" => vec![Effect::Reload],
             "edit_field" => vec![show("field", context.row.as_deref())],
             "new_field" => vec![
                 show("field", None),

@@ -227,7 +227,7 @@ $$;
 
 -- The user stacks the current role may open: those whose table it may read.
 CREATE VIEW xila.visible_stack AS
-    SELECT s.name, s.title, xila.card_count(s.name) AS cards
+    SELECT s.name, s.title, xila.card_count(s.name) AS cards, s.icon_id::text AS icon
     FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id
     WHERE s.kind = 'user'
       AND CASE WHEN b.source_table IS NULL THEN true
@@ -274,7 +274,8 @@ BEGIN
                   AND xila.offered(a.args, bg.stack_id)
                 ORDER BY kb.key, kb.background_id NULLS LAST) k),
         'colours', (
-            SELECT coalesce(jsonb_agg(jsonb_build_object('slot', c.slot, 'rgb', c.rgb)
+            SELECT coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+                       'slot', c.slot, 'rgb', c.rgb, 'name', c.name))
                                       ORDER BY c.slot), '[]')
             FROM xila.stack_colour c WHERE c.stack_id = bg.stack_id));
 END
@@ -496,6 +497,10 @@ BEGIN
 
     SELECT string_agg(format('%1$L, t.%1$I::text', c->>'column'), ', ') INTO cols
     FROM jsonb_array_elements(props->'columns') c;
+    -- A grid shown as icons also needs the image of each row.
+    IF props ? 'icon' THEN
+        cols := concat_ws(', ', cols, format('%1$L, t.%1$I::text', props->>'icon'));
+    END IF;
 
     IF props ? 'where' THEN
         IF source IS NOT NULL AND card IS NOT NULL THEN

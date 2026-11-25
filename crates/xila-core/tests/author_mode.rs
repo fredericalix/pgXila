@@ -397,3 +397,74 @@ fn undo_goes_back_one_change_at_a_time() {
 
     forget_the_test_stack();
 }
+
+#[test]
+#[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
+fn pictures_are_added_and_never_overwritten() {
+    forget_the_test_stack();
+    execute_as_author(&format!(
+        "SELECT xila.create_stack('Test books');
+         SELECT xila.add_field('{STACK}', 'Title');
+         SELECT xila.add_field('{STACK}', 'Cover', 'picture');
+         SELECT xila.save_card('{STACK}', NULL, '{{\"title\": \"Dune\"}}');"
+    ));
+    let mut session = session_as("PGXILA_TEST_AUTHOR");
+    session.be_graphic();
+    open_the_test_stack(&mut session);
+    let drawing = |pixels: &str| {
+        serde_json::json!({
+            "target": "card", "widget": "cover", "width": 2, "height": 2, "pixels": pixels
+        })
+    };
+
+    // The picture of the card: nothing yet, a frame of the size of a portrait.
+    session.run_with("draw", serde_json::json!({ "target": "card", "widget": "cover" }));
+    let open = session.view().drawing.clone().expect("the drawing editor is asked for");
+    assert_eq!((open.image, open.width, open.height), (None, 68, 80));
+    session.stop_drawing();
+
+    // A first drawing, then another: the card points to a new image each time.
+    assert!(session.run_with("save_drawing", drawing("0018ff07")), "{:?}", session.message());
+    assert_eq!(session.message(), Some("Picture saved."));
+    let first = session.view().value("cover").to_owned();
+    assert_eq!(session.image(&first).map(|image| image.pixels.clone()), Some(vec![0, 24, 255, 7]));
+    assert!(session.run_with("save_drawing", drawing("01010101")));
+    let second = session.view().value("cover").to_owned();
+    assert_ne!(second, first);
+
+    // Drawing it again starts from the image the card has now.
+    session.run_with("draw", serde_json::json!({ "target": "card", "widget": "cover" }));
+    let open = session.view().drawing.clone().unwrap();
+    assert_eq!((open.image.as_deref(), open.width, open.height), (Some(second.as_str()), 2, 2));
+    session.stop_drawing();
+
+    // The history of the card goes back to the first picture, which is
+    // still there: an image is never changed.
+    session.press("F10");
+    assert_eq!(column(&session, "changes", "summary")[0], "Card “Dune” changed: cover");
+    session.activate("changes");
+    session.answer(true);
+    assert_eq!(session.view().stack(), STACK, "{:?}", session.message());
+    assert_eq!(session.view().value("cover"), first);
+
+    // A colour of the stack, for the pictures of its cards.
+    assert!(session.run_with("set_colour", serde_json::json!({ "rgb": "#AB12CD" })));
+    let colours = &session.view().screen.colours;
+    assert_eq!((colours[0].slot, colours[0].rgb.as_str()), (32, "#ab12cd"));
+    assert!(session.run_with("save_drawing", drawing("20202020")));
+
+    // The icon of the stack only has the colours every stack has.
+    let icon = |pixels: &str| serde_json::json!({ "target": "icon", "width": 2, "height": 2, "pixels": pixels });
+    assert!(!session.run_with("save_drawing", icon("20202020")));
+    assert_eq!(session.message(), Some("An icon is drawn with the 32 system colours only."));
+    assert!(session.run_with("save_drawing", icon("18181818")));
+
+    // The list of stacks gives the icon of each stack, and the client reads it.
+    session.press("F12");
+    assert_eq!(session.view().stack(), "stacks");
+    let row = column(&session, "list", "title").iter().position(|t| t == "Test books").unwrap();
+    let image = column(&session, "list", "icon")[row].clone();
+    assert_eq!(session.image(&image).map(|image| image.pixels.clone()), Some(vec![24; 4]));
+
+    forget_the_test_stack();
+}

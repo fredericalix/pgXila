@@ -44,6 +44,16 @@ const GRID_ROWS: i32 = 10;
 const GRID_ROWS_MIN: i32 = 3;
 pub const GRID_HEADER: i32 = 13;
 pub const GRID_ROW: i32 = 12;
+/// The size of a tile of a list shown as icons: an icon at twice its size,
+/// a title and a line under it.
+pub const TILE: (i32, i32) = (96, 88);
+/// How many rows of tiles a list shown as icons has on screen.
+const TILE_ROWS: i32 = 2;
+
+/// True for a list that asks to be shown as icons rather than as rows.
+pub fn is_icon_view(widget: &Widget) -> bool {
+    widget.props.get("view").and_then(|v| v.as_str()) == Some("icons")
+}
 const BUTTON_GAP: i32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,10 +222,18 @@ pub fn layout(screen: &Screen, card_widgets: &[Widget], fonts: &Fonts) -> Graphi
         layout
     };
 
+    // The picture of a card can be drawn: it takes the focus too, after the
+    // rest, so that the cursor still starts in the first field.
+    let card_picture = |item: &Item| {
+        cards
+            && item.part == Part::Picture
+            && screen.widgets.iter().any(|w| w.name == item.widget && w.column.is_some())
+    };
     let mut focusable: Vec<&Item> = layout
         .items
         .iter()
         .filter(|item| matches!(item.part, Part::Field { .. } | Part::Grid | Part::Button { .. }))
+        .chain(layout.items.iter().filter(|item| card_picture(item)))
         .collect();
     // Placed by hand, the widgets are visited as they are read: down the
     // window, and from left to right.
@@ -487,7 +505,9 @@ fn grid_columns(widget: &Widget) -> usize {
 /// A static screen or a dialog: a banner, lines of text, fields, a list, and
 /// buttons.
 fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
-    let wide = widgets.iter().any(|w| w.kind == WidgetKind::Grid && grid_columns(w) > 2);
+    let wide = widgets
+        .iter()
+        .any(|w| w.kind == WidgetKind::Grid && (grid_columns(w) > 2 || is_icon_view(w)));
     let width = if wide { WIDE_STATIC_WIDTH } else { STATIC_WIDTH };
     let mut layout = GraphicLayout { width, ..GraphicLayout::default() };
     let left = 14;
@@ -575,7 +595,11 @@ fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
         let fixed = GRID_HEADER + 2 + 9;
         let room = MAX_HEIGHT - y - buttons_height - if has_picture { PICTURE.1 + 9 } else { 0 };
         let rows = ((room / grids.len() as i32 - fixed) / GRID_ROW).clamp(GRID_ROWS_MIN, GRID_ROWS);
-        let height = GRID_HEADER + rows * GRID_ROW + 2;
+        let height = if is_icon_view(widget) {
+            TILE_ROWS * TILE.1 + 2
+        } else {
+            GRID_HEADER + rows * GRID_ROW + 2
+        };
         layout.items.push(Item {
             widget: widget.name.clone(),
             area: Rect::new(MARGIN, y, width - 2 * MARGIN, height),
@@ -782,7 +806,9 @@ mod tests {
     #[test]
     fn the_focus_goes_through_fields_then_buttons() {
         let layout = layout(&addressbook(), &[], &fonts());
-        assert_eq!(layout.focus_order, ["last_name", "company", "previous", "new"]);
+        // The picture of a card can be drawn, so it takes the focus, but last:
+        // the cursor still starts in the first field.
+        assert_eq!(layout.focus_order, ["last_name", "company", "previous", "new", "photo"]);
     }
 
     #[test]

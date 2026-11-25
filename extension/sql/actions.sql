@@ -31,6 +31,7 @@ DECLARE
     scope   text;
     shown   text;
     is_field boolean;
+    drawn   xila.widget;
     n       bigint;
 BEGIN
     SELECT s.* INTO info FROM xila.stack s WHERE s.id = bg.stack_id;
@@ -328,6 +329,104 @@ BEGIN
         RETURN jsonb_build_array(
             jsonb_build_object('do', 'reload'),
             xila.fx_message(format('Undone: %s.', saved->>'summary')));
+
+    -- Drawing ---------------------------------------------------------------
+    -- A picture is the icon of the stack, the picture a card has in one of
+    -- its columns, or a picture of the background. "draw" opens the drawing
+    -- editor of the client on it; "save_drawing" keeps what was drawn as a new
+    -- image, and points the stack, the card or the widget to it.
+
+    WHEN 'draw', 'save_drawing' THEN
+        IF context->>'renderer' IS DISTINCT FROM 'graphic' THEN
+            RETURN jsonb_build_array(xila.fx_message('Drawing needs the graphical client.'));
+        END IF;
+        scope := input->>'target';
+        target := input->>'widget';
+        IF scope IS NULL OR scope NOT IN ('icon', 'card', 'widget') THEN
+            RAISE EXCEPTION 'Unknown kind of picture: %.', scope USING ERRCODE = 'XL003';
+        END IF;
+
+        -- Who may draw it, and the image it shows now.
+        IF scope = 'icon' THEN
+            PERFORM xila.editable(stack);
+            shown := info.icon_id::text;
+        ELSE
+            SELECT w.* INTO drawn
+            FROM xila.widget w
+            WHERE w.background_id = bg.id AND w.name = target AND w.kind = 'image'
+              AND (w.card_key IS NULL OR w.card_key = card)
+            ORDER BY w.card_key NULLS LAST
+            LIMIT 1;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'This screen has no picture named “%”.', target
+                    USING ERRCODE = 'XL002';
+            END IF;
+            IF scope = 'widget' THEN
+                PERFORM xila.editable(stack);
+                IF drawn.bound_column IS NOT NULL THEN
+                    RAISE EXCEPTION 'This picture is drawn card by card.' USING ERRCODE = 'XL003';
+                END IF;
+                shown := drawn.props->>'image';
+            ELSE
+                IF drawn.bound_column IS NULL OR source IS NULL THEN
+                    RAISE EXCEPTION 'This picture is the same on every card.'
+                        USING ERRCODE = 'XL003';
+                END IF;
+                IF card IS NULL THEN
+                    RAISE EXCEPTION 'Save the card before drawing its picture.'
+                        USING ERRCODE = 'XL003';
+                END IF;
+                IF NOT has_table_privilege(source, 'UPDATE') THEN
+                    RAISE EXCEPTION 'You are not allowed to change this stack.'
+                        USING ERRCODE = 'XL004';
+                END IF;
+                EXECUTE format('SELECT %I::text FROM %s WHERE %I::text = $1',
+                               drawn.bound_column, source, bg.key_column)
+                INTO shown USING card;
+            END IF;
+        END IF;
+
+        IF act.handler = 'draw' THEN
+            -- The size of the drawing: that of the image, or else that of the
+            -- frame of the widget, or else that of an icon or of a portrait.
+            SELECT jsonb_build_object('image', i.id, 'width', i.width, 'height', i.height)
+            INTO saved
+            FROM xila.image i WHERE i.id::text = shown;
+            IF saved IS NULL AND scope <> 'icon' THEN
+                SELECT jsonb_build_object('width', l.w - 2, 'height', l.h - 2) INTO saved
+                FROM xila.layout l
+                WHERE l.widget_id = drawn.id AND l.renderer = 'graphic' AND l.w > 2 AND l.h > 2;
+            END IF;
+            RETURN jsonb_build_array(
+                jsonb_strip_nulls(jsonb_build_object('do', 'draw', 'target', scope, 'widget', target))
+                || coalesce(saved, CASE WHEN scope = 'icon'
+                                        THEN '{"width": 28, "height": 26}'::jsonb
+                                        ELSE '{"width": 68, "height": 80}'::jsonb END));
+        END IF;
+
+        BEGIN
+            shown := xila.new_image((input->>'width')::integer, (input->>'height')::integer,
+                                    decode(input->>'pixels', 'hex'))::text;
+        EXCEPTION WHEN data_exception THEN
+            RAISE EXCEPTION 'The drawing could not be read.' USING ERRCODE = 'XL003';
+        END;
+        IF scope = 'icon' THEN
+            PERFORM xila.set_stack(stack, jsonb_build_object('icon', shown));
+        ELSIF scope = 'widget' THEN
+            PERFORM xila.set_widget(stack, target, jsonb_build_object('image', shown), card);
+        ELSE
+            PERFORM xila.save_card(stack, card, jsonb_build_object(drawn.bound_column, shown));
+        END IF;
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'), xila.fx_message('Picture saved.'));
+
+    WHEN 'set_colour' THEN
+        PERFORM xila.set_colour(stack, (input->>'slot')::integer, input->>'rgb', input->>'name');
+        RETURN jsonb_build_array(jsonb_build_object('do', 'reload'));
+
+    WHEN 'remove_colour' THEN
+        PERFORM xila.remove_colour(stack, (input->>'slot')::integer);
+        RETURN jsonb_build_array(jsonb_build_object('do', 'reload'));
 
     WHEN 'rewind' THEN
         scope := act.args->>'scope';

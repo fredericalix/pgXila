@@ -107,7 +107,7 @@ mod tests {
             PaletteColour { slot: 0, name: "black".into(), rgb: "#000000".into() },
             PaletteColour { slot: 6, name: "cream".into(), rgb: "not a colour".into() },
         ];
-        let stack = [Colour { slot: 40, rgb: "#102030".into() }];
+        let stack = [Colour { slot: 40, rgb: "#102030".into(), name: None }];
         let palette = Palette::of_session(&system, &stack);
 
         assert_eq!(palette.rgb(0), 0x000000);

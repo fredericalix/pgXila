@@ -1,8 +1,8 @@
 # pgXila SQL API
 
 This document describes the contract between the pgXila extension and its
-clients, as implemented for phase 1 and for steps 2a and 2b of author mode.
-API version: 2.
+clients, as implemented for phase 1 and for steps 2a, 2b and 2c of author
+mode. API version: 2.
 
 A pgXila client is an ordinary PostgreSQL client. It connects over TLS 1.3 with
 SCRAM-SHA-256, calls SQL functions of the `xila` schema, and listens on
@@ -23,6 +23,7 @@ return and sends back what the user does.
 | Who may change a stack | Its owner role and the members of that role, enforced by row-level security |
 | Where the author screens live | In the database, as system stacks; the clients have no author code |
 | Tables pgXila alters | Only those it created (`managed`); never a table that existed before |
+| Pictures | An image never changes: a drawing is saved as a new image, and what showed the old one points to the new one |
 | Identifiers | `uuid` (UUIDv7), ready for several instances |
 | Text grid | 80 columns by 24 rows |
 | Graphic screen | 480 by 300 pixels, one byte per pixel, each a palette slot |
@@ -56,8 +57,8 @@ its own, usually in a schema of its own, for example `addressbook.contacts`.
 | Table | One row is | Main columns |
 |-------|-----------|--------------|
 | `xila.palette` | a system colour | `slot` (0 to 31), `name`, `rgb` (`#rrggbb`) |
-| `xila.stack_colour` | an extra colour of a stack | `stack_id`, `slot` (32 to 255), `name`, `rgb` |
-| `xila.image` | an indexed image | `id`, `width`, `height`, `pixels` (one byte per pixel) |
+| `xila.stack_colour` | an extra colour of a stack | `stack_id`, `slot` (32 to 254), `name`, `rgb` |
+| `xila.image` | an indexed image, written once | `id`, `width`, `height`, `pixels` (one byte per pixel; 255 is transparent) |
 | `xila.stack` | a stack | `id`, `name` (identifier), `title`, `kind` (`system` or `user`), `icon_id`, `owner` |
 | `xila.background` | the screen shared by the cards of a stack | `id`, `stack_id`, `source_schema`, `source_table`, `key_column`, `order_columns`, `managed` |
 | `xila.action` | something a button or a key triggers | `id`, `background_id`, `name`, `label`, `handler`, `args` |
@@ -115,7 +116,9 @@ client.
 - **Image.** An `image` widget shows a row of `xila.image`: the one whose
   identifier is in its bound column, of type `uuid`, or a fixed one named in
   `props` as `{"image": "0193…"}`. An image is `width * height` bytes, one per
-  pixel, row by row; each byte is a palette slot.
+  pixel, row by row; each byte is a palette slot. Slot 255 is transparent: such
+  a pixel shows what is behind the picture. Images are never changed nor
+  deleted; see section 10.8.
 - **Grid.** A `grid` widget lists the rows of a table or view named in `props`:
   `{"schema": "xila", "table": "visible_stack", "key": "name", "columns":
   [{"column": "title", "label": "Stack"}]}`. Choosing a row runs the widget's
@@ -123,7 +126,11 @@ client.
   `"where": {"stack": "name"}` keeps the rows whose column `stack` equals the
   column `name` of the card on screen, so that a grid lists what belongs to that
   card; `"order": ["ord", "name"]` sorts by these columns instead of the key,
-  from last to first with `"descending": true`.
+  from last to first with `"descending": true`. `{"view": "icons", "icon":
+  "icon"}` asks for the rows to be shown as icons, as on a desktop, and names
+  the column that holds the image of each row; the graphical client then draws
+  each row as its icon, twice its size, over the text of the first column and
+  that of the second ("12 cards"). The text client shows the rows.
 - **Actions and keys.** An action or a key binding without a background is
   available on every screen. A key bound on a screen wins over the same key
   bound everywhere. Keys are `F1` to `F24` and `Enter`. `{"for": "author"}` in
@@ -286,7 +293,7 @@ SELECT xila.act('addressbook', 'next_card',
 saved, `row` is the key of the selected grid row, and `confirmed` is true once
 the user has accepted the question the action asked. `renderer` says which
 client this is, `text` or `graphic`, and `input` holds what a tool of the
-client, such as the visual editor, has to say. The server looks up the
+client, such as the visual editor or the drawing editor, has to say. The server looks up the
 action, runs its handler, and answers with effects that the client applies in
 order:
 
@@ -305,6 +312,7 @@ order:
 | `confirm` | Ask the question in `text`. If the user accepts (`label` says what accepting does), the client runs the same action again with `"confirmed": true` in its context |
 | `select` | Select the row of the grid whose key is `row` |
 | `design` | Open the visual editor on the stack named by `stack`. Only sent to a graphical client |
+| `draw` | Open the drawing editor on a picture: `target` is `icon`, `card` or `widget`, `widget` names the widget that shows it, `image` is the image it shows now, if any, and `width` and `height` the size of the drawing. Only sent to a graphical client |
 | `quit` | Leave the client |
 
 The handlers:
@@ -323,6 +331,7 @@ The handlers:
 | `new_stack`, `create_stack`, `save_stack`, `delete_stack` | The dialogs of a stack in author mode |
 | `new_field`, `edit_field`, `save_field`, `remove_field`, `move_field` | The dialogs of a field in author mode |
 | `place_widgets`, `reset_layout`, `add_widget`, `set_widget`, `remove_widget`, `undo` | What the visual editor asks for, with its request in `input`; see section 10.7 |
+| `draw`, `save_drawing`, `set_colour`, `remove_colour` | What the drawing editor asks for; see section 10.8 |
 
 The author handlers read the context and call the functions of section 10.3.
 On the author screens the key of the card is the subject of the dialog: the
@@ -406,8 +415,8 @@ its question is drawn by the clients as well.
 
 Phase 2 is delivered in four steps: 2a, building a stack with forms, ownership
 and rewinding, in both clients; 2b, the visual editor of a background; 2c, the
-drawing editor; 2d, scripts. This section describes steps 2a and 2b, which are
-implemented.
+drawing editor; 2d, scripts. This section describes steps 2a, 2b and 2c, which
+are implemented.
 
 ### 10.1 Ownership
 
@@ -432,9 +441,8 @@ Who may read or write the *cards* of a stack stays a matter of privileges on its
 table: a stack created in author mode is visible to its author alone until
 someone grants `USAGE` on its schema and privileges on its table.
 
-Not changed in 2a: any author may still change the palette, and any author may
-still write any image. Images get an owner and a history with the drawing
-editor, in 2c.
+Any author may still change the system palette. Images need no owner: they are
+never changed (section 10.8).
 
 ### 10.2 Where a new stack keeps its cards
 
@@ -468,16 +476,19 @@ tools in phase 3.
 | Function | What it does |
 |----------|--------------|
 | `xila.create_stack(title text, name text DEFAULT NULL, source regclass DEFAULT NULL)` | Creates a stack and returns its name, made from the title when not given. Without `source`: the schema, the table, an empty screen with its browsing buttons and keys. With `source`: a screen with one field per column of that table, which the caller must own |
-| `xila.set_stack(stack text, changes jsonb)` | Changes `title`, or `card_title`, the template written at the top of each card, such as `{last_name}, {first_name}` |
+| `xila.set_stack(stack text, changes jsonb)` | Changes `title`, `card_title`, the template written at the top of each card, such as `{last_name}, {first_name}`, or `icon`, the identifier of an image drawn with the system colours |
 | `xila.delete_stack(stack text)` | Removes the stack and its screens. The table and the cards are left in place; rewinding brings the stack back |
-| `xila.add_field(stack text, label text, type text DEFAULT 'text', name text DEFAULT NULL)` | Adds a field at the end and returns its name. `type` is `text`, `number`, `date` or `boolean`. Without `name`, an identifier is made from the label. On a stack that is not managed, the name is an existing column to show. The first field of a stack becomes the title of its cards |
+| `xila.add_field(stack text, label text, type text DEFAULT 'text', name text DEFAULT NULL)` | Adds a field at the end and returns its name. `type` is `text`, `number`, `date`, `boolean` or `picture` (a column that refers to an image, shown by an `image` widget). Without `name`, an identifier is made from the label. On a stack that is not managed, the name is an existing column to show. The first field of a stack becomes the title of its cards |
 | `xila.set_field(stack text, field text, changes jsonb)` | Changes `label`, `name` (renames the column too) or `required` (`NOT NULL`; refused, with the number of cards concerned, while some cards have no value) |
 | `xila.move_field(stack text, field text, by integer)` | Moves a field up (`-1`) or down (`1`) in the logical order |
 | `xila.remove_field(stack text, field text)` | Removes a field. On a managed stack the column is dropped; its values are saved in history, so that rewinding restores them |
 | `xila.place_widgets(stack text, renderer text, placements jsonb, card text DEFAULT NULL)` | Sets the rectangle of some widgets for one renderer: `{"city": {"x": 128, "y": 94, "w": 100, "h": 14}}`. Styles are kept. A widget of a single card is looked for on `card` |
 | `xila.reset_layout(stack text, renderer text)` | Forgets every rectangle of that renderer: the placement is automatic again. Styles are kept |
-| `xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}', card text DEFAULT NULL)` | Adds a `text` or a `button` and returns its name (`text1`, `button1`…). `props` may hold `label`, `text` (a template), `action` (the name of an action of the stack) and `placement`. With `card`, the widget is on that card only |
-| `xila.set_widget(stack text, widget text, changes jsonb, card text DEFAULT NULL)` | Changes `label`, `text`, `action`, `main` (the main button of the screen), `required` (for a field) or `layer` (`background` or `card`, to move a text or a button from one to the other) |
+| `xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}', card text DEFAULT NULL)` | Adds a `text`, a `button` or an `image` (a picture of the background) and returns its name (`text1`, `button1`…). `props` may hold `label`, `text` (a template), `action` (the name of an action of the stack), `image` and `placement`. With `card`, the widget is on that card only |
+| `xila.set_widget(stack text, widget text, changes jsonb, card text DEFAULT NULL)` | Changes `label`, `text`, `action`, `main` (the main button of the screen), `required` (for a field), `image` (for a picture of the background) or `layer` (`background` or `card`, to move a text, a button or a picture from one to the other) |
+| `xila.new_image(width int, height int, pixels bytea)` | Adds an image and returns its identifier. An image identical to one that is already there is not added twice. Open to every member of `xila_user` |
+| `xila.set_colour(stack text, slot int, rgb text, name text DEFAULT NULL)` | Adds an extra colour to a stack, or changes one, and returns its slot. With a null slot, the first free one is taken |
+| `xila.remove_colour(stack text, slot int)` | Removes an extra colour |
 | `xila.remove_widget(stack text, widget text, card text DEFAULT NULL)` | Removes a widget. A field is removed as by `xila.remove_field` |
 | `xila.undo(stack text)` | Undoes the last change made to the screen of the stack; see 10.7. Returns `{"undone": n, "summary": "…"}` |
 | `xila.rewind(stack text, scope text, since bigint, card text DEFAULT NULL)` | Undoes the recorded change `since` and all those after it; see 10.5. Returns `{"undone": n}` |
@@ -486,8 +497,7 @@ tools in phase 3.
 A stack created by `xila.create_stack` has the keys `F4` Delete, `F6` New, `F7`
 Previous, `F8` Next, `F10` History and `Enter` Save.
 
-The type of an existing field cannot be changed in 2a. Pictures as a field type
-come with the drawing editor.
+The type of an existing field cannot be changed.
 
 Views, for the author screens and for anyone:
 
@@ -560,15 +570,14 @@ the dialog, and what is typed on it goes to an action, never to the view:
 | My stacks | | For authors: `F6` New stack, `F10` Deleted stacks, `F11` Author mode on the selected stack |
 | New stack | `F6` on My stacks | Title, name (made from the title when left empty), start from an empty stack or from one of the caller's tables. `Enter` creates it and opens author mode: the visual editor in the window, the author dialog in the terminal |
 | Author mode | `F11` on a stack one may change, or on My stacks, in the text client; `F4` in the visual editor | Title, card title, the list of fields with label, name, type and required. `Enter` saves, or opens the selected field. `F6` New field, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
-| Field | `F6` or `Enter` in author mode | Label, name, type, required. `Enter` saves. Button Remove, with a confirmation that says how many cards have a value |
+| Field | `F6` or `Enter` in author mode | Label, name, type (text, number, date, yes or no, picture), required. `Enter` saves. Button Remove, with a confirmation that says how many cards have a value |
 | History | `F10` in author mode | The changes of the stack, newest first: when, who, what. `F6` Rewind the screen from the selected line on, `F7` or `Enter` Rewind the whole stack |
 | History of the cards | `F10` on a stack | The changes made to its cards. `F6` or `Enter` rewinds the card of the selected line, from that change on |
 | Deleted stacks | `F10` on My stacks | The stacks the author deleted. `F6` or `Enter` brings the selected one back |
 
 `Escape` leaves a screen like `F12`, and gives up a question.
 
-Left for later steps: pictures and icons (2c); scripts and handlers written by
-authors (2d); creating a stack from a description with the agent (phase 3);
+Left for later steps: scripts and handlers written by authors (2d); creating a stack from a description with the agent (phase 3);
 sharing the cards of a stack from the client.
 
 ### 10.7 The visual editor
@@ -624,8 +633,8 @@ and can be rewound from the History screen.
 
 **In the editor**, drawn by the client:
 
-- a tool palette in the left margin: pointer, field, text, button; the layer
-  for new widgets (background or card); grid and guides on or off;
+- a tool palette in the left margin: pointer, field, text, button, picture;
+  the layer for new widgets (background or card); grid and guides on or off;
 - the background with a dotted grid. Fields show the name of their column, in
   grey, instead of the values of a card, and the title shows its template;
 - selection handles; moving and resizing snap to the edges and centres of the
@@ -640,16 +649,100 @@ and can be rewound from the History screen.
   change), `Enter` goes to its properties, `Delete` removes it after a
   confirmation, `Escape` lets go of the tool, then of the selection, then
   leaves the editor;
-- keys: `F2` Undo (also Control-Z, or Command-Z on a Mac), `F4` Stack, `F6` New
-  widget, `F7` Properties, `F10` History, `F11` Browse, `F12` Back.
+- keys: `F2` Undo (also Control-Z, or Command-Z on a Mac), `F4` Stack, `F5` Icon
+  (the drawing editor, on the icon of the stack), `F6` New widget, `F7`
+  Properties, `F10` History, `F11` Browse, `F12` Back.
 
-Left for later: pictures and the image tool (2c), the script of a widget (2d),
+Left for later: the script of a widget (2d),
 the Agent button (phase 3), the slider, grid and chart tools, renaming a widget
 from the editor (a field is renamed in its dialog).
 
+### 10.8 Drawing
+
+The drawing editor is a tool of the graphical client, like the visual editor:
+a picture is drawn pixel by pixel, with the colours of the palette.
+
+**Images never change.** A row of `xila.image` is written once. Saving a
+drawing adds an image, and what showed the old one now points to the new one:
+the column of a card, the icon of a stack, a widget of the background.
+Rewinding therefore needs nothing more: the history of the card, of the stack
+or of the widget holds the old reference, and the old image is still there.
+Nobody can overwrite the picture of someone else. Every member of `xila_user`
+may add images (`xila.new_image`); nobody but a superuser may change or delete
+one. Old versions stay in the database; a way to purge those that nothing
+refers to any more comes later.
+
+**Transparency.** Palette slot 255 is transparent. The extra colours of a stack
+are therefore slots 32 to 254.
+
+**What is drawn.**
+
+| Picture | Where it is kept | Who may draw it | Colours |
+|---------|------------------|-----------------|---------|
+| The icon of a stack | `xila.stack.icon_id` | whoever may edit the stack | the 32 system colours |
+| The picture of a card | a column of the card, of field type `picture` | whoever may write the card | the 32 system colours and those of the stack |
+| A picture of the background | the `image` property of an `image` widget | whoever may edit the stack | the same |
+
+An icon is limited to the system colours because the list of stacks shows the
+icons of several stacks at once, each of which may have its own extra colours.
+The server refuses an icon that uses another colour.
+
+**Actions.** On every screen:
+
+- `draw`, with `{"target": "card" | "icon" | "widget", "widget": "photo"}` in
+  its input, checks that the current role may draw that picture and answers
+  with the effect `draw`, which opens the drawing editor on the image the
+  picture shows now, or on an empty drawing. The size of an empty drawing is
+  that of the frame of the widget, or 68 by 80 for the picture of a card, and 28
+  by 26 for an icon. The card must be saved before its picture is drawn;
+- `save_drawing`, with the same target and `width`, `height` and `pixels` (two
+  hexadecimal digits per pixel), adds the image and points the card, the stack
+  or the widget to it, in one transaction. The picture of a card is saved like
+  any other value of the card, by `xila.save_card`;
+- `set_colour`, with `{"slot": 32, "rgb": "#ab12cd"}` (or no slot, for a new
+  colour), and `remove_colour`, with `{"slot": 32}`, for those who may edit the
+  stack.
+
+**The list of stacks in icons.** `xila.visible_stack` has a column `icon`, and
+the grid of "My stacks" asks to be shown as icons (section 2). A stack without
+an icon gets a generic one, drawn by the client.
+
+**Reaching the editor.** A click on the picture of a card, or `Enter` when it
+has the focus; `F5` in the visual editor for the icon of the stack; the picture
+tool of the visual editor, then "Draw" in Properties, for a picture of the
+background. Leaving the editor saves the drawing if it changed, as leaving a
+card saves what was typed on it; if the server refuses it, the editor stays
+open.
+
+**In the editor**, drawn by the client, as in the mockup:
+
+- the picture enlarged, with a grid, transparent pixels shown as a checkerboard;
+- tools: pencil, eraser (transparent), fill, line, rectangle (outlined or
+  filled), pipette, selection. A selected area is moved by dragging it or with
+  the arrows, duplicated (`D`), erased (`Delete`) and put down (`Enter`);
+- the whole picture is flipped (`H`, `V`), turned a quarter (`T`), or given
+  another size (`F6`), which keeps what is already drawn at the top left;
+- a Colours window: the 32 system colours, the extra colours of the stack with
+  `+` and `-` to add and remove one, and the name, the number and the value of
+  the colour in hand; the value of a colour of the stack is typed there;
+- a Preview window: the picture at its real size on the desktop, and enlarged
+  on paper;
+- `F2` undoes, step by step, what was drawn since the editor was opened; `F4`
+  goes back to the picture as it was;
+- with the keyboard: the arrows move a cursor over the pixels and the space bar
+  is the button of the pointer there (it starts and ends a line, a rectangle or
+  a selection); a letter picks each tool (`P`, `E`, `F`, `L`, `R`, `I`, `S`),
+  `+` and `-` change the zoom, `G` shows or hides the grid, `X` fills rectangles
+  or not.
+
+An image is at most 480 by 300 pixels.
+
+Left for later: importing an image from a file, purging unused images, the
+Agent button.
+
 ## 11. Not covered yet
 
-- Author mode beyond section 10 (drawing, scripts): steps 2c and 2d.
+- Author mode beyond section 10 (scripts): step 2d.
 - Agent API, audit log, validation of proposed actions: phase 3.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.

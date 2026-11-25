@@ -54,6 +54,7 @@ a AS (
 INSERT INTO xila.widget (background_id, name, kind, ord, action_id, props)
 SELECT background_id, 'list', 'grid', 10, id, '{
     "schema": "xila", "table": "visible_stack", "key": "name",
+    "view": "icons", "icon": "icon",
     "columns": [
         {"column": "title", "label": "Stack"},
         {"column": "cards", "label": "Cards", "align": "right"}
@@ -83,7 +84,16 @@ INSERT INTO xila.action (name, label, handler, args) VALUES
     ('add_widget',    'New widget',   'add_widget',    '{"for": "editor"}'),
     ('set_widget',    'Change',       'set_widget',    '{"for": "editor"}'),
     ('remove_widget', 'Remove',       'remove_widget', '{"for": "editor"}'),
-    ('undo',          'Undo',         'undo',          '{"for": "editor"}');
+    ('undo',          'Undo',         'undo',          '{"for": "editor"}'),
+    ('set_colour',    'Colour',       'set_colour',    '{"for": "editor"}'),
+    ('remove_colour', 'No colour',    'remove_colour', '{"for": "editor"}');
+
+-- What the drawing editor of the graphical client asks for, on any screen:
+-- the picture of a card is drawn by whoever may write the card. They are
+-- tools, not something a button of a stack would do.
+INSERT INTO xila.action (name, label, handler, args) VALUES
+    ('draw',         'Draw',         'draw',         '{"for": "tool"}'),
+    ('save_drawing', 'Save picture', 'save_drawing', '{"for": "tool"}');
 
 -- What authors find in the list of stacks.
 INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
@@ -184,7 +194,8 @@ VALUES
            {"value": "text", "label": "Text"},
            {"value": "number", "label": "Number"},
            {"value": "date", "label": "Date"},
-           {"value": "boolean", "label": "Yes or no"}
+           {"value": "boolean", "label": "Yes or no"},
+           {"value": "picture", "label": "Picture"}
        ]}'),
     (xila.background_id('field'), 'required', 'field', 60, 'Required', 'required', NULL, '{}'),
     (xila.background_id('field'), 'save', 'button', 70, 'Save', NULL,

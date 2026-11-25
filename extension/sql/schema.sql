@@ -71,6 +71,12 @@ INSERT INTO xila.palette (slot, name, rgb) VALUES
 -- Images
 -- ---------------------------------------------------------------------------
 -- An indexed image: one byte per pixel, row by row, each byte a palette slot.
+-- Slot 255 is transparent.
+--
+-- An image never changes. Saving a drawing adds an image, and what showed the
+-- old one now points to the new one: the old image is still there for the
+-- history of whatever pointed to it, and nobody can overwrite the picture of
+-- someone else.
 CREATE TABLE xila.image (
     id     uuid PRIMARY KEY DEFAULT uuidv7(),
     width  smallint NOT NULL CHECK (width BETWEEN 1 AND 480),
@@ -78,6 +84,9 @@ CREATE TABLE xila.image (
     pixels bytea NOT NULL,
     CHECK (octet_length(pixels) = width::integer * height::integer)
 );
+
+-- To find an image that is already there instead of adding it again.
+CREATE INDEX image_content ON xila.image (md5(pixels));
 
 -- ---------------------------------------------------------------------------
 -- Stacks and their screens
@@ -95,7 +104,7 @@ CREATE TABLE xila.stack (
 -- Extra colours of a stack, beyond the 32 system colours.
 CREATE TABLE xila.stack_colour (
     stack_id uuid NOT NULL REFERENCES xila.stack ON DELETE CASCADE,
-    slot     smallint NOT NULL CHECK (slot BETWEEN 32 AND 255),
+    slot     smallint NOT NULL CHECK (slot BETWEEN 32 AND 254),
     name     text,
     rgb      text NOT NULL CHECK (rgb ~ '^#[0-9a-f]{6}$'),
     PRIMARY KEY (stack_id, slot)
@@ -132,7 +141,8 @@ CREATE TABLE xila.action (
                       'delete_stack', 'new_field', 'edit_field', 'save_field',
                       'remove_field', 'move_field', 'history', 'rewind',
                       'place_widgets', 'reset_layout', 'add_widget', 'set_widget',
-                      'remove_widget', 'undo')),
+                      'remove_widget', 'undo', 'draw', 'save_drawing', 'set_colour',
+                      'remove_colour')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );
@@ -581,8 +591,12 @@ CREATE POLICY note ON xila.history FOR INSERT
 GRANT USAGE ON SCHEMA xila TO xila_user;
 GRANT SELECT ON xila.palette, xila.image, xila.stack, xila.stack_colour, xila.background,
     xila.action, xila.widget, xila.layout, xila.key_binding TO xila_user;
-GRANT INSERT, UPDATE, DELETE ON xila.image, xila.stack, xila.stack_colour, xila.background,
+GRANT INSERT, UPDATE, DELETE ON xila.stack, xila.stack_colour, xila.background,
     xila.action, xila.widget, xila.layout, xila.key_binding TO xila_author;
+-- Images are added by anyone who uses pgXila, and changed or deleted by
+-- nobody but a superuser. An author may make a column refer to an image.
+GRANT INSERT ON xila.image TO xila_user;
+GRANT REFERENCES ON xila.image TO xila_author;
 GRANT UPDATE ON xila.palette TO xila_author;
 GRANT SELECT ON xila.history TO xila_user;
 GRANT INSERT (origin, stack_id, object_kind, object_key, op, before, after)

@@ -137,6 +137,50 @@ drawn AS (
 UPDATE addressbook.contacts c SET photo = chosen.image_id
 FROM chosen WHERE c.id = chosen.contact_id;
 
+-- The icon of the stack: a notebook, 28 by 26 pixels. Each character below
+-- is a pixel: "." is transparent, the others are slots of the palette.
+CREATE FUNCTION addressbook.icon() RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT decode(string_agg(CASE pixel
+               WHEN '#' THEN '00'   -- black
+               WHEN 'o' THEN '18'   -- orange
+               WHEN 'b' THEN '1a'   -- burgundy
+               WHEN 'c' THEN '06'   -- cream
+               WHEN 'g' THEN '0d'   -- grey
+               WHEN 'y' THEN '16'   -- yellow
+               WHEN 'v' THEN '12'   -- meadow
+               WHEN 'a' THEN '04'   -- azure
+               ELSE 'ff'            -- transparent
+           END, '' ORDER BY at), 'hex')
+    FROM regexp_split_to_table(
+        '............................' ||
+        '..######################....' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..#bbb#oooooooooooooooo####.' ||
+        '..#bbb#oo###########ooo#yy#.' ||
+        '..#bbb#oo#ccccccccc#ooo#yy#.' ||
+        '..#bbb#oo#ccccccccc#ooo#yy#.' ||
+        '..#bbb#oo#ccgggggcc#ooo####.' ||
+        '..#bbb#oo#ccccccccc#ooo#....' ||
+        '..#bbb#oo#ccccccccc#ooo####.' ||
+        '..#bbb#oo###########ooo#vv#.' ||
+        '..#bbb#oooooooooooooooo#vv#.' ||
+        '..#bbb#oooooooooooooooo#vv#.' ||
+        '..#bbb#oooooooooooooooo####.' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..#bbb#oooooooooooooooo####.' ||
+        '..#bbb#oooooooooooooooo#aa#.' ||
+        '..#bbb#oooooooooooooooo#aa#.' ||
+        '..#bbb#oooooooooooooooo#aa#.' ||
+        '..#bbb#oooooooooooooooo####.' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..#bbb#oooooooooooooooo#....' ||
+        '..######################....' ||
+        '............................', '') WITH ORDINALITY AS art(pixel, at)
+$$;
+
 -- Who may use the stack is decided by ordinary PostgreSQL privileges.
 GRANT USAGE ON SCHEMA addressbook TO xila_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON addressbook.contacts TO xila_user;
@@ -147,7 +191,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON addressbook.contacts TO xila_user;
 -- alter it: in author mode, adding a field adds a column. Leave it out for a
 -- table that exists for other reasons; pgXila then never alters it.
 WITH s AS (
-    INSERT INTO xila.stack (name, title) VALUES ('addressbook', 'Address book')
+    -- An image is added once: loading the example again finds the same icon.
+    INSERT INTO xila.stack (name, title, icon_id)
+    VALUES ('addressbook', 'Address book', xila.new_image(28, 26, addressbook.icon()))
     RETURNING id),
 b AS (
     INSERT INTO xila.background

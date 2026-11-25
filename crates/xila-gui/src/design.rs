@@ -22,12 +22,13 @@ use crate::layout::{self, FieldKind, GraphicLayout, Item, Part};
 use crate::palette::slot;
 
 /// The keys of the editor. They belong to the tool, not to the stack.
-pub const KEYS: [(&str, &str); 8] = [
+pub const KEYS: [(&str, &str); 9] = [
     ("F2", "Undo"),
     ("F3", "Quit"),
     ("F4", "Stack"),
+    ("F5", "Icon"),
     ("F6", "Widget"),
-    ("F7", "Properties"),
+    ("F7", "Props"),
     ("F10", "History"),
     ("F11", "Browse"),
     ("F12", "Back"),
@@ -47,7 +48,7 @@ const MAX_HEIGHT: i32 = 243;
 /// next one before it is saved: several presses are one change.
 const NUDGE_PATIENCE: u8 = 3;
 
-const PALETTE: Rect = Rect::new(2, 22, 30, 12 + 8 * CELL + 9);
+const PALETTE: Rect = Rect::new(2, 22, 30, 12 + 9 * CELL + 9);
 const CELL: i32 = 21;
 const PROPERTIES_WIDTH: i32 = 134;
 const ROW: i32 = 18;
@@ -62,6 +63,8 @@ pub enum Tool {
     Field,
     Text,
     Button,
+    /// A picture of the background, the same on every card.
+    Picture,
 }
 
 /// Where new widgets go.
@@ -124,6 +127,8 @@ pub enum Prop {
     H,
     /// The button that makes the layout automatic again.
     Reset,
+    /// The button that opens the drawing editor on a picture.
+    Draw,
 }
 
 impl Prop {
@@ -506,6 +511,7 @@ pub fn palette_cells() -> Vec<(Cell, Rect)> {
         Cell::Tool(Tool::Field),
         Cell::Tool(Tool::Text),
         Cell::Tool(Tool::Button),
+        Cell::Tool(Tool::Picture),
         Cell::Layer(Layer::Background),
         Cell::Layer(Layer::Card),
         Cell::Grid,
@@ -515,7 +521,7 @@ pub fn palette_cells() -> Vec<(Cell, Rect)> {
     let mut placed = Vec::new();
     for (index, cell) in cells.into_iter().enumerate() {
         // A little room between the tools, the layers and the helpers.
-        if index == 4 || index == 6 {
+        if index == 5 || index == 7 {
             y += 4;
         }
         placed.push((cell, Rect::new(PALETTE.x + 2, y, PALETTE.w - 4, CELL - 1)));
@@ -561,6 +567,20 @@ fn icon(cell: Cell) -> Sprite {
                 ".##############.",
             ],
             &[ink, ('p', slot::PEARL), ('g', slot::GREY)],
+        ),
+        Cell::Tool(Tool::Picture) => Sprite::from_art(
+            &[
+                "##############",
+                "#bbbbbbbbbbbb#",
+                "#bbbbbbbyybbb#",
+                "#bbbbbbbyybbb#",
+                "#bbbgbbbbbbbb#",
+                "#bbgggbbbgbbb#",
+                "#bgggggbgggbb#",
+                "#gggggggggggb#",
+                "##############",
+            ],
+            &[ink, ('b', slot::AZURE), ('g', slot::GREEN), ('y', slot::YELLOW)],
         ),
         // Every card: a pile of sheets. One card: the sheet on top.
         Cell::Layer(Layer::Background) => Sprite::from_art(
@@ -770,6 +790,17 @@ impl Properties {
                                 String::new(),
                             ));
                         }
+                    }
+                    // A picture of the background is drawn from here; the
+                    // picture of a card is drawn from the card.
+                    Part::Picture if definition.is_some_and(|w| w.column.is_none()) => {
+                        rows.push((Prop::Draw, "Draw", Control::Button, String::new()));
+                        rows.push((
+                            Prop::OnBackground,
+                            "On every card",
+                            Control::Check(!on_card),
+                            String::new(),
+                        ));
                     }
                     _ => {}
                 }
@@ -1005,6 +1036,11 @@ fn press_property<A: Api>(session: &mut Session<A>, designer: &Designer, fonts: 
             change(session, json!({ "action": name }));
         }
         (Prop::Reset, _) => session.run("reset_layout"),
+        (Prop::Draw, _) => {
+            if let Some(name) = &selected {
+                session.run_with("draw", json!({ "target": "widget", "widget": name }));
+            }
+        }
         _ => {}
     }
 }
@@ -1013,8 +1049,12 @@ fn press_property<A: Api>(session: &mut Session<A>, designer: &Designer, fonts: 
 // The "New widget" menu
 // ---------------------------------------------------------------------------
 
-const MENU: [(Tool, &str); 3] =
-    [(Tool::Field, "Field"), (Tool::Text, "Text"), (Tool::Button, "Button")];
+const MENU: [(Tool, &str); 4] = [
+    (Tool::Field, "Field"),
+    (Tool::Text, "Text"),
+    (Tool::Button, "Button"),
+    (Tool::Picture, "Picture"),
+];
 
 fn menu_window() -> Rect {
     window_around(110, MENU.len() as i32 * MENU_ROW + 10)
@@ -1062,6 +1102,8 @@ fn create<A: Api>(
         }
         Tool::Text => ("text", (90, FIELD_HEIGHT)),
         Tool::Button => ("button", (62, BUTTON_HEIGHT)),
+        // The frame of a picture is one pixel wider than its image all round.
+        Tool::Picture => ("image", (50, 50)),
     };
 
     // A widget with a place of its own ends the automatic layout: the others
@@ -1190,6 +1232,11 @@ pub fn handle_key<A: Api>(
         Key::F(4) => {
             flush(session, designer, fonts);
             session.run("author_form");
+        }
+        // The icon of the stack is drawn, like any picture, in its own editor.
+        Key::F(5) => {
+            flush(session, designer, fonts);
+            session.run_with("draw", json!({ "target": "icon" }));
         }
         Key::F(6) => designer.menu = Some(0),
         Key::F(7) => designer.properties_hidden = !designer.properties_hidden,
@@ -1512,7 +1559,14 @@ fn dotted_outline(frame: &mut Frame, area: Rect, colour: u8) {
 }
 
 /// A widget as the editor shows it: its structure, not the values of a card.
-fn draw_item(frame: &mut Frame, fonts: &Fonts, view: &View, item: &Item, area: Rect) {
+fn draw_item<A: Api>(
+    frame: &mut Frame,
+    fonts: &Fonts,
+    session: &Session<A>,
+    item: &Item,
+    area: Rect,
+) {
+    let view = session.view();
     let definition = widget(view, &item.widget);
     match &item.part {
         Part::Title | Part::Banner { .. } => {
@@ -1550,8 +1604,24 @@ fn draw_item(frame: &mut Frame, fonts: &Fonts, view: &View, item: &Item, area: R
             }
         }
         Part::Picture => {
-            frame.fill(area, slot::ICE);
-            frame.dither(area, slot::AZURE, 4);
+            // A picture of the background is shown; that of a card is a
+            // frame, since it changes from card to card.
+            let fixed = definition
+                .filter(|w| w.column.is_none())
+                .and_then(|w| view.image_id(w))
+                .and_then(|id| session.image(id));
+            match fixed {
+                Some(image) => {
+                    frame.fill(area, slot::CREAM);
+                    let clip = frame.clip_to(area.inset(1));
+                    frame.blit(image, area.x + 1, area.y + 1);
+                    frame.set_clip(clip);
+                }
+                None => {
+                    frame.fill(area, slot::ICE);
+                    frame.dither(area, slot::AZURE, 4);
+                }
+            }
             frame.outline(area, slot::INK);
         }
         Part::Grid => {
@@ -1605,7 +1675,7 @@ pub fn draw<A: Api>(
     }
 
     for item in &editor.layout.items {
-        draw_item(frame, fonts, view, item, editor.on_screen(designer.rect_of(item)));
+        draw_item(frame, fonts, session, item, editor.on_screen(designer.rect_of(item)));
     }
 
     // The selection: a dotted line around it, and its eight handles.
@@ -1639,6 +1709,7 @@ pub fn hint(designer: &Designer) -> Option<&'static str> {
         Tool::Field => Some("Field: click on the card to add one. Esc gives up."),
         Tool::Text => Some("Text: click where it goes. Esc gives up."),
         Tool::Button => Some("Button: click where it goes. Esc gives up."),
+        Tool::Picture => Some("Picture: click where it goes. Esc gives up."),
     }
 }
 

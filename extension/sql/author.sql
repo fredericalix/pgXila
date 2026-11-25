@@ -248,8 +248,122 @@ BEGIN
 END
 $$;
 
--- Changes the title of a stack, or the template written at the top of each
--- card: {"title": "…", "card_title": "{last_name}, {first_name}"}.
+-- ---------------------------------------------------------------------------
+-- Images
+-- ---------------------------------------------------------------------------
+
+-- Adds an image and answers with its identifier. An image is never changed:
+-- this is the only way a picture gets into the database. An image identical
+-- to one that is already there is not added twice.
+CREATE FUNCTION xila.new_image(width integer, height integer, pixels bytea) RETURNS uuid
+LANGUAGE plpgsql AS $$
+DECLARE
+    wanted_w integer := width;
+    wanted_h integer := height;
+    content  bytea := pixels;
+    result   uuid;
+BEGIN
+    IF wanted_w IS NULL OR wanted_h IS NULL OR content IS NULL
+       OR wanted_w NOT BETWEEN 1 AND 480 OR wanted_h NOT BETWEEN 1 AND 300
+       OR octet_length(content) <> wanted_w * wanted_h THEN
+        RAISE EXCEPTION 'This is not a picture pgXila can keep: at most 480 by 300 pixels, one byte for each.'
+            USING ERRCODE = 'XL003';
+    END IF;
+    SELECT i.id INTO result
+    FROM xila.image i
+    WHERE md5(i.pixels) = md5(content) AND i.width = wanted_w AND i.height = wanted_h
+      AND i.pixels = content
+    LIMIT 1;
+    IF result IS NULL THEN
+        INSERT INTO xila.image (width, height, pixels)
+        VALUES (wanted_w, wanted_h, content)
+        RETURNING id INTO result;
+    END IF;
+    RETURN result;
+END
+$$;
+
+-- The identifier of an image that exists, from its text, or an error.
+CREATE FUNCTION xila.existing_image(image text) RETURNS uuid
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    result uuid;
+BEGIN
+    BEGIN
+        SELECT i.id INTO result FROM xila.image i WHERE i.id = image::uuid;
+    EXCEPTION WHEN data_exception THEN
+        result := NULL;
+    END;
+    IF result IS NULL THEN
+        RAISE EXCEPTION 'This picture does not exist.' USING ERRCODE = 'XL002';
+    END IF;
+    RETURN result;
+END
+$$;
+
+-- True when an image only uses the 32 system colours and transparency.
+CREATE FUNCTION xila.uses_system_colours(image uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT NOT EXISTS (
+        SELECT FROM xila.image i, generate_series(0, octet_length(i.pixels) - 1) AS at
+        WHERE i.id = image AND get_byte(i.pixels, at) BETWEEN 32 AND 254)
+$$;
+
+-- ---------------------------------------------------------------------------
+-- The colours of a stack
+-- ---------------------------------------------------------------------------
+
+-- Adds an extra colour to a stack, or changes one, and answers with its slot.
+-- Without a slot, the first free one is taken. Slots 0 to 31 are the system
+-- colours and 255 is transparent: a stack has slots 32 to 254.
+CREATE FUNCTION xila.set_colour(stack text, slot integer, rgb text, name text DEFAULT NULL)
+RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg     xila.background := xila.editable(stack);
+    wanted integer := slot;
+    value  text := lower(btrim(coalesce(rgb, '')));
+    called text := nullif(btrim(coalesce(name, '')), '');
+BEGIN
+    IF value !~ '^#[0-9a-f]{6}$' THEN
+        RAISE EXCEPTION 'A colour is written like #e8703a.' USING ERRCODE = 'XL003', COLUMN = 'rgb';
+    END IF;
+    IF wanted IS NULL THEN
+        SELECT min(free) INTO wanted
+        FROM generate_series(32, 254) AS free
+        WHERE NOT EXISTS (SELECT FROM xila.stack_colour c
+                          WHERE c.stack_id = bg.stack_id AND c.slot = free);
+        IF wanted IS NULL THEN
+            RAISE EXCEPTION 'This stack already has all the colours it can have.'
+                USING ERRCODE = 'XL003';
+        END IF;
+    ELSIF wanted NOT BETWEEN 32 AND 254 THEN
+        RAISE EXCEPTION 'The colours of a stack are numbered from 32 to 254.'
+            USING ERRCODE = 'XL003';
+    END IF;
+    INSERT INTO xila.stack_colour AS c (stack_id, slot, name, rgb)
+    VALUES (bg.stack_id, wanted, called, value)
+    ON CONFLICT ON CONSTRAINT stack_colour_pkey
+    DO UPDATE SET rgb = excluded.rgb, name = coalesce(excluded.name, c.name);
+    RETURN wanted;
+END
+$$;
+
+-- Removes an extra colour of a stack. Pictures that use it keep the number:
+-- they show nothing there until the colour is defined again.
+CREATE FUNCTION xila.remove_colour(stack text, slot integer) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg     xila.background := xila.editable(stack);
+    wanted integer := slot;
+BEGIN
+    DELETE FROM xila.stack_colour c WHERE c.stack_id = bg.stack_id AND c.slot = wanted;
+END
+$$;
+
+-- Changes the title of a stack, the template written at the top of each card,
+-- or its icon: {"title": "…", "card_title": "{last_name}, {first_name}",
+-- "icon": "0193…"}.
 CREATE FUNCTION xila.set_stack(stack text, changes jsonb) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -258,9 +372,20 @@ DECLARE
     heading uuid;
 BEGIN
     SELECT k INTO unknown FROM jsonb_object_keys(changes) k
-    WHERE k NOT IN ('title', 'card_title') LIMIT 1;
+    WHERE k NOT IN ('title', 'card_title', 'icon') LIMIT 1;
     IF unknown IS NOT NULL THEN
         RAISE EXCEPTION 'A stack has no property “%”.', unknown USING ERRCODE = 'XL003';
+    END IF;
+
+    -- The icon. The list of stacks shows the icons of several stacks at once,
+    -- so an icon is drawn with the colours every stack has.
+    IF changes ? 'icon' THEN
+        IF nullif(changes->>'icon', '') IS NOT NULL
+           AND NOT xila.uses_system_colours(xila.existing_image(changes->>'icon')) THEN
+            RAISE EXCEPTION 'An icon is drawn with the 32 system colours only.'
+                USING ERRCODE = 'XL003';
+        END IF;
+        UPDATE xila.stack SET icon_id = nullif(changes->>'icon', '')::uuid WHERE id = bg.stack_id;
     END IF;
 
     IF changes ? 'title' THEN
@@ -333,9 +458,11 @@ LANGUAGE sql AS $$
 $$;
 
 -- Adds a column. vals, if given, holds the value of the column for some
--- cards, by key: this is how a dropped column comes back.
+-- cards, by key: this is how a dropped column comes back. A picture is a
+-- column that refers to an image.
 CREATE FUNCTION xila.column_add(bg xila.background, col text, sql_type text,
-                                required boolean DEFAULT false, vals jsonb DEFAULT NULL)
+                                required boolean DEFAULT false, vals jsonb DEFAULT NULL,
+                                picture boolean DEFAULT false)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -357,9 +484,23 @@ BEGIN
     IF required THEN
         EXECUTE format('ALTER TABLE %s ALTER COLUMN %I SET NOT NULL', source, col);
     END IF;
+    IF picture THEN
+        EXECUTE format('ALTER TABLE %s ADD FOREIGN KEY (%I) REFERENCES xila.image', source, col);
+    END IF;
     PERFORM xila.note_column(bg, col, 'insert', NULL,
-        jsonb_build_object('name', col, 'type', checked::text, 'required', required));
+        jsonb_build_object('name', col, 'type', checked::text, 'required', required,
+                           'picture', picture));
 END
+$$;
+
+-- True when a column of a table refers to an image: it holds a picture.
+CREATE FUNCTION xila.is_picture(source regclass, col name) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND c.conkey = ARRAY[a.attnum]
+        WHERE c.conrelid = source AND c.contype = 'f'
+          AND c.confrelid = 'xila.image'::regclass AND a.attname = col)
 $$;
 
 -- Drops a column. Its values go to history, so that a rewind restores them.
@@ -369,6 +510,7 @@ DECLARE
     source   regclass := xila.managed_source(bg);
     sql_type text;
     required boolean;
+    picture  boolean;
     vals     jsonb;
 BEGIN
     SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull INTO sql_type, required
@@ -382,9 +524,11 @@ BEGIN
          FROM %3$s AS t WHERE t.%2$I IS NOT NULL',
         bg.key_column, col, source)
     INTO vals;
+    picture := xila.is_picture(source, col::name);
     EXECUTE format('ALTER TABLE %s DROP COLUMN %I', source, col);
     PERFORM xila.note_column(bg, col, 'delete',
-        jsonb_build_object('name', col, 'type', sql_type, 'required', required, 'values', vals),
+        jsonb_build_object('name', col, 'type', sql_type, 'required', required,
+                           'picture', picture, 'values', vals),
         NULL);
 END
 $$;
@@ -454,6 +598,8 @@ BEGIN
         WHEN 'number' THEN 'numeric'
         WHEN 'date' THEN 'date'
         WHEN 'boolean' THEN 'boolean'
+        -- A picture is the identifier of an image.
+        WHEN 'picture' THEN 'uuid'
     END;
 END
 $$;
@@ -501,7 +647,9 @@ BEGIN
     LIMIT 1;
     INSERT INTO xila.layout (widget_id, renderer, x, y, w, h)
     SELECT w.id, 'graphic', coalesce(lowest.x, 100), coalesce(lowest.y + 20, 44),
-           coalesce(lowest.w, 200), 14
+           -- A picture is a frame around an image; a field is a line.
+           CASE WHEN w.kind = 'image' THEN 70 ELSE coalesce(lowest.w, 200) END,
+           CASE WHEN w.kind = 'image' THEN 82 ELSE 14 END
     FROM xila.widget w
     WHERE w.background_id = bg.id AND w.layer = 'background' AND w.name = field;
 END
@@ -520,6 +668,7 @@ DECLARE
     shown  text := nullif(btrim(coalesce(label, '')), '');
     col    text := coalesce(nullif(btrim(name), ''), xila.identifier_from(label));
     exists_in_table boolean;
+    is_picture      boolean;
 BEGIN
     IF source IS NULL THEN
         RAISE EXCEPTION 'This stack has no cards, so it has no fields.' USING ERRCODE = 'XL003';
@@ -551,7 +700,7 @@ BEGIN
             RAISE EXCEPTION 'Unknown type of field: %.', type
                 USING ERRCODE = 'XL003', COLUMN = 'type';
         END IF;
-        PERFORM xila.column_add(bg, col, xila.column_type(type));
+        PERFORM xila.column_add(bg, col, xila.column_type(type), picture => type = 'picture');
     ELSIF NOT exists_in_table THEN
         RAISE EXCEPTION
             'The table of this stack has no column “%”. pgXila did not create that table and never alters it: add the column in SQL first.',
@@ -559,8 +708,10 @@ BEGIN
             USING ERRCODE = 'XL003', COLUMN = 'name';
     END IF;
 
+    -- A column that refers to an image is shown as a picture.
+    is_picture := xila.is_picture(source, col::name);
     INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column)
-    SELECT bg.id, col, 'field',
+    SELECT bg.id, col, CASE WHEN is_picture THEN 'image' ELSE 'field' END,
            coalesce(max(w.ord) FILTER (WHERE w.bound_column IS NOT NULL), 0) + 10,
            coalesce(shown, xila.label_from(col)), col
     FROM xila.widget w
@@ -570,10 +721,12 @@ BEGIN
     PERFORM xila.place_new_field(bg, col);
 
     -- The first field of a stack becomes the title of its cards.
-    UPDATE xila.widget w
-    SET props = w.props || jsonb_build_object('template', '{' || col || '}')
-    WHERE w.background_id = bg.id AND w.layer = 'background' AND w.kind = 'text'
-      AND w.props->>'style' = 'title' AND coalesce(w.props->>'template', '') = '';
+    IF NOT is_picture THEN
+        UPDATE xila.widget w
+        SET props = w.props || jsonb_build_object('template', '{' || col || '}')
+        WHERE w.background_id = bg.id AND w.layer = 'background' AND w.kind = 'text'
+          AND w.props->>'style' = 'title' AND coalesce(w.props->>'template', '') = '';
+    END IF;
 
     RETURN col;
 END
@@ -774,7 +927,8 @@ BEGIN
         ELSIF entry.op = 'delete' THEN
             PERFORM xila.column_add(bg, entry.before->>'name', entry.before->>'type',
                                     coalesce((entry.before->>'required')::boolean, false),
-                                    entry.before->'values');
+                                    entry.before->'values',
+                                    coalesce((entry.before->>'picture')::boolean, false));
         ELSE
             IF entry.before->>'name' <> entry.after->>'name' THEN
                 PERFORM xila.column_rename(bg, entry.after->>'name', entry.before->>'name');
@@ -1139,10 +1293,11 @@ BEGIN
 END
 $$;
 
--- Adds a text or a button and answers with its name. props may hold "label",
--- "text" (a template, for a text), "action" (the name of an action of the
--- stack, for a button) and "placement" (a rectangle for the window). With
--- card, the widget belongs to that card only.
+-- Adds a text, a button or a picture and answers with its name. props may
+-- hold "label", "text" (a template, for a text), "action" (the name of an
+-- action of the stack, for a button), "image" (for a picture) and "placement"
+-- (a rectangle for the window). With card, the widget belongs to that card
+-- only.
 CREATE FUNCTION xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}',
                                 card text DEFAULT NULL)
 RETURNS text
@@ -1155,9 +1310,9 @@ DECLARE
     new_id   uuid;
     n        integer := 0;
 BEGIN
-    IF wanted IS NULL OR wanted NOT IN ('text', 'button') THEN
+    IF wanted IS NULL OR wanted NOT IN ('text', 'button', 'image') THEN
         RAISE EXCEPTION
-            'Only texts and buttons are added this way. A field is added with its own dialog.'
+            'Only texts, buttons and pictures are added this way. A field is added with its own dialog.'
             USING ERRCODE = 'XL003';
     END IF;
     IF card IS NOT NULL AND xila.source_of(bg) IS NULL THEN
@@ -1181,6 +1336,8 @@ BEGIN
            CASE WHEN wanted = 'button' THEN xila.action_named(bg, given->>'action') END,
            CASE WHEN wanted = 'text'
                 THEN jsonb_build_object('template', coalesce(given->>'text', 'Text'))
+                WHEN wanted = 'image' AND nullif(given->>'image', '') IS NOT NULL
+                THEN jsonb_build_object('image', xila.existing_image(given->>'image'))
                 ELSE '{}'::jsonb END
     FROM xila.widget w
     WHERE w.background_id = bg.id
@@ -1209,7 +1366,7 @@ DECLARE
     to_layer text;
 BEGIN
     SELECT k INTO unknown FROM jsonb_object_keys(changes) k
-    WHERE k NOT IN ('label', 'text', 'action', 'main', 'required', 'layer') LIMIT 1;
+    WHERE k NOT IN ('label', 'text', 'action', 'main', 'required', 'layer', 'image') LIMIT 1;
     IF unknown IS NOT NULL THEN
         RAISE EXCEPTION 'A widget has no property “%”.', unknown USING ERRCODE = 'XL003';
     END IF;
@@ -1257,10 +1414,22 @@ BEGIN
         END IF;
     END IF;
 
+    IF changes ? 'image' THEN
+        IF w.kind <> 'image' OR w.bound_column IS NOT NULL THEN
+            RAISE EXCEPTION 'Only a picture of the background has an image of its own.'
+                USING ERRCODE = 'XL003';
+        END IF;
+        UPDATE xila.widget x
+        SET props = CASE WHEN nullif(changes->>'image', '') IS NULL THEN x.props - 'image'
+                         ELSE x.props || jsonb_build_object(
+                                  'image', xila.existing_image(changes->>'image')) END
+        WHERE x.id = w.id;
+    END IF;
+
     IF changes ? 'layer' THEN
         to_layer := changes->>'layer';
-        IF w.kind NOT IN ('text', 'button') OR w.bound_column IS NOT NULL THEN
-            RAISE EXCEPTION 'Only a text or a button can belong to a single card.'
+        IF w.kind NOT IN ('text', 'button', 'image') OR w.bound_column IS NOT NULL THEN
+            RAISE EXCEPTION 'Only a text, a button or a picture can belong to a single card.'
                 USING ERRCODE = 'XL003';
         END IF;
         IF to_layer = 'card' THEN
@@ -1349,8 +1518,8 @@ CREATE VIEW xila.own_table WITH (security_invoker = true) AS
 CREATE FUNCTION xila.change_rank(kind text) RETURNS integer
 LANGUAGE sql IMMUTABLE AS $$
     SELECT CASE kind WHEN 'rewind' THEN 0 WHEN 'stack' THEN 1 WHEN 'column' THEN 2
-                     WHEN 'widget' THEN 3 WHEN 'card' THEN 4 WHEN 'layout' THEN 5
-                     ELSE 6 END
+                     WHEN 'widget' THEN 3 WHEN 'card' THEN 4 WHEN 'stack_colour' THEN 5
+                     WHEN 'layout' THEN 6 ELSE 7 END
 $$;
 
 -- One recorded change, in words.
@@ -1377,6 +1546,7 @@ BEGIN
             WHEN op = 'delete' THEN 'Stack deleted'
             WHEN before->>'title' <> after->>'title'
                 THEN format('Title changed to “%s”', after->>'title')
+            WHEN before->>'icon_id' IS DISTINCT FROM after->>'icon_id' THEN 'Icon changed'
             ELSE 'Stack changed' END;
     WHEN 'column' THEN
         RETURN CASE
@@ -1396,8 +1566,14 @@ BEGIN
             WHEN before->'props'->>'template' IS DISTINCT FROM after->'props'->>'template'
                 THEN CASE WHEN after->'props'->>'style' = 'title' THEN 'Card title changed'
                           ELSE format('Text of “%s” changed', after->>'name') END
+            WHEN before->'props'->>'image' IS DISTINCT FROM after->'props'->>'image'
+                THEN format('Picture “%s” changed', after->>'name')
             WHEN before->>'ord' <> after->>'ord' THEN format('“%s” moved', after->>'name')
             ELSE format('“%s” changed', after->>'name') END;
+    WHEN 'stack_colour' THEN
+        RETURN CASE op WHEN 'insert' THEN format('Colour %s added', cur->>'slot')
+                       WHEN 'delete' THEN format('Colour %s removed', cur->>'slot')
+                       ELSE format('Colour %s changed', cur->>'slot') END;
     WHEN 'card' THEN
         IF op = 'insert' THEN
             RETURN card || ' added';
