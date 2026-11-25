@@ -13,8 +13,8 @@ use tokio_postgres::types::{Json, ToSql};
 use tokio_postgres::AsyncMessage;
 
 use crate::api::{
-    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, PaletteColour,
-    Screen,
+    Api, ApiError, Card, Context, Effect, GridPage, Hello, Image, Move, Notification,
+    PaletteColour, Screen,
 };
 use crate::connection::{connect, ConnectError, ConnectParams};
 
@@ -97,6 +97,21 @@ impl Api for Server {
                 rgb: row.get("rgb"),
             })
             .collect())
+    }
+
+    fn image(&mut self, id: &str) -> Result<Option<Image>, ApiError> {
+        let row =
+            self.runtime
+                .block_on(self.client.query_opt(
+                    "SELECT width, height, pixels FROM xila.image($1::text::uuid)",
+                    &[&id],
+                ))
+                .map_err(api_error)?;
+        Ok(row.map(|row| Image {
+            width: row.get::<_, i16>("width") as u16,
+            height: row.get::<_, i16>("height") as u16,
+            pixels: row.get("pixels"),
+        }))
     }
 
     fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {

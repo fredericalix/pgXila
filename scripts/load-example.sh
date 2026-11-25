@@ -2,7 +2,7 @@
 #
 # Loads an example stack into the development server.
 #
-#   scripts/load-example.sh carnet
+#   scripts/load-example.sh addressbook
 #
 # Examples are not part of pgXila: they show what a user builds with it.
 # PGXILA_SERVICE selects another Compose service than the development server.

@@ -7,11 +7,13 @@ use std::time::Duration;
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
-use xila_core::connection::{ConnectError, ConnectParams};
+use xila_core::connection::ConnectParams;
+use xila_core::input::Key;
+use xila_core::login::{open_session, LoginForm, Outcome};
 use xila_core::server::Server;
 use xila_core::session::Session;
-use xila_term::input::Key;
-use xila_term::login::{LoginForm, Outcome};
+use xila_term::input::key_from_event;
+use xila_term::login;
 use xila_term::screen::{self, put, Ui};
 use xila_term::theme::Theme;
 
@@ -71,14 +73,15 @@ fn run(terminal: &mut DefaultTerminal, args: &Args) -> std::io::Result<()> {
     // With a user and a password in the environment, connect straight away.
     let mut stage = match (&args.user, std::env::var("PGXILA_PASSWORD")) {
         (Some(user), Ok(password)) => {
-            match open_session(&params(
-                args,
-                &args.host,
-                args.port,
-                &args.database,
-                user,
-                &password,
-            )) {
+            let params = ConnectParams {
+                host: args.host.clone(),
+                port: args.port,
+                database: args.database.clone(),
+                user: user.clone(),
+                password,
+                ca_file: args.ca.clone(),
+            };
+            match open_session(&params) {
                 Ok(session) => Stage::Session(Box::new(session), Ui::default()),
                 Err(message) => {
                     form.message = Some(message);
@@ -94,12 +97,12 @@ fn run(terminal: &mut DefaultTerminal, args: &Args) -> std::io::Result<()> {
             let whole = frame.area();
             let Some(area) = screen::screen_area(whole) else {
                 let theme = Theme::terminal();
-                let message = "pgXila a besoin d'un terminal d'au moins 80 colonnes sur 24 lignes.";
+                let message = "pgXila needs a terminal of at least 80 columns by 24 rows.";
                 put(frame.buffer_mut(), whole, 0, 0, message, whole.width, theme.base());
                 return;
             };
             let cursor = match &stage {
-                Stage::Login(form) => form.draw(frame.buffer_mut(), area),
+                Stage::Login(form) => login::draw(form, frame.buffer_mut(), area),
                 Stage::Session(session, ui) => screen::draw(session, ui, frame.buffer_mut(), area),
             };
             if let Some(position) = cursor {
@@ -109,7 +112,7 @@ fn run(terminal: &mut DefaultTerminal, args: &Args) -> std::io::Result<()> {
 
         let key = if event::poll(TICK)? {
             match event::read()? {
-                Event::Key(event) => Key::from_event(event),
+                Event::Key(event) => key_from_event(event),
                 _ => None,
             }
         } else {
@@ -123,15 +126,7 @@ fn run(terminal: &mut DefaultTerminal, args: &Args) -> std::io::Result<()> {
             Stage::Login(form) => match key.map(|key| form.handle(key)) {
                 Some(Outcome::Quit) => return Ok(()),
                 Some(Outcome::Connect) => {
-                    let port = form.port().unwrap_or(args.port);
-                    let params = params(
-                        args,
-                        form.host(),
-                        port,
-                        form.database(),
-                        form.user(),
-                        form.password(),
-                    );
+                    let params = form.params(args.port, args.ca.clone());
                     form.clear_password();
                     match open_session(&params) {
                         Ok(session) => stage = Stage::Session(Box::new(session), Ui::default()),
@@ -151,48 +146,4 @@ fn run(terminal: &mut DefaultTerminal, args: &Args) -> std::io::Result<()> {
             }
         }
     }
-}
-
-fn params(
-    args: &Args,
-    host: &str,
-    port: u16,
-    database: &str,
-    user: &str,
-    password: &str,
-) -> ConnectParams {
-    ConnectParams {
-        host: host.to_owned(),
-        port,
-        database: database.to_owned(),
-        user: user.to_owned(),
-        password: password.to_owned(),
-        ca_file: args.ca.clone(),
-    }
-}
-
-/// Connects and opens the home stack, or explains to the user why not.
-fn open_session(params: &ConnectParams) -> Result<Session<Server>, String> {
-    let server = Server::connect(params).map_err(|error| match &error {
-        ConnectError::Postgres(postgres) => match postgres.as_db_error() {
-            // Wrong password, unknown role, or a role that may not log in.
-            Some(refusal) if refusal.code().code().starts_with("28") => {
-                "Nom d'utilisateur ou mot de passe incorrect.".to_owned()
-            }
-            Some(refusal) => format!("Connexion refusée : {}", refusal.message()),
-            None => format!("Connexion impossible : {}", root_cause(postgres)),
-        },
-        other => format!("Connexion impossible : {other}"),
-    })?;
-    Session::start(server)
-        .map_err(|error| format!("Ce compte ne peut pas utiliser pgXila : {error}"))
-}
-
-/// The innermost cause of an error, which is where the useful text is.
-fn root_cause(error: &dyn std::error::Error) -> String {
-    let mut cause = error;
-    while let Some(inner) = cause.source() {
-        cause = inner;
-    }
-    cause.to_string()
 }

@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::api::{
-    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, PaletteColour,
-    Screen, WidgetKind,
+    Api, ApiError, Card, Context, Effect, GridPage, Hello, Image, Move, Notification,
+    PaletteColour, Screen, Widget, WidgetKind,
 };
 
 /// The rows of a grid widget and the selected one.
@@ -65,6 +65,19 @@ impl View {
             .collect()
     }
 
+    /// The identifier of the image an image widget shows on this card: a
+    /// fixed one from its properties, or else the value of its column.
+    pub fn image_id<'a>(&'a self, widget: &'a Widget) -> Option<&'a str> {
+        let fixed = widget.props.get("image").and_then(|v| v.as_str());
+        let bound = || widget.column.as_deref().map(|column| self.value(column));
+        fixed.or_else(bound).filter(|id| !id.is_empty())
+    }
+
+    /// The widgets on screen: those of the background, then those of the card.
+    pub fn widgets(&self) -> impl Iterator<Item = &Widget> {
+        self.screen.widgets.iter().chain(self.card.widgets.iter())
+    }
+
     /// What the server needs to know about this view to run an action.
     fn context(&self) -> Context {
         // The focused grid decides the selected row; a single grid needs no focus.
@@ -88,6 +101,9 @@ pub struct Session<A: Api> {
     hello: Hello,
     palette: Vec<PaletteColour>,
     views: Vec<View>,
+    /// The images read so far, by identifier. None is an image that does
+    /// not exist, so that it is not asked for again.
+    images: BTreeMap<String, Option<Image>>,
     message: Option<String>,
     quit: bool,
 }
@@ -98,7 +114,17 @@ impl<A: Api> Session<A> {
         let hello = api.hello()?;
         let palette = api.palette()?;
         let home = open(&mut api, &hello.home, None)?;
-        Ok(Session { api, hello, palette, views: vec![home], message: None, quit: false })
+        let mut session = Session {
+            api,
+            hello,
+            palette,
+            views: vec![home],
+            images: BTreeMap::new(),
+            message: None,
+            quit: false,
+        };
+        session.fetch_images();
+        Ok(session)
     }
 
     /// The server this session talks to.
@@ -113,6 +139,28 @@ impl<A: Api> Session<A> {
     /// The system colours. Both renderers draw with these and nothing else.
     pub fn palette(&self) -> &[PaletteColour] {
         &self.palette
+    }
+
+    /// An image of the current screen, once read from the server.
+    pub fn image(&self, id: &str) -> Option<&Image> {
+        self.images.get(id).and_then(Option::as_ref)
+    }
+
+    /// Reads the images the current screen shows and that are not known yet.
+    /// An image that cannot be read is simply not drawn.
+    fn fetch_images(&mut self) {
+        let view = self.views.last().expect("a session always has a view");
+        let wanted: Vec<String> = view
+            .widgets()
+            .filter(|widget| widget.kind == WidgetKind::Image)
+            .filter_map(|widget| view.image_id(widget))
+            .filter(|id| !self.images.contains_key(*id))
+            .map(str::to_owned)
+            .collect();
+        for id in wanted {
+            let image = self.api.image(&id).ok().flatten();
+            self.images.insert(id, image);
+        }
     }
 
     /// Shows a message to the user. The next action replaces it.
@@ -151,6 +199,13 @@ impl<A: Api> Session<A> {
         if let Some(grid) = self.view_mut().grids.get_mut(widget) {
             let last = grid.page.rows.len().saturating_sub(1);
             grid.selected = grid.selected.saturating_add_signed(delta).min(last);
+        }
+    }
+
+    /// Selects a row of a grid by its position, for a client with a pointer.
+    pub fn select(&mut self, widget: &str, row: usize) {
+        if let Some(grid) = self.view_mut().grids.get_mut(widget) {
+            grid.selected = row.min(grid.page.rows.len().saturating_sub(1));
         }
     }
 
@@ -193,6 +248,7 @@ impl<A: Api> Session<A> {
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
         }
+        self.fetch_images();
     }
 
     fn apply(&mut self, effect: Effect) -> Result<(), ApiError> {
@@ -294,6 +350,9 @@ impl<A: Api> Session<A> {
                 self.message = Some(describe(&error));
             }
         }
+        if changed {
+            self.fetch_images();
+        }
         changed
     }
 
@@ -324,7 +383,7 @@ fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, Ap
 fn describe(error: &ApiError) -> String {
     match error {
         ApiError::User { message, .. } => message.clone(),
-        ApiError::Other(message) => format!("Erreur : {message}"),
+        ApiError::Other(message) => format!("Error: {message}"),
     }
 }
 
@@ -340,6 +399,8 @@ mod tests {
         contexts: Vec<Context>,
         effects: BTreeMap<String, Result<Vec<Effect>, ApiError>>,
         pending: Vec<Notification>,
+        /// The images asked for, in order.
+        images: Vec<String>,
     }
 
     impl FakeServer {
@@ -362,7 +423,9 @@ mod tests {
             serde_json::json!([{ "name": "list", "kind": "grid", "ord": 10, "action": "open" }])
         } else {
             serde_json::json!([
-                { "name": "ville", "kind": "field", "ord": 10, "label": "Ville", "column": "ville" }
+                { "name": "city", "kind": "field", "ord": 10, "label": "City", "column": "city" },
+                { "name": "photo", "kind": "image", "ord": 20, "column": "photo" },
+                { "name": "logo", "kind": "image", "ord": 30, "props": { "image": "logo" } }
             ])
         };
         let mut screen: Screen = serde_json::from_value(serde_json::json!({
@@ -373,7 +436,7 @@ mod tests {
         .unwrap();
         screen.keys.push(KeyBinding {
             key: "F8".into(),
-            label: "Suiv.".into(),
+            label: "Next".into(),
             action: "next_card".into(),
         });
         screen
@@ -393,7 +456,16 @@ mod tests {
 
         fn palette(&mut self) -> Result<Vec<PaletteColour>, ApiError> {
             self.calls.push("palette".into());
-            Ok(vec![PaletteColour { slot: 0, name: "noir".into(), rgb: "#14121f".into() }])
+            Ok(vec![PaletteColour { slot: 0, name: "black".into(), rgb: "#14121f".into() }])
+        }
+
+        fn image(&mut self, id: &str) -> Result<Option<Image>, ApiError> {
+            self.images.push(id.to_owned());
+            match id {
+                "photo-missing" => Ok(None),
+                "photo-broken" => Err(ApiError::Other("no such image".into())),
+                _ => Ok(Some(Image { width: 1, height: 1, pixels: vec![id.len() as u8] })),
+            }
         }
 
         fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
@@ -405,7 +477,10 @@ mod tests {
             self.calls.push(format!("card {stack} {key:?} {}", to.as_str()));
             let key = key.unwrap_or("1").to_owned();
             Ok(Card {
-                values: BTreeMap::from([("ville".to_string(), Some(format!("Ville {key}")))]),
+                values: BTreeMap::from([
+                    ("city".to_string(), Some(format!("Ville {key}"))),
+                    ("photo".to_string(), Some(format!("photo-{key}"))),
+                ]),
                 key: Some(key),
                 position: 1,
                 count: 3,
@@ -416,7 +491,7 @@ mod tests {
         fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
             self.calls.push(format!("grid_rows {stack} {widget}"));
             let row = |key: &str| GridRow { key: key.into(), cells: BTreeMap::new() };
-            Ok(GridPage { total: 2, rows: vec![row("carnet"), row("recettes")] })
+            Ok(GridPage { total: 2, rows: vec![row("addressbook"), row("recipes")] })
         }
 
         fn act(
@@ -435,13 +510,13 @@ mod tests {
         }
     }
 
-    /// A session showing the "carnet" stack on top of the stack list.
-    fn on_carnet(server: FakeServer) -> Session<FakeServer> {
-        let server =
-            server.answering("open", vec![Effect::Show { stack: "carnet".into(), card: None }]);
+    /// A session showing the "addressbook" stack on top of the stack list.
+    fn on_addressbook(server: FakeServer) -> Session<FakeServer> {
+        let server = server
+            .answering("open", vec![Effect::Show { stack: "addressbook".into(), card: None }]);
         let mut session = Session::start(server).unwrap();
         session.activate("list");
-        assert_eq!(session.view().stack(), "carnet");
+        assert_eq!(session.view().stack(), "addressbook");
         session.api.calls.clear();
         session.api.contexts.clear();
         session
@@ -461,30 +536,30 @@ mod tests {
     #[test]
     fn activating_a_grid_sends_its_selected_row() {
         let server = FakeServer::default()
-            .answering("open", vec![Effect::Show { stack: "recettes".into(), card: None }]);
+            .answering("open", vec![Effect::Show { stack: "recipes".into(), card: None }]);
         let mut session = Session::start(server).unwrap();
         session.select_row("list", 1);
         session.select_row("list", 5);
         session.activate("list");
 
-        assert_eq!(session.api.contexts[0].row.as_deref(), Some("recettes"));
-        assert_eq!(session.view().stack(), "recettes");
+        assert_eq!(session.api.contexts[0].row.as_deref(), Some("recipes"));
+        assert_eq!(session.view().stack(), "recipes");
     }
 
     #[test]
     fn a_key_runs_its_action_with_the_card_and_the_unsaved_edits() {
-        let mut session = on_carnet(FakeServer::default());
-        session.edit("ville", "Paris".into());
+        let mut session = on_addressbook(FakeServer::default());
+        session.edit("city", "Paris".into());
 
         assert!(session.press("F8"));
         assert!(!session.press("F5"), "F5 is not bound");
 
-        assert_eq!(session.api.calls, ["act carnet next_card"]);
+        assert_eq!(session.api.calls, ["act addressbook next_card"]);
         assert_eq!(
             session.api.contexts[0],
             Context {
                 card: Some("1".into()),
-                dirty: BTreeMap::from([("ville".to_string(), "Paris".to_string())]),
+                dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
                 row: None,
             }
         );
@@ -492,37 +567,41 @@ mod tests {
 
     #[test]
     fn typing_the_saved_value_back_is_not_a_change() {
-        let mut session = on_carnet(FakeServer::default());
-        session.edit("ville", "Paris".into());
-        session.edit("ville", "Ville 1".into());
+        let mut session = on_addressbook(FakeServer::default());
+        session.edit("city", "Paris".into());
+        session.edit("city", "Ville 1".into());
         assert!(session.view().dirty().is_empty());
-        assert_eq!(session.view().value("ville"), "Ville 1");
+        assert_eq!(session.view().value("city"), "Ville 1");
     }
 
     #[test]
     fn showing_another_card_of_the_same_stack_replaces_the_card_and_drops_the_edits() {
         let server = FakeServer::default().answering(
             "next_card",
-            vec![Effect::Show { stack: "carnet".into(), card: Some("2".into()) }],
+            vec![Effect::Show { stack: "addressbook".into(), card: Some("2".into()) }],
         );
-        let mut session = on_carnet(server);
-        session.edit("ville", "Paris".into());
+        let mut session = on_addressbook(server);
+        session.edit("city", "Paris".into());
         session.run("next_card");
 
         assert_eq!(session.view().card.key.as_deref(), Some("2"));
-        assert_eq!(session.view().value("ville"), "Ville 2");
+        assert_eq!(session.view().value("city"), "Ville 2");
         assert!(session.view().edits.is_empty());
-        assert_eq!(session.api.calls, ["act carnet next_card", "card carnet Some(\"2\") at"]);
+        assert_eq!(
+            session.api.calls,
+            ["act addressbook next_card", "card addressbook Some(\"2\") at"]
+        );
     }
 
     #[test]
     fn back_returns_to_the_previous_screen_and_refreshes_it() {
-        let mut session = on_carnet(FakeServer::default().answering("back", vec![Effect::Back]));
+        let mut session =
+            on_addressbook(FakeServer::default().answering("back", vec![Effect::Back]));
         session.run("back");
         assert_eq!(session.view().stack(), "stacks");
         assert_eq!(
             session.api.calls,
-            ["act carnet back", "card stacks Some(\"1\") at", "grid_rows stacks list"]
+            ["act addressbook back", "card stacks Some(\"1\") at", "grid_rows stacks list"]
         );
 
         // There is nothing behind the first screen.
@@ -533,44 +612,46 @@ mod tests {
     #[test]
     fn an_error_for_the_user_is_shown_and_the_edits_are_kept() {
         let server =
-            FakeServer::default().failing("save_card", "Le champ « nom » est obligatoire.");
-        let mut session = on_carnet(server);
-        session.edit("ville", "Paris".into());
+            FakeServer::default().failing("save_card", "The field “last_name” is required.");
+        let mut session = on_addressbook(server);
+        session.edit("city", "Paris".into());
         session.run("save_card");
 
-        assert_eq!(session.message(), Some("Le champ « nom » est obligatoire."));
-        assert_eq!(session.view().value("ville"), "Paris");
+        assert_eq!(session.message(), Some("The field “last_name” is required."));
+        assert_eq!(session.view().value("city"), "Paris");
     }
 
     #[test]
     fn a_message_lasts_until_the_next_action() {
         let server = FakeServer::default()
-            .answering("save_card", vec![Effect::Message { text: "Fiche enregistrée.".into() }]);
-        let mut session = on_carnet(server);
+            .answering("save_card", vec![Effect::Message { text: "Card saved.".into() }]);
+        let mut session = on_addressbook(server);
         session.run("save_card");
-        assert_eq!(session.message(), Some("Fiche enregistrée."));
+        assert_eq!(session.message(), Some("Card saved."));
         session.run("next_card");
         assert_eq!(session.message(), None);
     }
 
     #[test]
     fn a_new_card_is_empty_and_is_sent_without_a_key() {
-        let mut session = on_carnet(FakeServer::default().answering("new_card", vec![Effect::New]));
+        let mut session =
+            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New]));
         session.run("new_card");
         assert!(session.view().is_new);
-        assert_eq!(session.view().value("ville"), "");
+        assert_eq!(session.view().value("city"), "");
         assert_eq!(session.view().card.count, 3);
 
-        session.edit("ville", "Lyon".into());
+        session.edit("city", "Lyon".into());
         session.run("save_card");
         let sent = session.api.contexts.last().unwrap();
         assert_eq!(sent.card, None);
-        assert_eq!(sent.dirty["ville"], "Lyon");
+        assert_eq!(sent.dirty["city"], "Lyon");
     }
 
     #[test]
     fn quit_ends_the_session() {
-        let mut session = on_carnet(FakeServer::default().answering("quit", vec![Effect::Quit]));
+        let mut session =
+            on_addressbook(FakeServer::default().answering("quit", vec![Effect::Quit]));
         assert!(!session.should_quit());
         session.run("quit");
         assert!(session.should_quit());
@@ -578,29 +659,29 @@ mod tests {
 
     #[test]
     fn a_change_made_elsewhere_refreshes_the_card_but_keeps_what_is_being_typed() {
-        let mut session = on_carnet(FakeServer::default());
-        session.edit("ville", "Paris".into());
+        let mut session = on_addressbook(FakeServer::default());
+        session.edit("city", "Paris".into());
         session
             .api
             .pending
-            .push(Notification::Card { stack: Some("carnet".into()), key: Some("1".into()) });
+            .push(Notification::Card { stack: Some("addressbook".into()), key: Some("1".into()) });
 
         assert!(session.poll());
-        assert_eq!(session.api.calls, ["card carnet Some(\"1\") at"]);
-        assert_eq!(session.view().value("ville"), "Paris");
+        assert_eq!(session.api.calls, ["card addressbook Some(\"1\") at"]);
+        assert_eq!(session.view().value("city"), "Paris");
     }
 
     #[test]
     fn a_change_in_another_stack_is_ignored() {
-        let mut session = on_carnet(FakeServer::default());
-        session.api.pending.push(Notification::Card { stack: Some("recettes".into()), key: None });
+        let mut session = on_addressbook(FakeServer::default());
+        session.api.pending.push(Notification::Card { stack: Some("recipes".into()), key: None });
         assert!(!session.poll());
         assert!(session.api.calls.is_empty());
     }
 
     #[test]
     fn a_changed_palette_is_read_again() {
-        let mut session = on_carnet(FakeServer::default());
+        let mut session = on_addressbook(FakeServer::default());
         session.api.pending.push(Notification::Screen { stack: None });
         assert!(session.poll());
         assert_eq!(session.api.calls, ["palette"]);
@@ -609,9 +690,64 @@ mod tests {
 
     #[test]
     fn a_changed_screen_definition_is_read_again() {
-        let mut session = on_carnet(FakeServer::default());
-        session.api.pending.push(Notification::Screen { stack: Some("carnet".into()) });
+        let mut session = on_addressbook(FakeServer::default());
+        session.api.pending.push(Notification::Screen { stack: Some("addressbook".into()) });
         assert!(session.poll());
-        assert_eq!(session.api.calls, ["open_stack carnet", "card carnet Some(\"1\") at"]);
+        assert_eq!(
+            session.api.calls,
+            ["open_stack addressbook", "card addressbook Some(\"1\") at"]
+        );
+    }
+
+    #[test]
+    fn a_row_is_selected_by_its_position() {
+        let mut session = Session::start(FakeServer::default()).unwrap();
+        session.select("list", 1);
+        assert_eq!(session.view().grids["list"].selected_key(), Some("recipes"));
+        session.select("list", 99);
+        assert_eq!(session.view().grids["list"].selected, 1, "there are two rows");
+        session.select("nothing", 0);
+    }
+
+    #[test]
+    fn the_images_of_a_screen_are_read_once() {
+        let server = FakeServer::default().answering(
+            "open",
+            vec![Effect::Show { stack: "addressbook".into(), card: Some("2".into()) }],
+        );
+        let mut session = Session::start(server).unwrap();
+        assert!(session.api().images.is_empty(), "the stack list shows no image");
+
+        session.run("open");
+        assert_eq!(session.api().images, ["photo-2", "logo"]);
+        assert_eq!(session.image("photo-2").map(|image| image.pixels.clone()), Some(vec![7]));
+        assert!(session.image("logo").is_some());
+
+        // Showing the same card again asks for nothing more.
+        session.run("open");
+        assert_eq!(session.api().images.len(), 2);
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_read_is_not_asked_for_again() {
+        let server = FakeServer::default()
+            .answering(
+                "missing",
+                vec![Effect::Show { stack: "addressbook".into(), card: Some("missing".into()) }],
+            )
+            .answering(
+                "broken",
+                vec![Effect::Show { stack: "addressbook".into(), card: Some("broken".into()) }],
+            );
+        let mut session = Session::start(server).unwrap();
+        session.run("missing");
+        session.run("broken");
+        session.run("missing");
+        session.run("broken");
+
+        assert_eq!(session.api().images, ["photo-missing", "logo", "photo-broken"]);
+        assert!(session.image("photo-missing").is_none());
+        assert!(session.image("photo-broken").is_none());
+        assert_eq!(session.message(), None, "a missing image is not an error for the user");
     }
 }

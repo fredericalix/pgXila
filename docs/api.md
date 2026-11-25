@@ -21,7 +21,8 @@ return and sends back what the user does.
 | Concurrent edits | The last save wins; history keeps every version |
 | Identifiers | `uuid` (UUIDv7), ready for several instances |
 | Text grid | 80 columns by 24 rows |
-| Language | Identifiers in English; messages for the user in French |
+| Graphic screen | 480 by 300 pixels, one byte per pixel, each a palette slot |
+| Language | English, for identifiers and for everything the user reads |
 
 ## 1. Roles
 
@@ -46,7 +47,7 @@ The role the agent tools run under (`xila_agent`) comes with phase 3.
 ## 2. Data model
 
 System objects live in the `xila` schema. A stack keeps its data in a table of
-its own, usually in a schema of its own, for example `carnet.contacts`.
+its own, usually in a schema of its own, for example `addressbook.contacts`.
 
 | Table | One row is | Main columns |
 |-------|-----------|--------------|
@@ -61,7 +62,7 @@ its own, usually in a schema of its own, for example `carnet.contacts`.
 | `xila.key_binding` | a key bound to an action | `background_id`, `key`, `action_id` |
 | `xila.history` | one recorded change | see section 7 |
 
-Building a stack means inserting rows in these tables. `examples/carnet.sql`
+Building a stack means inserting rows in these tables. `examples/addressbook.sql`
 builds a complete one.
 
 - **Cards.** A card is a row of the table named by its background. pgXila keeps
@@ -75,7 +76,8 @@ builds a complete one.
 - **One background per stack** for now. It is a separate table so that several
   backgrounds per stack can be allowed later without moving columns.
 - **Widget kinds**: `field`, `text`, `button`, `image`, `grid`, `slider`,
-  `canvas`. The clients of phase 1 draw `field`, `text`, `button` and `grid`.
+  `canvas`. The clients of phase 1 draw `field`, `text`, `button` and `grid`;
+  the graphical client also draws `image`.
 - **Logical model first.** `xila.widget` says what the screen contains: name,
   kind, label, bound column, logical order (`ord`) and group (`grp`). It says
   nothing about where things are drawn. `xila.layout` adds one optional placement
@@ -86,11 +88,20 @@ builds a complete one.
 - **Field type.** The editing behaviour of a field comes from the PostgreSQL
   type of the bound column: `text`, `number`, `date` or `boolean`.
 - **Computed text.** A `text` widget carries a template in `props`, such as
-  `{"template": "{nom}, {prenom}"}`. `{position}` and `{count}` are also
-  available. The server fills it in.
+  `{"template": "{last_name}, {first_name}"}`. Besides the columns of the card,
+  `{position}`, `{count}`, `{instance}` and `{user}` are available; a column
+  with one of these names wins. The server fills the template in.
+- **Kinds of text.** `"style": "title"` in the `props` of a `text` widget makes
+  it the title of the screen, and `"style": "subtitle"` the line under that
+  title. A `text` widget that has a `label` is a line of a summary: the label,
+  then the text. These say what a text is, not how it is drawn.
+- **Image.** An `image` widget shows a row of `xila.image`: the one whose
+  identifier is in its bound column, of type `uuid`, or a fixed one named in
+  `props` as `{"image": "0193…"}`. An image is `width * height` bytes, one per
+  pixel, row by row; each byte is a palette slot.
 - **Grid.** A `grid` widget lists the rows of a table or view named in `props`:
   `{"schema": "xila", "table": "visible_stack", "key": "name", "columns":
-  [{"column": "title", "label": "Pile"}]}`. Choosing a row runs the widget's
+  [{"column": "title", "label": "Stack"}]}`. Choosing a row runs the widget's
   action with the key of that row.
 - **Actions and keys.** An action or a key binding without a background is
   available on every screen. A key bound on a screen wins over the same key
@@ -103,27 +114,27 @@ it calls `xila.open_stack` and receives one JSON document.
 
 ```json
 {
-  "stack": { "name": "carnet", "title": "Carnet d'adresses", "kind": "user" },
+  "stack": { "name": "addressbook", "title": "Address book", "kind": "user" },
   "source": { "has_cards": true, "count": 12 },
   "widgets": [
-    { "name": "titre", "kind": "text", "layer": "background", "ord": 10,
-      "props": { "template": "{nom}, {prenom}", "style": "title" },
+    { "name": "title", "kind": "text", "layer": "background", "ord": 10,
+      "props": { "template": "{last_name}, {first_name}", "style": "title" },
       "layout": { "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } } },
-    { "name": "nom", "kind": "field", "layer": "background", "ord": 20,
-      "label": "Nom", "column": "nom", "type": "text",
+    { "name": "last_name", "kind": "field", "layer": "background", "ord": 20,
+      "label": "Last name", "column": "last_name", "type": "text",
       "props": { "required": true }, "layout": {} },
-    { "name": "suivante", "kind": "button", "layer": "background", "ord": 100,
-      "label": "Suiv.", "action": "next_card", "props": {}, "layout": {} }
+    { "name": "next", "kind": "button", "layer": "background", "ord": 100,
+      "label": "Next", "action": "next_card", "props": {}, "layout": {} }
   ],
   "actions": [
-    { "name": "next_card", "label": "Suiv." },
-    { "name": "quit", "label": "Quitter" }
+    { "name": "next_card", "label": "Next" },
+    { "name": "quit", "label": "Quit" }
   ],
   "keys": [
-    { "key": "F3", "label": "Quitter", "action": "quit" },
-    { "key": "F8", "label": "Suiv.", "action": "next_card" },
-    { "key": "F12", "label": "Retour", "action": "back" },
-    { "key": "Enter", "label": "Enregistrer", "action": "save_card" }
+    { "key": "F3", "label": "Quit", "action": "quit" },
+    { "key": "F8", "label": "Next", "action": "next_card" },
+    { "key": "F12", "label": "Back", "action": "back" },
+    { "key": "Enter", "label": "Save", "action": "save_card" }
   ],
   "colours": []
 }
@@ -133,6 +144,35 @@ Coordinates: `text` layouts are in character cells on an 80 by 24 grid. The
 client keeps rows 0 to 2 for the header and rows 21 to 23 for messages and
 function keys. `graphic` layouts are in pixels, relative to the content area of
 the stack window, on the 480 by 300 screen.
+
+### The graphic renderer
+
+The graphical client shows one stack at a time, in a window whose size follows
+its content. Without any `graphic` layout row, it places the widgets itself:
+
+- **A stack with cards** is a sheet of paper. The `title` text is written large
+  at the top, with the position in the stack on its right. Under it, the first
+  `image` widget is on the left, and the fields form a column with their labels,
+  in `ord` order. The buttons are in a row under the sheet.
+- **A static screen** starts with a banner made of its `title` and `subtitle`
+  texts. The other texts follow, one per line, then the fields, the grid and a
+  row of buttons.
+
+A `graphic` layout row changes that for one widget:
+
+- with a size (`w` and `h` greater than zero), the widget is drawn exactly in
+  that rectangle and takes no part in the automatic placement;
+- without a size, the widget keeps its automatic place and only `style` is
+  used.
+
+| Style key | Applies to | Meaning |
+|-----------|-----------|---------|
+| `hidden` | any widget | `true` removes the widget from this renderer |
+| `variant` | button | `"primary"` makes it the main button of the screen |
+| `arrow` | button | `"left"` or `"right"` adds an arrow, for browsing buttons |
+
+The function key bar lists the keys of the screen; a click on a key is the key.
+The close box of the window is the `F12` key.
 
 ## 4. Functions
 
@@ -162,8 +202,8 @@ last three are relative to `key`. `next` and `previous` stop at the ends. When
   "key": "0193a5e2-…",
   "position": 3,
   "count": 12,
-  "values": { "nom": "Lovelace", "prenom": "Ada", "ville": "Londres" },
-  "texts":  { "titre": "Lovelace, Ada" },
+  "values": { "last_name": "Lovelace", "first_name": "Ada", "city": "London" },
+  "texts":  { "title": "Lovelace, Ada" },
   "widgets": []
 }
 ```
@@ -179,7 +219,7 @@ are in the history. The clients do not call this function directly: they run the
 `save_card` action, or simply move to another card.
 
 **Errors.** pgXila errors use SQLSTATE class `XL`. Their message is written for
-the user, in French, and the client shows it as it is.
+the user, in English, and the client shows it as it is.
 
 | SQLSTATE | Meaning |
 |----------|---------|
@@ -193,8 +233,8 @@ Buttons and function keys do not carry code. They name an action, and the client
 asks the server to run it:
 
 ```sql
-SELECT xila.act('carnet', 'next_card',
-                '{"card": "0193a5e2-…", "dirty": {"ville": "Paris"}}');
+SELECT xila.act('addressbook', 'next_card',
+                '{"card": "0193a5e2-…", "dirty": {"city": "Paris"}}');
 ```
 
 `context` is the state of the client: `card` is the key of the card on screen
@@ -203,7 +243,7 @@ saved, `row` is the key of the selected grid row. The server looks up the action
 runs its handler, and answers with effects that the client applies in order:
 
 ```json
-[ { "do": "show", "stack": "carnet", "card": "0193a5e3-…" } ]
+[ { "do": "show", "stack": "addressbook", "card": "0193a5e3-…" } ]
 ```
 
 | Effect | Meaning |
@@ -234,8 +274,8 @@ and scripting. They will be additional kinds of handler behind the same
 
 | Channel | Payload | Sent when |
 |---------|---------|-----------|
-| `xila_card` | `{"stack": "carnet", "key": "…", "op": "update"}` | a card is inserted, updated or deleted |
-| `xila_screen` | `{"stack": "carnet"}` | a screen definition changes; `stack` is null when it is the palette |
+| `xila_card` | `{"stack": "addressbook", "key": "…", "op": "update"}` | a card is inserted, updated or deleted |
+| `xila_screen` | `{"stack": "addressbook"}` | a screen definition changes; `stack` is null when it is the palette |
 
 Payloads carry identifiers only, never card contents, because any connected role
 may listen. A client that shows the affected card or stack reads it again.
@@ -269,8 +309,10 @@ and rewound as well. How a dropped column is restored is still open.
 The desktop and the stack list are stacks shipped by the extension, with
 `kind = 'system'`, described with the same rows as any other stack:
 
-- `desktop`: a static screen. Its widgets are buttons whose action is
-  `open_stack`. In text mode the default layout of buttons is a numbered menu.
+- `desktop`: a static screen. Its buttons run `open_stack`; its texts say
+  which instance this is and who is connected. In text mode the buttons are a
+  numbered menu and the texts are hidden, because the header of the screen
+  already says the same. In the window they form the welcome banner.
 - `stacks`: a static screen with a `grid` widget over `xila.visible_stack`.
   Choosing a row runs `open_stack`.
 

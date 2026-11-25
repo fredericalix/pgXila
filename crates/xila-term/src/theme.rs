@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn colours_come_from_the_palette_slots() {
         let palette = vec![
-            PaletteColour { slot: 0, name: "noir".into(), rgb: "#14121f".into() },
+            PaletteColour { slot: 0, name: "black".into(), rgb: "#14121f".into() },
             PaletteColour { slot: 22, name: "jaune".into(), rgb: "#f7d046".into() },
         ];
         let theme = Theme::from_palette(&palette);

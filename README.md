@@ -17,7 +17,8 @@ pgXila is made of two parts:
 
 ## Status
 
-Early development. Phase 1 is being built in two steps; the first one is done:
+Early development. Phase 1 is done: one vertical slice, from the database to
+two clients.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -28,12 +29,14 @@ Early development. Phase 1 is being built in two steps; the first one is done:
 - the SQL API the clients call, described in [docs/api.md](docs/api.md);
 - the desktop and the stack list, which are themselves stacks stored in the
   database;
-- **the text client**: connect, browse the cards of a stack, edit a field and
-  write it back.
+- **the text client**, in the manner of an AS/400 display, and **the
+  graphical client**, in pixel art: connect, browse the cards of a stack, edit
+  a field and write it back. Both draw the same screens from the same rows.
 
-Not there yet: the graphical client (next step), author mode, the agent and
-multiple instances. Until author mode exists, a stack is built with SQL, as
-[examples/carnet.sql](examples/carnet.sql) shows.
+Not there yet: author mode, the agent and multiple instances. Until author mode
+exists, a stack is built with SQL, as
+[examples/addressbook.sql](examples/addressbook.sql) shows. The interface is in
+English.
 
 ## Requirements
 
@@ -53,19 +56,21 @@ docker compose up --build --detach --wait
 scripts/create-user.sh ada
 
 # 3. Load the example stack, an address book
-scripts/load-example.sh carnet
+scripts/load-example.sh addressbook
 
-# 4. Run the text client
+# 4. Run a client: in a window...
+cargo run -p xila-gui -- --user ada --ca docker/certs/ca.crt
+
+#    ...or in the terminal
 cargo run -p xila-term -- --user ada --ca docker/certs/ca.crt
 ```
 
-In the client, type the password, choose `1` then Enter for the list of stacks,
-and Enter again to open the address book. `F7` and `F8` browse the cards, `Tab`
-moves between fields, Enter saves, `F6` starts a new card, `F12` goes back and
-`F3` quits. Moving to another card also saves what was typed. A change made by
-someone else appears on screen by itself.
-
-The terminal must be at least 80 columns by 24 rows.
+In either client, type the password and press Enter. Open the list of stacks
+(Enter in the window, `1` then Enter in the terminal), and press Enter again to
+open the address book. `F7` and `F8` browse the cards, `Tab` moves between
+fields, Enter saves, `F6` starts a new card, `F12` goes back and `F3` quits.
+Moving to another card also saves what was typed. A change made by someone else
+appears on screen by itself.
 
 ## The server
 
@@ -115,9 +120,12 @@ endpoint and token are read from a `.env.local` file at the root of the
 repository. Copy `.env.example` to `.env.local` and fill it in. The file is
 ignored by git and is optional: the server runs without it.
 
-## The text client
+## The clients
+
+Both clients take the same options:
 
 ```sh
+cargo run -p xila-gui -- --help
 cargo run -p xila-term -- --help
 ```
 
@@ -133,8 +141,33 @@ The password is typed on the connection screen. For scripts, it can come from
 the `PGXILA_PASSWORD` environment variable; there is deliberately no command
 line option for it.
 
-The client draws with the colours of `xila.palette`, as 24-bit colours: use a
-terminal that supports them.
+### The graphical client
+
+`xila-gui` draws its own pixels: a screen of 480 by 300 pixels, one byte per
+pixel, with the colours of `xila.palette` and its own bitmap fonts. The window
+enlarges that screen by a whole factor, so pixels stay square and sharp. It
+opens at 3 times the size when the display is large enough, or else less;
+`--scale` (or `PGXILA_SCALE`) chooses the factor, and the window can be resized
+or made full screen.
+
+Everything works with the keyboard, as in the text client. The pointer works
+too: click a button, a field, a row of a list (a second click opens it), a key
+of the function key bar, or the close box of the window to go back.
+
+On a Mac, the function keys of a laptop keyboard need the `fn` key, unless
+"Use F1, F2, etc. keys as standard function keys" is turned on in the keyboard
+settings. Clicking the keys of the bar at the bottom of the screen does the
+same.
+
+Rendering uses [winit](https://github.com/rust-windowing/winit) for the window
+and the keyboard, and [softbuffer](https://github.com/rust-windowing/softbuffer)
+to show the pixels, without a graphics card.
+
+### The text client
+
+`xila-term` needs a terminal of at least 80 columns by 24 rows. It draws with
+the colours of `xila.palette`, as 24-bit colours: use a terminal that supports
+them.
 
 ## Security model
 
@@ -154,8 +187,8 @@ terminal that supports them.
 ## Tests
 
 ```sh
-# Clients: unit tests of the API types, the session, the text layout and the
-# text screens
+# Clients: unit tests of the API types, the session, the layouts and the
+# screens of both clients, drawn without a terminal or a window
 cargo test --workspace
 
 # Extension: pgrx tests of the schema and the SQL API, inside Docker
@@ -168,9 +201,9 @@ scripts/test-integration.sh
 The integration tests prove, among other things, that an unencrypted connection
 is refused, both by the configuration and by the extension alone, that TLS 1.2
 is refused, and that the client rejects an untrusted certificate or a wrong
-host name. They also drive a session from the desktop to a card and check what
-is written. They run against a throwaway server and do not touch the data of
-the development server.
+host name. They also drive both clients from the desktop to a card, with its
+picture, and check what is written. They run against a throwaway server and do
+not touch the data of the development server.
 
 The same three suites run in GitHub Actions on every push, with the clients
 built and tested on Linux, macOS and Windows.
@@ -180,7 +213,8 @@ built and tested on Linux, macOS and Windows.
 | Path | Content |
 |------|---------|
 | `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, and SQL) |
-| `crates/xila-core/` | Code shared by the clients: connection, API, session, default layout |
+| `crates/xila-core/` | Code shared by the clients: connection, API, session, connection form |
+| `crates/xila-gui/` | The graphical client, with its fonts |
 | `crates/xila-term/` | The text client |
 | `docker/` | Server image: Dockerfile, configuration, entrypoint |
 | `docs/api.md` | SQL API between the extension and the clients |
@@ -193,3 +227,7 @@ PostgreSQL headers, inside the Docker image.
 ## Licence
 
 pgXila is released under the [PostgreSQL License](LICENSE).
+
+The two bitmap fonts of the graphical client are a conversion of Pixeloid Sans
+by GGBotNet and stay under the SIL Open Font License 1.1; see
+[crates/xila-gui/assets/fonts](crates/xila-gui/assets/fonts/README.md).

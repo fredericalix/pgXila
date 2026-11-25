@@ -5,7 +5,8 @@
 -- stack's table. Identifiers that end up in dynamic SQL always come from the
 -- catalog or go through format('%I').
 --
--- Errors meant for the user use SQLSTATE class XL and a message in French:
+-- Errors meant for the user use SQLSTATE class XL and a message written for
+-- the user, which the clients show as it is:
 --   XL002  unknown stack, card, widget or action
 --   XL003  a value was rejected
 --   XL004  not allowed for this role
@@ -24,7 +25,7 @@ BEGIN
     FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id
     WHERE s.name = stack;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'La pile « % » n''existe pas.', stack USING ERRCODE = 'XL002';
+        RAISE EXCEPTION 'The stack “%” does not exist.', stack USING ERRCODE = 'XL002';
     END IF;
     RETURN result;
 END
@@ -165,7 +166,7 @@ BEGIN
     SELECT * INTO info FROM xila.stack WHERE id = bg.stack_id;
 
     IF source IS NOT NULL AND NOT has_table_privilege(source, 'SELECT') THEN
-        RAISE EXCEPTION 'Vous n''avez pas accès à la pile « % ».', stack USING ERRCODE = 'XL004';
+        RAISE EXCEPTION 'You do not have access to the stack “%”.', stack USING ERRCODE = 'XL004';
     END IF;
 
     RETURN jsonb_build_object(
@@ -214,7 +215,7 @@ DECLARE
     extras jsonb;
 BEGIN
     IF move NOT IN ('first', 'last', 'at', 'next', 'previous') THEN
-        RAISE EXCEPTION 'Déplacement inconnu : %.', move USING ERRCODE = 'XL002';
+        RAISE EXCEPTION 'Unknown move: %.', move USING ERRCODE = 'XL002';
     END IF;
 
     IF source IS NULL THEN
@@ -250,7 +251,13 @@ BEGIN
     SELECT coalesce(jsonb_object_agg(e.key, e.value #>> '{}'), '{}') INTO vals
     FROM jsonb_each(found - '_pos' - '_count') e;
 
-    extras := vals || jsonb_build_object('position', found->'_pos', 'count', found->'_count');
+    -- What a template may use: these names, then the columns of the card. A
+    -- column wins over a name it shares.
+    extras := jsonb_build_object(
+        'position', found->'_pos',
+        'count', found->'_count',
+        'instance', xila.hello()->>'instance',
+        'user', session_user) || vals;
 
     RETURN jsonb_build_object(
         'key', CASE WHEN source IS NOT NULL THEN vals->>bg.key_column END,
@@ -284,7 +291,7 @@ DECLARE
     bad_col  text;
 BEGIN
     IF source IS NULL THEN
-        RAISE EXCEPTION 'La pile « % » n''a pas de cartes modifiables.', stack
+        RAISE EXCEPTION 'The stack “%” has no cards to edit.', stack
             USING ERRCODE = 'XL003';
     END IF;
 
@@ -295,7 +302,7 @@ BEGIN
         WHERE a.attrelid = source AND a.attname = change.col
           AND a.attnum > 0 AND NOT a.attisdropped;
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'Le champ « % » n''existe pas dans cette pile.', change.col
+            RAISE EXCEPTION 'The field “%” does not exist in this stack.', change.col
                 USING ERRCODE = 'XL003', COLUMN = change.col;
         END IF;
 
@@ -307,7 +314,7 @@ BEGIN
         BEGIN
             EXECUTE format('SELECT CAST($1 AS %s)::text', col_type) INTO probe USING change.val;
         EXCEPTION WHEN data_exception THEN
-            RAISE EXCEPTION 'La valeur « % » n''est pas valide pour le champ « % ».',
+            RAISE EXCEPTION 'The value “%” is not valid for the field “%”.',
                 change.val, change.col
                 USING ERRCODE = 'XL003', COLUMN = change.col;
         END;
@@ -335,20 +342,20 @@ BEGIN
                  WHERE %3$I::text = $2 RETURNING %3$I::text', source, cols, bg.key_column)
             INTO new_key USING cleaned, key;
             IF new_key IS NULL THEN
-                RAISE EXCEPTION 'Cette carte n''existe plus.' USING ERRCODE = 'XL002';
+                RAISE EXCEPTION 'This card no longer exists.' USING ERRCODE = 'XL002';
             END IF;
         END IF;
     EXCEPTION
         WHEN not_null_violation THEN
             GET STACKED DIAGNOSTICS bad_col = COLUMN_NAME;
-            RAISE EXCEPTION 'Le champ « % » est obligatoire.', bad_col
+            RAISE EXCEPTION 'The field “%” is required.', bad_col
                 USING ERRCODE = 'XL003', COLUMN = bad_col;
         WHEN unique_violation THEN
-            RAISE EXCEPTION 'Une autre carte contient déjà cette valeur.' USING ERRCODE = 'XL003';
+            RAISE EXCEPTION 'Another card already holds this value.' USING ERRCODE = 'XL003';
         WHEN integrity_constraint_violation OR data_exception THEN
-            RAISE EXCEPTION 'Valeur refusée : %', SQLERRM USING ERRCODE = 'XL003';
+            RAISE EXCEPTION 'Value rejected: %', SQLERRM USING ERRCODE = 'XL003';
         WHEN insufficient_privilege THEN
-            RAISE EXCEPTION 'Vous n''avez pas le droit de modifier cette pile.'
+            RAISE EXCEPTION 'You are not allowed to change this stack.'
                 USING ERRCODE = 'XL004';
     END;
 
@@ -372,12 +379,12 @@ BEGIN
     FROM xila.widget w
     WHERE w.background_id = bg.id AND w.name = widget AND w.kind = 'grid';
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'La grille « % » n''existe pas.', widget USING ERRCODE = 'XL002';
+        RAISE EXCEPTION 'The grid “%” does not exist.', widget USING ERRCODE = 'XL002';
     END IF;
 
     rel := to_regclass(format('%I.%I', props->>'schema', props->>'table'));
     IF rel IS NULL THEN
-        RAISE EXCEPTION 'La source de la grille « % » n''existe pas.', widget
+        RAISE EXCEPTION 'The source of the grid “%” does not exist.', widget
             USING ERRCODE = 'XL002';
     END IF;
 
@@ -425,7 +432,7 @@ BEGIN
     ORDER BY a.background_id NULLS LAST
     LIMIT 1;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'L''action « % » n''existe pas.', action USING ERRCODE = 'XL002';
+        RAISE EXCEPTION 'The action “%” does not exist.', action USING ERRCODE = 'XL002';
     END IF;
 
     CASE act.handler
@@ -439,7 +446,7 @@ BEGIN
         -- The stack named by the action, or else the selected grid row.
         target := coalesce(act.args->>'stack', context->>'row');
         IF target IS NULL THEN
-            RAISE EXCEPTION 'Aucune pile n''est sélectionnée.' USING ERRCODE = 'XL002';
+            RAISE EXCEPTION 'No stack is selected.' USING ERRCODE = 'XL002';
         END IF;
         PERFORM xila.background_of(target);
         RETURN jsonb_build_array(jsonb_build_object('do', 'show', 'stack', target));
@@ -452,10 +459,10 @@ BEGIN
             saved := xila.save_card(stack, card, dirty);
             RETURN jsonb_build_array(
                 jsonb_build_object('do', 'show', 'stack', stack, 'card', saved->>'key'),
-                jsonb_build_object('do', 'message', 'text', 'Fiche enregistrée.'));
+                jsonb_build_object('do', 'message', 'text', 'Card saved.'));
         END IF;
         RETURN jsonb_build_array(
-            jsonb_build_object('do', 'message', 'text', 'Aucune modification à enregistrer.'));
+            jsonb_build_object('do', 'message', 'text', 'Nothing to save.'));
 
     WHEN 'next_card', 'previous_card', 'first_card', 'last_card' THEN
         -- Leaving a card saves what was typed on it.

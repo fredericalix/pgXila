@@ -137,7 +137,7 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
         Key::Interrupt => {}
         Key::F(number) => {
             if !session.press(&format!("F{number}")) {
-                session.say("Cette touche n'est pas active sur cet écran.");
+                session.say("This key is not active on this screen.");
             }
         }
         Key::Up if on_grid => session.select_row(focus.as_deref().unwrap_or_default(), -1),
@@ -149,7 +149,7 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
                 let chosen = ui.option.parse().ok().and_then(|number| layout.option(number));
                 match chosen {
                     Some(action) => session.run(action),
-                    None => session.say("Cette option n'existe pas."),
+                    None => session.say("There is no such option."),
                 }
                 ui.option.clear();
             }
@@ -308,10 +308,8 @@ pub fn draw<A: Api>(
     }
 
     let hint = match focus.as_deref() {
-        Some(PROMPT) => "Tapez le numéro d'une option, puis appuyez sur Entrée.",
-        Some(name) if is_grid(&layout, name) => {
-            "Choisissez une ligne avec les flèches, puis appuyez sur Entrée."
-        }
+        Some(PROMPT) => "Type the number of an option, then press Enter.",
+        Some(name) if is_grid(&layout, name) => "Choose a row with the arrows, then press Enter.",
         _ => "",
     };
     match session.message() {
@@ -346,23 +344,17 @@ fn draw_header<A: Api>(session: &Session<A>, buffer: &mut Buffer, area: Rect, th
 
     if view.screen.source.has_cards {
         let position = if view.is_new {
-            "Nouvelle fiche".to_owned()
+            "New card".to_owned()
         } else if view.card.count == 0 {
-            "Aucune fiche".to_owned()
+            "No card".to_owned()
         } else {
-            format!("Fiche {}/{}", view.card.position, view.card.count)
+            format!("Card {}/{}", view.card.position, view.card.count)
         };
         put_right(buffer, area, 0, &position, theme.of(theme.title));
     } else {
         let hello = session.hello();
-        put(buffer, area, 1, 1, &format!("Instance : {}", hello.instance), 40, theme.base());
-        put_right(
-            buffer,
-            area,
-            1,
-            &format!("Utilisateur : {}", hello.role.to_uppercase()),
-            theme.base(),
-        );
+        put(buffer, area, 1, 1, &format!("Instance: {}", hello.instance), 40, theme.base());
+        put_right(buffer, area, 1, &format!("User: {}", hello.role.to_uppercase()), theme.base());
     }
 }
 
@@ -371,7 +363,7 @@ fn put_right(buffer: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) 
     put(buffer, area, (COLUMNS - 1).saturating_sub(width), y, text, width, style);
 }
 
-/// Last row: the function keys of the screen, `F3=Quitter  F8=Suiv.`.
+/// Last row: the function keys of the screen, `F3=Quit  F8=Next`.
 pub fn draw_keys<'a>(
     buffer: &mut Buffer,
     area: Rect,
@@ -380,7 +372,6 @@ pub fn draw_keys<'a>(
 ) {
     let mut x = 1;
     for (key, label) in keys {
-        let key = if key == "Enter" { "Entrée" } else { key };
         let width = (key.chars().count() + 1 + label.chars().count()) as u16;
         if x + width >= COLUMNS {
             break;
@@ -456,8 +447,7 @@ fn draw_grid(
     put(buffer, area, x + MARKER, y, &header, w - MARKER, theme.of(theme.label));
 
     if state.page.rows.is_empty() {
-        let empty =
-            definition.props.get("empty").and_then(|v| v.as_str()).unwrap_or("Aucune ligne.");
+        let empty = definition.props.get("empty").and_then(|v| v.as_str()).unwrap_or("No rows.");
         put(buffer, area, x + MARKER, y + 1, empty, w - MARKER, theme.base());
         return;
     }
@@ -492,7 +482,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use xila_core::api::{
-        ApiError, Card, Context, Effect, GridPage, GridRow, Hello, Move, Notification,
+        ApiError, Card, Context, Effect, GridPage, GridRow, Hello, Image, Move, Notification,
         PaletteColour, Screen,
     };
 
@@ -502,22 +492,22 @@ mod tests {
         actions: Vec<(String, Context)>,
     }
 
-    fn carnet() -> Screen {
+    fn addressbook() -> Screen {
         serde_json::from_value(serde_json::json!({
-            "stack": { "name": "carnet", "title": "Carnet d'adresses", "kind": "user" },
+            "stack": { "name": "addressbook", "title": "Address book", "kind": "user" },
             "source": { "has_cards": true, "count": 42 },
             "widgets": [
-                { "name": "titre", "kind": "text", "ord": 10, "props": { "template": "{nom}" },
+                { "name": "title", "kind": "text", "ord": 10, "props": { "template": "{last_name}" },
                   "layout": { "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } } },
-                { "name": "nom", "kind": "field", "ord": 20, "label": "Nom", "column": "nom" },
-                { "name": "prenom", "kind": "field", "ord": 30, "label": "Prénom", "column": "prenom" },
-                { "name": "suivante", "kind": "button", "ord": 90, "label": "Suiv.", "action": "next_card" }
+                { "name": "last_name", "kind": "field", "ord": 20, "label": "Last name", "column": "last_name" },
+                { "name": "first_name", "kind": "field", "ord": 30, "label": "First name", "column": "first_name" },
+                { "name": "next", "kind": "button", "ord": 90, "label": "Next", "action": "next_card" }
             ],
             "actions": [],
             "keys": [
-                { "key": "F3", "label": "Quitter", "action": "quit" },
-                { "key": "F8", "label": "Suiv.", "action": "next_card" },
-                { "key": "Enter", "label": "Enregistrer", "action": "save_card" }
+                { "key": "F3", "label": "Quit", "action": "quit" },
+                { "key": "F8", "label": "Next", "action": "next_card" },
+                { "key": "Enter", "label": "Save", "action": "save_card" }
             ]
         }))
         .unwrap()
@@ -525,28 +515,28 @@ mod tests {
 
     fn desktop() -> Screen {
         serde_json::from_value(serde_json::json!({
-            "stack": { "name": "desktop", "title": "Menu principal", "kind": "system" },
+            "stack": { "name": "desktop", "title": "Main menu", "kind": "system" },
             "source": { "has_cards": false, "count": 1 },
             "widgets": [
-                { "name": "stacks", "kind": "button", "ord": 10, "label": "Mes piles", "action": "open_stacks" }
+                { "name": "stacks", "kind": "button", "ord": 10, "label": "My stacks", "action": "open_stacks" }
             ],
             "actions": [],
-            "keys": [{ "key": "F3", "label": "Quitter", "action": "quit" }]
+            "keys": [{ "key": "F3", "label": "Quit", "action": "quit" }]
         }))
         .unwrap()
     }
 
     fn stacks() -> Screen {
         serde_json::from_value(serde_json::json!({
-            "stack": { "name": "stacks", "title": "Mes piles", "kind": "system" },
+            "stack": { "name": "stacks", "title": "My stacks", "kind": "system" },
             "source": { "has_cards": false, "count": 1 },
             "widgets": [
                 { "name": "list", "kind": "grid", "ord": 10, "action": "open", "props": {
-                    "columns": [ { "column": "title", "label": "Pile" },
-                                 { "column": "cards", "label": "Cartes", "align": "right" } ] } }
+                    "columns": [ { "column": "title", "label": "Stack" },
+                                 { "column": "cards", "label": "Cards", "align": "right" } ] } }
             ],
             "actions": [],
-            "keys": [{ "key": "F12", "label": "Retour", "action": "back" }]
+            "keys": [{ "key": "F12", "label": "Back", "action": "back" }]
         }))
         .unwrap()
     }
@@ -567,16 +557,20 @@ mod tests {
             Ok(vec![])
         }
 
+        fn image(&mut self, _id: &str) -> Result<Option<Image>, ApiError> {
+            Ok(None)
+        }
+
         fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
             Ok(match stack {
                 "desktop" => desktop(),
                 "stacks" => stacks(),
-                _ => carnet(),
+                _ => addressbook(),
             })
         }
 
         fn card(&mut self, stack: &str, _key: Option<&str>, _to: Move) -> Result<Card, ApiError> {
-            if stack != "carnet" {
+            if stack != "addressbook" {
                 return Ok(Card { position: 1, count: 1, ..Card::default() });
             }
             Ok(Card {
@@ -584,8 +578,8 @@ mod tests {
                 position: 3,
                 count: 42,
                 values: BTreeMap::from([
-                    ("nom".to_string(), Some("Lovelace".to_string())),
-                    ("prenom".to_string(), Some("Ada".to_string())),
+                    ("last_name".to_string(), Some("Lovelace".to_string())),
+                    ("first_name".to_string(), Some("Ada".to_string())),
                 ]),
                 ..Card::default()
             })
@@ -602,8 +596,8 @@ mod tests {
             Ok(GridPage {
                 total: 2,
                 rows: vec![
-                    row("carnet", "Carnet d'adresses", "42"),
-                    row("recettes", "Recettes", "27"),
+                    row("addressbook", "Address book", "42"),
+                    row("recipes", "Recipes", "27"),
                 ],
             })
         }
@@ -650,11 +644,11 @@ mod tests {
     }
 
     /// A session taken from the menu to the address book.
-    fn on_carnet() -> (Session<Fake>, Ui) {
+    fn on_addressbook() -> (Session<Fake>, Ui) {
         let mut session = Session::start(Fake::default()).unwrap();
         let mut ui = Ui::default();
         press(&mut session, &mut ui, &[Key::Char('1'), Key::Enter, Key::Enter]);
-        assert_eq!(session.view().stack(), "carnet");
+        assert_eq!(session.view().stack(), "addressbook");
         (session, ui)
     }
 
@@ -663,15 +657,12 @@ mod tests {
         let session = Session::start(Fake::default()).unwrap();
         let (lines, cursor) = render(&session, &Ui::default());
 
-        assert_eq!(lines[0], " PGXILA                          Menu principal");
-        assert_eq!(
-            lines[1],
-            " Instance : normandie-01                                      Utilisateur : FAX"
-        );
-        assert_eq!(lines[3], "    1. Mes piles");
+        assert_eq!(lines[0], " PGXILA                            Main menu");
+        assert_eq!(lines[1], format!(" {:<69}{}", "Instance: normandie-01", "User: FAX"));
+        assert_eq!(lines[3], "    1. My stacks");
         assert_eq!(lines[5], " Option ===>");
-        assert_eq!(lines[22], " Tapez le numéro d'une option, puis appuyez sur Entrée.");
-        assert_eq!(lines[23], " F3=Quitter");
+        assert_eq!(lines[22], " Type the number of an option, then press Enter.");
+        assert_eq!(lines[23], " F3=Quit");
         assert_eq!(cursor, Some((13, 5)));
     }
 
@@ -683,11 +674,11 @@ mod tests {
         assert_eq!(session.view().stack(), "stacks");
 
         let (lines, _) = render(&session, &ui);
-        assert_eq!(lines[0], " PGXILA                            Mes piles");
-        assert_eq!(lines[3], format!("   {:<65} {:>9}", "Pile", "Cartes"));
-        assert_eq!(lines[4], format!(" > {:<65} {:>9}", "Carnet d'adresses", "42"));
-        assert_eq!(lines[5], format!("   {:<65} {:>9}", "Recettes", "27"));
-        assert_eq!(lines[23], " F12=Retour");
+        assert_eq!(lines[0], " PGXILA                            My stacks");
+        assert_eq!(lines[3], format!("   {:<65} {:>9}", "Stack", "Cards"));
+        assert_eq!(lines[4], format!(" > {:<65} {:>9}", "Address book", "42"));
+        assert_eq!(lines[5], format!("   {:<65} {:>9}", "Recipes", "27"));
+        assert_eq!(lines[23], " F12=Back");
     }
 
     #[test]
@@ -696,7 +687,7 @@ mod tests {
         let mut ui = Ui::default();
         press(&mut session, &mut ui, &[Key::Char('7'), Key::Enter]);
         assert_eq!(session.view().stack(), "desktop");
-        assert_eq!(session.message(), Some("Cette option n'existe pas."));
+        assert_eq!(session.message(), Some("There is no such option."));
     }
 
     #[test]
@@ -705,35 +696,35 @@ mod tests {
         let mut ui = Ui::default();
         press(&mut session, &mut ui, &[Key::Char('1'), Key::Enter, Key::Down]);
         let (lines, _) = render(&session, &ui);
-        assert!(lines[5].starts_with(" > Recettes"), "{}", lines[5]);
+        assert!(lines[5].starts_with(" > Recipes"), "{}", lines[5]);
 
         press(&mut session, &mut ui, &[Key::Enter]);
         let (action, context) = session_actions(&session).last().unwrap();
         assert_eq!(action, "open");
-        assert_eq!(context.row.as_deref(), Some("recettes"));
+        assert_eq!(context.row.as_deref(), Some("recipes"));
     }
 
     #[test]
     fn a_card_shows_its_fields_with_leaders_and_its_function_keys() {
-        let (session, ui) = on_carnet();
+        let (session, ui) = on_addressbook();
         let (lines, cursor) = render(&session, &ui);
 
         assert_eq!(
             lines[0],
-            " CARNET                        Carnet d'adresses                     Fiche 3/42"
+            " ADDRESSBOOK                      Address book                        Card 3/42"
         );
-        assert_eq!(lines[3], " Nom . . . . . . :  Lovelace");
-        assert_eq!(lines[4], " Prénom  . . . . :  Ada");
-        assert_eq!(lines[23], " F3=Quitter  F8=Suiv.  Entrée=Enregistrer");
+        assert_eq!(lines[3], " Last name . . . :  Lovelace");
+        assert_eq!(lines[4], " First name  . . :  Ada");
+        assert_eq!(lines[23], " F3=Quit  F8=Next  Enter=Save");
         // The button is not repeated: F8 already offers its action.
-        assert!(!lines.iter().any(|line| line.contains("1. Suiv.")));
+        assert!(!lines.iter().any(|line| line.contains("1. Next")));
         // The cursor waits at the end of the first field.
         assert_eq!(cursor, Some((28, 3)));
     }
 
     #[test]
     fn typing_edits_the_focused_field() {
-        let (mut session, mut ui) = on_carnet();
+        let (mut session, mut ui) = on_addressbook();
         press(
             &mut session,
             &mut ui,
@@ -747,42 +738,42 @@ mod tests {
             ],
         );
 
-        assert_eq!(session.view().value("prenom"), "Alan");
-        assert_eq!(session.view().value("nom"), "Lovelace");
+        assert_eq!(session.view().value("first_name"), "Alan");
+        assert_eq!(session.view().value("last_name"), "Lovelace");
         let (lines, cursor) = render(&session, &ui);
-        assert_eq!(lines[4], " Prénom  . . . . :  Alan");
+        assert_eq!(lines[4], " First name  . . :  Alan");
         assert_eq!(cursor, Some((24, 4)));
     }
 
     #[test]
     fn a_function_key_sends_the_card_and_what_was_typed() {
-        let (mut session, mut ui) = on_carnet();
+        let (mut session, mut ui) = on_addressbook();
         press(&mut session, &mut ui, &[Key::Char('!'), Key::F(8)]);
 
         let (action, context) = session_actions(&session).last().unwrap().clone();
         assert_eq!(action, "next_card");
         assert_eq!(context.card.as_deref(), Some("3"));
-        assert_eq!(context.dirty["nom"], "Lovelace!");
+        assert_eq!(context.dirty["last_name"], "Lovelace!");
     }
 
     #[test]
     fn enter_in_a_field_runs_the_action_bound_to_enter() {
-        let (mut session, mut ui) = on_carnet();
+        let (mut session, mut ui) = on_addressbook();
         press(&mut session, &mut ui, &[Key::Enter]);
         assert_eq!(session_actions(&session).last().unwrap().0, "save_card");
     }
 
     #[test]
     fn a_key_with_no_binding_says_so() {
-        let (mut session, mut ui) = on_carnet();
+        let (mut session, mut ui) = on_addressbook();
         press(&mut session, &mut ui, &[Key::F(5)]);
         let (lines, _) = render(&session, &ui);
-        assert_eq!(lines[22], " Cette touche n'est pas active sur cet écran.");
+        assert_eq!(lines[22], " This key is not active on this screen.");
     }
 
     #[test]
     fn quitting_goes_through_the_server_like_any_action() {
-        let (mut session, mut ui) = on_carnet();
+        let (mut session, mut ui) = on_addressbook();
         press(&mut session, &mut ui, &[Key::F(3)]);
         assert!(session.should_quit());
     }

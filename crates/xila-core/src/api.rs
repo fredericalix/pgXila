@@ -38,6 +38,25 @@ impl PaletteColour {
     }
 }
 
+/// Answer of `xila.image()`: an indexed image, one byte per pixel, row by
+/// row. Each byte is a palette slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub width: u16,
+    pub height: u16,
+    pub pixels: Vec<u8>,
+}
+
+impl Image {
+    /// The palette slot of a pixel, if it is inside the image.
+    pub fn pixel(&self, x: u16, y: u16) -> Option<u8> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        self.pixels.get(usize::from(y) * usize::from(self.width) + usize::from(x)).copied()
+    }
+}
+
 /// Answer of `xila.open_stack()`: the definition of a screen.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Screen {
@@ -241,7 +260,7 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ApiError {
     /// An error meant for the user (SQLSTATE class `XL`). The message is in
-    /// French and is shown as it is.
+    /// English and is shown as it is.
     #[error("{message}")]
     User { code: String, message: String },
     /// Anything else: a lost connection, a bug.
@@ -275,6 +294,8 @@ impl Notification {
 pub trait Api {
     fn hello(&mut self) -> Result<Hello, ApiError>;
     fn palette(&mut self) -> Result<Vec<PaletteColour>, ApiError>;
+    /// An image by its identifier, or None when there is no such image.
+    fn image(&mut self, id: &str) -> Result<Option<Image>, ApiError>;
     fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError>;
     fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError>;
     fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError>;
@@ -295,23 +316,23 @@ mod tests {
     #[test]
     fn a_screen_is_read_from_the_json_of_the_server() {
         let screen: Screen = serde_json::from_value(serde_json::json!({
-            "stack": { "name": "carnet", "title": "Carnet d'adresses", "kind": "user" },
+            "stack": { "name": "addressbook", "title": "Address book", "kind": "user" },
             "source": { "has_cards": true, "count": 42 },
             "widgets": [
-                { "name": "nom", "kind": "field", "layer": "background", "ord": 20,
-                  "label": "Nom", "column": "nom", "type": "text",
+                { "name": "last_name", "kind": "field", "layer": "background", "ord": 20,
+                  "label": "Last name", "column": "last_name", "type": "text",
                   "props": { "required": true },
                   "layout": { "text": { "x": 20, "y": 4, "w": 30, "h": 1, "style": {} } } },
-                { "name": "suivante", "kind": "button", "layer": "background", "ord": 90,
-                  "label": "Suiv.", "action": "next_card", "props": {}, "layout": {} }
+                { "name": "next", "kind": "button", "layer": "background", "ord": 90,
+                  "label": "Next", "action": "next_card", "props": {}, "layout": {} }
             ],
-            "actions": [ { "name": "next_card", "label": "Suiv." } ],
-            "keys": [ { "key": "F8", "label": "Suiv.", "action": "next_card" } ],
+            "actions": [ { "name": "next_card", "label": "Next" } ],
+            "keys": [ { "key": "F8", "label": "Next", "action": "next_card" } ],
             "colours": []
         }))
         .unwrap();
 
-        assert_eq!(screen.stack.title, "Carnet d'adresses");
+        assert_eq!(screen.stack.title, "Address book");
         assert_eq!(screen.widgets[0].kind, WidgetKind::Field);
         assert_eq!(screen.widgets[0].field_type, Some(FieldType::Text));
         assert_eq!(screen.widgets[0].layout["text"].x, 20);
@@ -329,11 +350,20 @@ mod tests {
     }
 
     #[test]
+    fn an_image_gives_its_pixels_by_position() {
+        let image = Image { width: 3, height: 2, pixels: vec![0, 1, 2, 10, 11, 12] };
+        assert_eq!(image.pixel(0, 0), Some(0));
+        assert_eq!(image.pixel(2, 1), Some(12));
+        assert_eq!(image.pixel(3, 0), None);
+        assert_eq!(image.pixel(0, 2), None);
+    }
+
+    #[test]
     fn effects_are_read_from_their_do_tag() {
         let effects: Vec<Effect> = serde_json::from_value(serde_json::json!([
-            { "do": "show", "stack": "carnet", "card": "42" },
+            { "do": "show", "stack": "addressbook", "card": "42" },
             { "do": "show", "stack": "stacks" },
-            { "do": "message", "text": "Fiche enregistrée." },
+            { "do": "message", "text": "Card saved." },
             { "do": "new" },
             { "do": "quit" }
         ]))
@@ -341,9 +371,9 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::Show { stack: "carnet".into(), card: Some("42".into()) },
+                Effect::Show { stack: "addressbook".into(), card: Some("42".into()) },
                 Effect::Show { stack: "stacks".into(), card: None },
-                Effect::Message { text: "Fiche enregistrée.".into() },
+                Effect::Message { text: "Card saved.".into() },
                 Effect::New,
                 Effect::Quit,
             ]
@@ -354,20 +384,20 @@ mod tests {
     fn the_context_is_sent_as_json() {
         let context = Context {
             card: Some("42".into()),
-            dirty: BTreeMap::from([("ville".to_string(), "Paris".to_string())]),
+            dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
             row: None,
         };
         assert_eq!(
             serde_json::to_value(&context).unwrap(),
-            serde_json::json!({ "card": "42", "dirty": { "ville": "Paris" } })
+            serde_json::json!({ "card": "42", "dirty": { "city": "Paris" } })
         );
     }
 
     #[test]
     fn notifications_are_decoded_by_channel() {
         assert_eq!(
-            Notification::parse("xila_card", r#"{"stack":"carnet","key":"42","op":"update"}"#),
-            Some(Notification::Card { stack: Some("carnet".into()), key: Some("42".into()) })
+            Notification::parse("xila_card", r#"{"stack":"addressbook","key":"42","op":"update"}"#),
+            Some(Notification::Card { stack: Some("addressbook".into()), key: Some("42".into()) })
         );
         assert_eq!(
             Notification::parse("xila_screen", r#"{"stack":null}"#),

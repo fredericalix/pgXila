@@ -50,22 +50,22 @@ CREATE TRIGGER palette_upsert BEFORE INSERT ON xila.palette
     FOR EACH ROW EXECUTE FUNCTION xila.palette_upsert();
 
 INSERT INTO xila.palette (slot, name, rgb) VALUES
-    ( 0, 'noir',      '#14121f'), ( 1, 'nuit',      '#232a4d'),
-    ( 2, 'marine',    '#2f4a8a'), ( 3, 'bleu',      '#3f73c4'),
-    ( 4, 'azur',      '#6fb0e8'), ( 5, 'glacier',   '#bfe3f5'),
-    ( 6, 'crème',     '#f6ecd2'), ( 7, 'blanc',     '#fffdf5'),
-    ( 8, 'sable',     '#e3cf9f'), ( 9, 'ocre',      '#c2a06a'),
-    (10, 'brun',      '#8a6240'), (11, 'chocolat',  '#573a2e'),
-    (12, 'ardoise',   '#3d3f52'), (13, 'gris',      '#6c7086'),
-    (14, 'argent',    '#a4a8b8'), (15, 'perle',     '#d6d8e0'),
-    (16, 'sapin',     '#1f5a48'), (17, 'vert',      '#2f9a5c'),
-    (18, 'prairie',   '#7fd06a'), (19, 'tilleul',   '#c9f0a8'),
-    (20, 'canard',    '#1f8a8f'), (21, 'turquoise', '#4fd0c2'),
-    (22, 'jaune',     '#f7d046'), (23, 'ambre',     '#f0a030'),
-    (24, 'orange',    '#e8703a'), (25, 'rouge',     '#d0414a'),
-    (26, 'bordeaux',  '#8a2846'), (27, 'rose',      '#f08aa0'),
-    (28, 'pêche',     '#f8c8a8'), (29, 'violet',    '#6a4aa8'),
-    (30, 'lavande',   '#a88ae0'), (31, 'prune',     '#3c2452');
+    ( 0, 'black',     '#14121f'), ( 1, 'night',     '#232a4d'),
+    ( 2, 'navy',      '#2f4a8a'), ( 3, 'blue',      '#3f73c4'),
+    ( 4, 'azure',     '#6fb0e8'), ( 5, 'ice',       '#bfe3f5'),
+    ( 6, 'cream',     '#f6ecd2'), ( 7, 'white',     '#fffdf5'),
+    ( 8, 'sand',      '#e3cf9f'), ( 9, 'ochre',     '#c2a06a'),
+    (10, 'brown',     '#8a6240'), (11, 'chocolate', '#573a2e'),
+    (12, 'slate',     '#3d3f52'), (13, 'grey',      '#6c7086'),
+    (14, 'silver',    '#a4a8b8'), (15, 'pearl',     '#d6d8e0'),
+    (16, 'fir',       '#1f5a48'), (17, 'green',     '#2f9a5c'),
+    (18, 'meadow',    '#7fd06a'), (19, 'lime',      '#c9f0a8'),
+    (20, 'teal',      '#1f8a8f'), (21, 'turquoise', '#4fd0c2'),
+    (22, 'yellow',    '#f7d046'), (23, 'amber',     '#f0a030'),
+    (24, 'orange',    '#e8703a'), (25, 'red',       '#d0414a'),
+    (26, 'burgundy',  '#8a2846'), (27, 'pink',      '#f08aa0'),
+    (28, 'peach',     '#f8c8a8'), (29, 'violet',    '#6a4aa8'),
+    (30, 'lavender',  '#a88ae0'), (31, 'plum',      '#3c2452');
 
 -- ---------------------------------------------------------------------------
 -- Images
@@ -306,7 +306,7 @@ BEGIN
 
     source := to_regclass(format('%I.%I', NEW.source_schema, NEW.source_table));
     IF source IS NULL THEN
-        RAISE EXCEPTION 'La table %.% n''existe pas.', NEW.source_schema, NEW.source_table
+        RAISE EXCEPTION 'The table %.% does not exist.', NEW.source_schema, NEW.source_table
             USING ERRCODE = 'XL002';
     END IF;
 
@@ -316,7 +316,7 @@ BEGIN
     WHERE i.indrelid = source AND i.indisprimary;
 
     IF key_cols IS DISTINCT FROM ARRAY[NEW.key_column] THEN
-        RAISE EXCEPTION 'La colonne « % » doit être, à elle seule, la clé primaire de la table %.',
+        RAISE EXCEPTION 'The column “%” must be, on its own, the primary key of the table %.',
             NEW.key_column, source
             USING ERRCODE = 'XL003';
     END IF;
@@ -328,7 +328,7 @@ BEGIN
         WHERE a.attrelid = source AND a.attname = c AND a.attnum > 0 AND NOT a.attisdropped)
     LIMIT 1;
     IF missing IS NOT NULL THEN
-        RAISE EXCEPTION 'La colonne de tri « % » n''existe pas dans la table %.', missing, source
+        RAISE EXCEPTION 'The order column “%” does not exist in the table %.', missing, source
             USING ERRCODE = 'XL003';
     END IF;
 

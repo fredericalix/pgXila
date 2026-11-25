@@ -118,7 +118,7 @@ mod tests {
                 ('Germinal', 'Zola', 1885);
 
             WITH s AS (
-                INSERT INTO xila.stack (name, title) VALUES ('library', 'Bibliothèque')
+                INSERT INTO xila.stack (name, title) VALUES ('library', 'Library')
                 RETURNING id),
             b AS (
                 INSERT INTO xila.background
@@ -127,8 +127,8 @@ mod tests {
             a AS (
                 INSERT INTO xila.action (background_id, name, label, handler)
                 SELECT b.id, v.name, v.label, v.name
-                FROM b, (VALUES ('next_card', 'Suiv.'), ('previous_card', 'Préc.'),
-                                ('save_card', 'Enregistrer'), ('new_card', 'Nouvelle')) v(name, label)
+                FROM b, (VALUES ('next_card', 'Next'), ('previous_card', 'Prev.'),
+                                ('save_card', 'Save'), ('new_card', 'New')) v(name, label)
                 RETURNING id, background_id, name),
             k AS (
                 INSERT INTO xila.key_binding (background_id, key, action_id)
@@ -137,9 +137,9 @@ mod tests {
             SELECT b.id, v.name, v.kind, v.ord, v.label, v.col, v.props::jsonb
             FROM b, (VALUES
                 ('heading', 'text', 10, NULL, NULL, '{"template": "{title} ({position}/{count})"}'),
-                ('title', 'field', 20, 'Titre', 'title', '{}'),
-                ('year', 'field', 30, 'Année', 'year', '{}'),
-                ('bought', 'field', 40, 'Acheté le', 'bought', '{}')
+                ('title', 'field', 20, 'Title', 'title', '{}'),
+                ('year', 'field', 30, 'Year', 'year', '{}'),
+                ('bought', 'field', 40, 'Bought on', 'bought', '{}')
             ) v(name, kind, ord, label, col, props);
             "#,
         )
@@ -172,11 +172,52 @@ mod tests {
         let desktop = json("SELECT xila.open_stack('desktop')");
         assert_eq!(desktop["stack"]["kind"], "system");
         assert_eq!(desktop["source"]["has_cards"], false);
-        assert_eq!(desktop["widgets"][0]["kind"], "button");
-        assert_eq!(desktop["widgets"][0]["action"], "open_stacks");
+        let widgets = desktop["widgets"].as_array().unwrap();
+        let button = widgets.iter().find(|w| w["name"] == "stacks").unwrap();
+        assert_eq!(button["kind"], "button");
+        assert_eq!(button["action"], "open_stacks");
+        assert_eq!(button["layout"]["graphic"]["style"]["variant"], "primary");
+        // The welcome texts belong to the window, not to the text menu.
+        let banner = widgets.iter().find(|w| w["name"] == "banner").unwrap();
+        assert_eq!(banner["layout"]["text"]["style"]["hidden"], true);
 
         let effects = json("SELECT xila.act('desktop', 'open_stacks')");
         assert_eq!(effects, serde_json::json!([{ "do": "show", "stack": "stacks" }]));
+    }
+
+    #[pg_test]
+    fn a_static_screen_can_say_where_and_who_we_are() {
+        let card = json("SELECT xila.card('desktop')");
+        assert_eq!(card["texts"]["banner"], "pgXila");
+        assert_eq!(card["texts"]["instance"], json("SELECT xila.hello()")["instance"]);
+        assert_eq!(
+            card["texts"]["user"].as_str().map(str::to_owned),
+            text("SELECT session_user::text")
+        );
+    }
+
+    #[pg_test]
+    fn an_image_is_read_by_its_identifier() {
+        Spi::run(
+            r"INSERT INTO xila.image (id, width, height, pixels)
+              VALUES ('00000000-0000-7000-8000-000000000001', 3, 2, '\x000102030405')",
+        )
+        .unwrap();
+        let image = json(
+            "SELECT to_jsonb(i) FROM (
+                 SELECT width, height, encode(pixels, 'hex') AS pixels
+                 FROM xila.image('00000000-0000-7000-8000-000000000001')) i",
+        );
+        assert_eq!(image, serde_json::json!({ "width": 3, "height": 2, "pixels": "000102030405" }));
+        assert_eq!(
+            number("SELECT count(*) FROM xila.image('00000000-0000-7000-8000-000000000002')"),
+            0
+        );
+        // The size of an image and its pixels must agree.
+        let (code, _) = error_of_statement(
+            r"INSERT INTO xila.image (width, height, pixels) VALUES (3, 2, '\x0001')",
+        );
+        assert_eq!(code, "23514");
     }
 
     #[pg_test]
@@ -185,8 +226,8 @@ mod tests {
         assert_eq!(
             keys,
             serde_json::json!([
-                { "key": "F3", "label": "Quitter", "action": "quit" },
-                { "key": "F12", "label": "Retour", "action": "back" }
+                { "key": "F3", "label": "Quit", "action": "quit" },
+                { "key": "F12", "label": "Back", "action": "back" }
             ])
         );
         assert_eq!(
@@ -199,14 +240,14 @@ mod tests {
     fn an_unknown_stack_is_a_user_error() {
         let (state, message) = error_of("SELECT xila.open_stack('nowhere')");
         assert_eq!(state, "XL002");
-        assert_eq!(message, "La pile « nowhere » n'existe pas.");
+        assert_eq!(message, "The stack “nowhere” does not exist.");
     }
 
     #[pg_test]
     fn a_screen_describes_its_widgets_and_field_types() {
         create_library_stack();
         let screen = json("SELECT xila.open_stack('library')");
-        assert_eq!(screen["stack"]["title"], "Bibliothèque");
+        assert_eq!(screen["stack"]["title"], "Library");
         assert_eq!(screen["source"], serde_json::json!({ "has_cards": true, "count": 3 }));
 
         let widgets = screen["widgets"].as_array().unwrap();
@@ -280,12 +321,12 @@ mod tests {
             r#"SELECT xila.save_card('library', '{key}', '{{"year": "soon"}}')"#
         ));
         assert_eq!(state, "XL003");
-        assert_eq!(message, "La valeur « soon » n'est pas valide pour le champ « year ».");
+        assert_eq!(message, "The value “soon” is not valid for the field “year”.");
 
         let (state, message) =
             error_of(&format!(r#"SELECT xila.save_card('library', '{key}', '{{"title": null}}')"#));
         assert_eq!(state, "XL003");
-        assert_eq!(message, "Le champ « title » est obligatoire.");
+        assert_eq!(message, "The field “title” is required.");
     }
 
     #[pg_test]
@@ -382,7 +423,7 @@ mod tests {
             "INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
              SELECT id, 'public', 'pairs', 'a' FROM xila.stack WHERE name = 'pairs'",
         );
-        assert!(message.contains("clé primaire"), "{message}");
+        assert!(message.contains("primary key"), "{message}");
         assert_eq!(state, "XL003");
     }
 
@@ -394,7 +435,7 @@ mod tests {
         assert_eq!(rows["rows"][0]["key"], "library");
         assert_eq!(
             rows["rows"][0]["cells"],
-            serde_json::json!({ "title": "Bibliothèque", "cards": "3" })
+            serde_json::json!({ "title": "Library", "cards": "3" })
         );
 
         let effects = json(r#"SELECT xila.act('stacks', 'open', '{"row": "library"}')"#);
