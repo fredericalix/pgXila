@@ -51,7 +51,13 @@ impl Server {
             }
         });
 
-        runtime.block_on(client.batch_execute("LISTEN xila_card; LISTEN xila_screen"))?;
+        // The server writes the times it shows, such as those of the history
+        // of a stack, in the time zone of the session: use the local one.
+        let offset = chrono::Local::now().offset().local_minus_utc();
+        runtime.block_on(client.batch_execute(&format!(
+            "LISTEN xila_card; LISTEN xila_screen; {}",
+            set_time_zone(offset)
+        )))?;
         Ok(Server { runtime, client, notifications })
     }
 
@@ -66,6 +72,14 @@ impl Server {
         serde_json::from_value(value)
             .map_err(|error| ApiError::Other(format!("unexpected answer from the server: {error}")))
     }
+}
+
+/// The statement that sets the time zone of a session to an offset from UTC,
+/// given in seconds.
+fn set_time_zone(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let minutes = offset_seconds.abs() / 60;
+    format!("SET TIME ZONE INTERVAL '{sign}{:02}:{:02}' HOUR TO MINUTE", minutes / 60, minutes % 60)
 }
 
 /// Errors of SQLSTATE class XL are written for the user; the rest is not.
@@ -122,8 +136,13 @@ impl Api for Server {
         self.call("SELECT xila.card($1, $2, $3)", &[&stack, &key, &to.as_str()])
     }
 
-    fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
-        self.call("SELECT xila.grid_rows($1, $2)", &[&stack, &widget])
+    fn grid_rows(
+        &mut self,
+        stack: &str,
+        widget: &str,
+        card: Option<&str>,
+    ) -> Result<GridPage, ApiError> {
+        self.call("SELECT xila.grid_rows($1, $2, 0, 100, $3)", &[&stack, &widget, &card])
     }
 
     fn act(
@@ -137,5 +156,17 @@ impl Api for Server {
 
     fn notifications(&mut self) -> Vec<Notification> {
         self.notifications.try_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_time_zone_is_set_from_the_local_offset() {
+        assert_eq!(set_time_zone(3600), "SET TIME ZONE INTERVAL '+01:00' HOUR TO MINUTE");
+        assert_eq!(set_time_zone(-12_600), "SET TIME ZONE INTERVAL '-03:30' HOUR TO MINUTE");
+        assert_eq!(set_time_zone(0), "SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE");
     }
 }

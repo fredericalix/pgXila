@@ -103,7 +103,8 @@ CREATE TABLE xila.stack_colour (
 
 -- The screen shared by all the cards of a stack. The cards are the rows of
 -- the source table. Without a source table, the background is a static screen
--- with a single card.
+-- with a single card. The source may also be a view: its cards are then shown
+-- but never saved.
 CREATE TABLE xila.background (
     id            uuid PRIMARY KEY DEFAULT uuidv7(),
     stack_id      uuid NOT NULL UNIQUE REFERENCES xila.stack ON DELETE CASCADE,
@@ -111,6 +112,8 @@ CREATE TABLE xila.background (
     source_table  name,
     key_column    name,
     order_columns name[] NOT NULL DEFAULT '{}',
+    -- True when pgXila created the table and may therefore alter it.
+    managed       boolean NOT NULL DEFAULT false,
     CHECK ((source_schema IS NULL) = (source_table IS NULL)),
     CHECK ((source_table IS NULL) = (key_column IS NULL))
 );
@@ -124,7 +127,10 @@ CREATE TABLE xila.action (
     label         text NOT NULL,
     handler       text NOT NULL CHECK (handler IN (
                       'open_stack', 'next_card', 'previous_card', 'first_card',
-                      'last_card', 'save_card', 'new_card', 'back', 'quit')),
+                      'last_card', 'save_card', 'new_card', 'delete_card', 'back', 'quit',
+                      'author', 'browse', 'new_stack', 'create_stack', 'save_stack',
+                      'delete_stack', 'new_field', 'edit_field', 'save_field',
+                      'remove_field', 'move_field', 'history', 'rewind')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );
@@ -208,19 +214,43 @@ LANGUAGE sql STABLE AS $$
             OR coalesce(current_setting('xila.restoring', true), '') = 'on')
 $$;
 
--- Finds the stack a definition row belongs to.
+-- Finds the stack a definition row belongs to. When a stack is deleted, its
+-- rows go with it, parents first: the parent of a row may be gone by the time
+-- the deletion of the row is recorded. History still knows where it was.
 CREATE FUNCTION xila.stack_of(kind text, r jsonb) RETURNS uuid
-LANGUAGE sql STABLE AS $$
-    SELECT CASE kind
-        WHEN 'stack' THEN (r->>'id')::uuid
-        WHEN 'background' THEN (r->>'stack_id')::uuid
-        WHEN 'stack_colour' THEN (r->>'stack_id')::uuid
-        WHEN 'layout' THEN (
-            SELECT b.stack_id
-            FROM xila.widget w JOIN xila.background b ON b.id = w.background_id
-            WHERE w.id = (r->>'widget_id')::uuid)
-        ELSE (SELECT b.stack_id FROM xila.background b WHERE b.id = (r->>'background_id')::uuid)
-    END
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    result      uuid;
+    parent_kind text;
+    parent_key  text;
+BEGIN
+    IF kind = 'stack' THEN
+        RETURN (r->>'id')::uuid;
+    ELSIF kind IN ('background', 'stack_colour') THEN
+        RETURN (r->>'stack_id')::uuid;
+    ELSIF kind = 'palette' THEN
+        RETURN NULL;
+    ELSIF kind = 'layout' THEN
+        parent_kind := 'widget';
+        parent_key := r->>'widget_id';
+        SELECT b.stack_id INTO result
+        FROM xila.widget w JOIN xila.background b ON b.id = w.background_id
+        WHERE w.id = parent_key::uuid;
+    ELSE
+        parent_kind := 'background';
+        parent_key := r->>'background_id';
+        SELECT b.stack_id INTO result FROM xila.background b WHERE b.id = parent_key::uuid;
+    END IF;
+
+    IF result IS NULL AND parent_key IS NOT NULL THEN
+        SELECT h.stack_id INTO result
+        FROM xila.history h
+        WHERE h.object_kind = parent_kind AND h.object_key = parent_key
+        ORDER BY h.id DESC
+        LIMIT 1;
+    END IF;
+    RETURN result;
+END
 $$;
 
 -- Records a change to a definition table and tells the clients about it.
@@ -290,12 +320,14 @@ BEGIN
 END
 $$;
 
--- Checks the source table of a background and installs the card trigger on
--- it. Runs with the privileges of the caller, who must own the table.
+-- Checks the source of a background and, for a table, installs the card
+-- trigger on it. Runs with the privileges of the caller, who must own the
+-- table. A view is accepted as it is: its cards are read-only.
 CREATE FUNCTION xila.attach_source() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     source   regclass;
+    kind     "char";
     key_cols name[];
     missing  name;
 BEGIN
@@ -309,6 +341,25 @@ BEGIN
         RAISE EXCEPTION 'The table %.% does not exist.', NEW.source_schema, NEW.source_table
             USING ERRCODE = 'XL002';
     END IF;
+    SELECT c.relkind INTO kind FROM pg_class c WHERE c.oid = source;
+
+    SELECT c INTO missing
+    FROM unnest(NEW.order_columns || NEW.key_column) AS c
+    WHERE NOT EXISTS (
+        SELECT FROM pg_attribute a
+        WHERE a.attrelid = source AND a.attname = c AND a.attnum > 0 AND NOT a.attisdropped)
+    LIMIT 1;
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION 'The column “%” does not exist in the table %.', missing, source
+            USING ERRCODE = 'XL003';
+    END IF;
+
+    IF kind IN ('v', 'm') THEN
+        IF NEW.managed THEN
+            RAISE EXCEPTION 'A view cannot be managed by pgXila.' USING ERRCODE = 'XL003';
+        END IF;
+        RETURN NEW;
+    END IF;
 
     SELECT array_agg(a.attname) INTO key_cols
     FROM pg_index i
@@ -318,17 +369,6 @@ BEGIN
     IF key_cols IS DISTINCT FROM ARRAY[NEW.key_column] THEN
         RAISE EXCEPTION 'The column “%” must be, on its own, the primary key of the table %.',
             NEW.key_column, source
-            USING ERRCODE = 'XL003';
-    END IF;
-
-    SELECT c INTO missing
-    FROM unnest(NEW.order_columns) AS c
-    WHERE NOT EXISTS (
-        SELECT FROM pg_attribute a
-        WHERE a.attrelid = source AND a.attname = c AND a.attnum > 0 AND NOT a.attisdropped)
-    LIMIT 1;
-    IF missing IS NOT NULL THEN
-        RAISE EXCEPTION 'The order column “%” does not exist in the table %.', missing, source
             USING ERRCODE = 'XL003';
     END IF;
 
@@ -347,17 +387,182 @@ CREATE TRIGGER attach_source
     ON xila.background
     FOR EACH ROW EXECUTE FUNCTION xila.attach_source();
 
+-- When a background goes away, its table stops being a stack: the card
+-- trigger is removed. The table and its rows stay.
+CREATE FUNCTION xila.detach_source() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    source regclass;
+BEGIN
+    IF OLD.source_table IS NULL OR xila.restoring() THEN
+        RETURN NULL;
+    END IF;
+    source := to_regclass(format('%I.%I', OLD.source_schema, OLD.source_table));
+    IF source IS NOT NULL THEN
+        BEGIN
+            EXECUTE format('DROP TRIGGER IF EXISTS xila_card ON %s', source);
+        EXCEPTION WHEN insufficient_privilege THEN
+            NULL;  -- not our table: its owner removes the trigger
+        END;
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER detach_source AFTER DELETE ON xila.background
+    FOR EACH ROW EXECUTE FUNCTION xila.detach_source();
+
+-- ---------------------------------------------------------------------------
+-- Ownership
+-- ---------------------------------------------------------------------------
+-- A stack belongs to a role. Its definition may be changed by that role and
+-- by its members, and by nobody else. System stacks, and the actions and keys
+-- shared by every screen, can only be changed by a superuser. Row-level
+-- security enforces this on the tables themselves, so it also holds for
+-- someone who writes the rows in SQL. Everyone may read every definition.
+
+-- True when the current role is, or is a member of, the given role.
+CREATE FUNCTION xila.is_mine(owner name) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM pg_catalog.pg_roles r
+        WHERE r.rolname = owner AND pg_has_role(r.oid, 'USAGE'))
+$$;
+
+CREATE FUNCTION xila.may_edit(stack uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM xila.stack s
+        WHERE s.id = stack AND s.kind = 'user' AND xila.is_mine(s.owner))
+$$;
+
+CREATE FUNCTION xila.may_edit_background(background uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM xila.background b WHERE b.id = background AND xila.may_edit(b.stack_id))
+$$;
+
+CREATE FUNCTION xila.may_edit_widget(widget uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM xila.widget w
+        WHERE w.id = widget AND xila.may_edit_background(w.background_id))
+$$;
+
+ALTER TABLE xila.stack ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.stack FOR SELECT USING (true);
+CREATE POLICY edit ON xila.stack
+    USING (kind = 'user' AND xila.is_mine(owner))
+    WITH CHECK (kind = 'user' AND xila.is_mine(owner));
+
+ALTER TABLE xila.stack_colour ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.stack_colour FOR SELECT USING (true);
+CREATE POLICY edit ON xila.stack_colour
+    USING (xila.may_edit(stack_id)) WITH CHECK (xila.may_edit(stack_id));
+
+ALTER TABLE xila.background ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.background FOR SELECT USING (true);
+CREATE POLICY edit ON xila.background
+    USING (xila.may_edit(stack_id)) WITH CHECK (xila.may_edit(stack_id));
+
+ALTER TABLE xila.action ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.action FOR SELECT USING (true);
+CREATE POLICY edit ON xila.action
+    USING (xila.may_edit_background(background_id))
+    WITH CHECK (xila.may_edit_background(background_id));
+
+ALTER TABLE xila.widget ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.widget FOR SELECT USING (true);
+CREATE POLICY edit ON xila.widget
+    USING (xila.may_edit_background(background_id))
+    WITH CHECK (xila.may_edit_background(background_id));
+
+ALTER TABLE xila.key_binding ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.key_binding FOR SELECT USING (true);
+CREATE POLICY edit ON xila.key_binding
+    USING (xila.may_edit_background(background_id))
+    WITH CHECK (xila.may_edit_background(background_id));
+
+ALTER TABLE xila.layout ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.layout FOR SELECT USING (true);
+CREATE POLICY edit ON xila.layout
+    USING (xila.may_edit_widget(widget_id)) WITH CHECK (xila.may_edit_widget(widget_id));
+
+-- ---------------------------------------------------------------------------
+-- Who may read history
+-- ---------------------------------------------------------------------------
+-- The owner a stack had when it was deleted. SECURITY DEFINER: it is used by
+-- the policy of xila.history, which could not read xila.history itself.
+CREATE FUNCTION xila.last_owner(stack uuid) RETURNS name
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+    SELECT (h.before->>'owner')::name
+    FROM xila.history h
+    WHERE h.stack_id = stack AND h.object_kind = 'stack' AND h.op = 'delete'
+    ORDER BY h.id DESC
+    LIMIT 1
+$$;
+
+-- True when the current role may change the stack, or could when the stack
+-- was deleted.
+CREATE FUNCTION xila.may_rewind(stack uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN EXISTS (SELECT FROM xila.stack s WHERE s.id = stack)
+                THEN xila.may_edit(stack)
+                ELSE coalesce(xila.is_mine(xila.last_owner(stack)), false) END
+$$;
+
+-- History holds old versions of cards, so reading it follows the table:
+--   * changes to a definition: whoever may open the stack;
+--   * changes to cards, and the values of a dropped column: whoever may read
+--     the whole table. When the table uses row-level security, only those who
+--     may edit the stack, so that history never shows a row the table hides.
+CREATE FUNCTION xila.may_read_history(stack uuid, kind text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT CASE
+        WHEN stack IS NULL THEN true
+        WHEN xila.may_rewind(stack) THEN true
+        ELSE coalesce((
+            SELECT CASE
+                WHEN b.source_table IS NULL THEN kind NOT IN ('card', 'column')
+                WHEN NOT has_table_privilege(c.oid, 'SELECT') THEN false
+                ELSE kind NOT IN ('card', 'column') OR NOT c.relrowsecurity
+            END
+            FROM xila.background b
+            LEFT JOIN pg_catalog.pg_class c
+                   ON c.oid = to_regclass(format('%I.%I', b.source_schema, b.source_table))
+            WHERE b.stack_id = stack), false)
+    END
+$$;
+
+ALTER TABLE xila.history ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.history FOR SELECT
+    USING (xila.may_read_history(stack_id, object_kind));
+-- The triggers write history as its owner. The author functions add two kinds
+-- of rows themselves: what they did to the columns of a table, and the mark
+-- that a rewind leaves.
+CREATE POLICY note ON xila.history FOR INSERT
+    WITH CHECK (actor = session_user
+                AND CASE object_kind
+                        WHEN 'column' THEN xila.may_edit(stack_id)
+                        WHEN 'rewind' THEN xila.may_read_history(stack_id, 'card')
+                        ELSE false
+                    END);
+
 -- ---------------------------------------------------------------------------
 -- Privileges
 -- ---------------------------------------------------------------------------
 -- Users read the definitions through the API functions, which run with their
--- own privileges. Authors write them. Nobody writes history directly.
+-- own privileges. Authors write them, within the ownership rules above.
+-- History is read and written within its own policies.
 GRANT USAGE ON SCHEMA xila TO xila_user;
 GRANT SELECT ON xila.palette, xila.image, xila.stack, xila.stack_colour, xila.background,
     xila.action, xila.widget, xila.layout, xila.key_binding TO xila_user;
 GRANT INSERT, UPDATE, DELETE ON xila.image, xila.stack, xila.stack_colour, xila.background,
     xila.action, xila.widget, xila.layout, xila.key_binding TO xila_author;
 GRANT UPDATE ON xila.palette TO xila_author;
+GRANT SELECT ON xila.history TO xila_user;
+GRANT INSERT (origin, stack_id, object_kind, object_key, op, before, after)
+    ON xila.history TO xila_user;
 
 -- ---------------------------------------------------------------------------
 -- Backups

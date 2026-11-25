@@ -25,6 +25,7 @@ pub fn key_from_event(event: KeyEvent) -> Option<Key> {
         KeyCode::End => Key::End,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Delete => Key::Delete,
+        KeyCode::Esc => Key::Escape,
         _ => return None,
     })
 }

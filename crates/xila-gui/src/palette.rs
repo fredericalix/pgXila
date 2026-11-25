@@ -22,6 +22,7 @@ pub mod slot {
     pub const GREY: u8 = 13;
     pub const SILVER: u8 = 14;
     pub const PEARL: u8 = 15;
+    pub const FERN: u8 = 17;
     pub const GREEN: u8 = 18;
     pub const TURQUOISE: u8 = 21;
     pub const YELLOW: u8 = 22;

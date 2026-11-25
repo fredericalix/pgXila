@@ -25,6 +25,14 @@ const SHADOW: i32 = 3;
 
 pub const BUTTON_HEIGHT: i32 = 15;
 pub const FIELD_HEIGHT: i32 = 14;
+/// Width of the arrow of a field that only takes some values.
+const CHOICE_ARROW: i32 = 13;
+/// Side of the square of a check box.
+const CHECK_SIZE: i32 = 12;
+/// Space between two keys of the function key bar, and the least it shrinks
+/// to on a screen with many keys.
+const KEY_GAP: i32 = 14;
+const KEY_GAP_MIN: i32 = 5;
 
 fn key(slots: &[(char, u8)]) -> Vec<(char, u8)> {
     slots.to_vec()
@@ -119,15 +127,30 @@ pub fn key_slots<'a>(
     fonts: &Fonts,
     keys: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Vec<(&'a str, &'a str, Rect)> {
+    let keys: Vec<(&str, &str, i32)> = keys
+        .map(|(name, label)| (name, label, fonts.bold.width(name) + 3 + fonts.regular.width(label)))
+        .collect();
+
+    // The keys stand 14 pixels apart; a screen with many keys brings them
+    // closer so that they all fit.
+    let room = WIDTH - 13;
+    let taken: i32 = keys.iter().map(|(_, _, width)| width).sum();
+    let between = keys.len().saturating_sub(1).max(1) as i32;
+    let gap = ((room - taken) / between).clamp(KEY_GAP_MIN, KEY_GAP);
+
     let mut slots = Vec::new();
     let mut x = 9;
-    for (name, label) in keys {
-        let width = fonts.bold.width(name) + 3 + fonts.regular.width(label);
+    for (name, label, width) in keys {
         if x + width > WIDTH - 4 {
             break;
         }
-        slots.push((name, label, Rect::new(x - 3, KEYS_TOP, width + 6, HEIGHT - KEYS_TOP)));
-        x += width + 14;
+        let margin = gap.min(6) / 2;
+        slots.push((
+            name,
+            label,
+            Rect::new(x - margin, KEYS_TOP, width + 2 * margin, HEIGHT - KEYS_TOP),
+        ));
+        x += width + gap;
     }
     slots
 }
@@ -140,7 +163,8 @@ pub fn draw_key_bar<'a>(
 ) {
     frame.fill(Rect::new(0, KEYS_TOP, WIDTH, HEIGHT - KEYS_TOP), slot::INK);
     for (name, label, area) in key_slots(fonts, keys) {
-        let x = fonts.bold.draw(frame, area.x + 3, KEYS_TOP + 11, name, slot::YELLOW);
+        let start = area.x + (area.w - fonts.bold.width(name) - 3 - fonts.regular.width(label)) / 2;
+        let x = fonts.bold.draw(frame, start, KEYS_TOP + 11, name, slot::YELLOW);
         fonts.regular.draw(frame, x + 3, KEYS_TOP + 11, label, slot::CREAM);
     }
 }
@@ -369,6 +393,65 @@ pub fn draw_field(
         frame.vline(x - 1, area.y + 3, 9, slot::INK);
     }
     frame.set_clip(previous);
+}
+
+/// A field that only takes some values: the one it has, and an arrow on the
+/// right that says there are others.
+pub fn draw_choice(frame: &mut Frame, fonts: &Fonts, area: Rect, text: &str, focused: bool) {
+    if focused {
+        frame.outline(area.inset(-1), slot::BLUE);
+    }
+    frame.fill(area, slot::WHITE);
+    frame.outline(area, slot::INK);
+    frame.hline(area.x + 1, area.y + 1, area.w - 2, slot::PEARL);
+
+    let arrow = Rect::new(area.right() - CHOICE_ARROW, area.y, CHOICE_ARROW, area.h);
+    frame.fill(arrow.inset(1), slot::PEARL);
+    frame.vline(arrow.x, arrow.y, arrow.h, slot::INK);
+    let down = Sprite::from_art(&["#######", ".#####.", "..###..", "...#..."], &[('#', slot::INK)]);
+    frame.sprite(&down, arrow.x + 3, arrow.y + 5);
+
+    let previous =
+        frame.clip_to(Rect::new(area.x + 2, area.y + 2, area.w - CHOICE_ARROW - 3, area.h - 4));
+    fonts.regular.draw(frame, area.x + FIELD_TEXT_X, area.y + 11, text, slot::INK);
+    frame.set_clip(previous);
+}
+
+/// The square of a check box, in the rectangle of its field.
+pub fn check_box_of(area: Rect) -> Rect {
+    Rect::new(area.x, area.y + 1, CHECK_SIZE, CHECK_SIZE)
+}
+
+/// A yes-or-no field: a box, ticked for yes.
+pub fn draw_check(frame: &mut Frame, area: Rect, checked: bool, focused: bool) {
+    let square = check_box_of(area);
+    if focused {
+        frame.outline(square.inset(-1), slot::BLUE);
+    }
+    frame.fill(square, slot::WHITE);
+    frame.outline(square, slot::INK);
+    if checked {
+        let tick = Sprite::from_art(
+            &["......#", ".....##", "#...##.", "##.##..", ".###...", "..#...."],
+            &[('#', slot::FERN)],
+        );
+        frame.sprite(&tick, square.x + 2, square.y + 3);
+    }
+}
+
+/// Cuts a text into lines no wider than `width` pixels, between words.
+pub fn wrap(fonts: &Fonts, text: &str, width: i32) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if fonts.regular.width(&format!("{line} {word}")) <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines
 }
 
 /// The character position a click falls on in a field: the gap between two

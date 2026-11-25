@@ -18,6 +18,8 @@ pub enum Key {
     End,
     Backspace,
     Delete,
+    /// Give up what is being asked: a question, a menu.
+    Escape,
     Char(char),
     /// Leave at once: Ctrl-C in a terminal.
     Interrupt,

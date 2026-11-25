@@ -13,7 +13,7 @@
 //!
 //! All coordinates are relative to the content area of the window.
 
-use xila_core::api::{Placement, Screen, Widget, WidgetKind};
+use xila_core::api::{FieldType, Placement, Screen, Widget, WidgetKind};
 
 use crate::chrome::{button_width, Arrow, ButtonLook, BUTTON_HEIGHT, FIELD_HEIGHT};
 use crate::font::Fonts;
@@ -24,8 +24,13 @@ pub const RENDERER: &str = "graphic";
 
 /// Width of the content of a window that shows cards, as in the mockups.
 const CARD_WIDTH: i32 = 406;
-/// Width of the content of a static screen.
+/// Width of the content of a static screen or of a dialog, and of one whose
+/// list has more than two columns.
 const STATIC_WIDTH: i32 = 260;
+const WIDE_STATIC_WIDTH: i32 = 400;
+/// The tallest content a dialog can have while its window stays clear of the
+/// strip where messages are shown.
+const MAX_HEIGHT: i32 = 221;
 /// Space between the frame of the window and what it contains.
 const MARGIN: i32 = 7;
 /// Distance between two fields, top to top.
@@ -36,6 +41,7 @@ const BANNER_HEIGHT: i32 = 44;
 /// Size of a picture when nothing says otherwise: a portrait.
 const PICTURE: (i32, i32) = (70, 82);
 const GRID_ROWS: i32 = 10;
+const GRID_ROWS_MIN: i32 = 3;
 pub const GRID_HEADER: i32 = 13;
 pub const GRID_ROW: i32 = 12;
 const BUTTON_GAP: i32 = 5;
@@ -58,6 +64,7 @@ pub enum Part {
     Field {
         column: String,
         label: String,
+        kind: FieldKind,
     },
     Picture,
     Grid,
@@ -65,6 +72,35 @@ pub enum Part {
         label: String,
         look: ButtonLook,
     },
+}
+
+/// How a field is edited and drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// A line of text.
+    Text,
+    /// One of a few values, chosen by going through them.
+    Choice,
+    /// Yes or no: a check box.
+    Check,
+}
+
+fn field_kind(widget: &Widget) -> FieldKind {
+    if widget.props.contains_key("choices") {
+        FieldKind::Choice
+    } else if widget.field_type == Some(FieldType::Boolean) {
+        FieldKind::Check
+    } else {
+        FieldKind::Text
+    }
+}
+
+fn field_part(widget: &Widget) -> Part {
+    Part::Field {
+        column: widget.column.clone().unwrap_or_default(),
+        label: label(widget),
+        kind: field_kind(widget),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +181,8 @@ pub fn layout(screen: &Screen, card_widgets: &[Widget], fonts: &Fonts) -> Graphi
     let (placed, flowing): (Vec<&Widget>, Vec<&Widget>) =
         widgets.into_iter().partition(|w| fixed(w).is_some());
 
-    let mut layout = if screen.source.has_cards {
+    // The screens of the system are dialogs, even when they show a card.
+    let mut layout = if screen.source.has_cards && !screen.stack.is_system() {
         card_layout(&flowing, fonts)
     } else {
         static_layout(&flowing, fonts)
@@ -172,7 +209,10 @@ pub fn layout(screen: &Screen, card_widgets: &[Widget], fonts: &Fonts) -> Graphi
 /// What a widget with its own rectangle is drawn as.
 fn part_of(widget: &Widget, fonts: &Fonts) -> Option<Part> {
     Some(match widget.kind {
-        WidgetKind::Field => Part::Field { column: widget.column.clone()?, label: label(widget) },
+        WidgetKind::Field => {
+            widget.column.as_ref()?;
+            field_part(widget)
+        }
         WidgetKind::Text if text_style(widget) == Some("title") => Part::Title,
         WidgetKind::Text => match &widget.label {
             Some(label) => {
@@ -273,10 +313,7 @@ fn card_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
                 layout.items.push(Item {
                     widget: widget.name.clone(),
                     area: Rect::new(field_x, y, inside_right - field_x, FIELD_HEIGHT),
-                    part: Part::Field {
-                        column: widget.column.clone().unwrap_or_default(),
-                        label: label(widget),
-                    },
+                    part: field_part(widget),
                 });
                 y += FIELD_PITCH;
             }
@@ -323,11 +360,19 @@ fn card_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
     layout
 }
 
-/// A static screen: a banner, lines of text, a list, and buttons.
+/// The number of columns of a list.
+fn grid_columns(widget: &Widget) -> usize {
+    widget.props.get("columns").and_then(|v| v.as_array()).map_or(0, Vec::len)
+}
+
+/// A static screen or a dialog: a banner, lines of text, fields, a list, and
+/// buttons.
 fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
-    let mut layout = GraphicLayout { width: STATIC_WIDTH, ..GraphicLayout::default() };
+    let wide = widgets.iter().any(|w| w.kind == WidgetKind::Grid && grid_columns(w) > 2);
+    let width = if wide { WIDE_STATIC_WIDTH } else { STATIC_WIDTH };
+    let mut layout = GraphicLayout { width, ..GraphicLayout::default() };
     let left = 14;
-    let right = STATIC_WIDTH - 14;
+    let right = width - 14;
     let mut y = 0;
 
     let title =
@@ -337,7 +382,7 @@ fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
     if let Some(title) = title {
         layout.items.push(Item {
             widget: title.name.clone(),
-            area: Rect::new(0, 0, STATIC_WIDTH, BANNER_HEIGHT + 1),
+            area: Rect::new(0, 0, width, BANNER_HEIGHT + 1),
             part: Part::Banner { subtitle: subtitle.map(|w| w.name.clone()) },
         });
         y = BANNER_HEIGHT + 1;
@@ -376,24 +421,45 @@ fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
         y += 4;
     }
 
-    for widget in widgets.iter().filter(|w| w.kind == WidgetKind::Field && w.column.is_some()) {
-        let field_x = left + fonts.regular.width(&label(widget)) + 5;
+    // The fields, in a column, their labels lined up on the right.
+    let fields: Vec<&&Widget> =
+        widgets.iter().filter(|w| w.kind == WidgetKind::Field && w.column.is_some()).collect();
+    let field_x =
+        left + fields.iter().map(|w| fonts.regular.width(&label(w))).max().unwrap_or(0) + 5;
+    for widget in &fields {
         layout.items.push(Item {
             widget: widget.name.clone(),
             area: Rect::new(field_x, y, right - field_x, FIELD_HEIGHT),
-            part: Part::Field {
-                column: widget.column.clone().unwrap_or_default(),
-                label: label(widget),
-            },
+            part: field_part(widget),
         });
         y += FIELD_PITCH;
     }
+    if !fields.is_empty() {
+        y += 3;
+    }
 
-    for widget in widgets.iter().filter(|w| w.kind == WidgetKind::Grid) {
-        let height = GRID_HEADER + GRID_ROWS * GRID_ROW + 2;
+    let buttons: Vec<&Widget> =
+        widgets.iter().filter(|w| w.kind == WidgetKind::Button).copied().collect();
+    // Buttons share the width when there are several, up to a point.
+    let count = buttons.len().max(1) as i32;
+    let minimum = ((right - left - (count - 1) * BUTTON_GAP) / count).clamp(62, 96);
+    let buttons_height = if buttons.is_empty() {
+        0
+    } else {
+        button_rows(&buttons, fonts, left, 0, right, minimum, &mut Vec::new()) + 14
+    };
+
+    // A list takes the room that is left, within reason.
+    let grids: Vec<&&Widget> = widgets.iter().filter(|w| w.kind == WidgetKind::Grid).collect();
+    let has_picture = widgets.iter().any(|w| w.kind == WidgetKind::Image);
+    for widget in &grids {
+        let fixed = GRID_HEADER + 2 + 9;
+        let room = MAX_HEIGHT - y - buttons_height - if has_picture { PICTURE.1 + 9 } else { 0 };
+        let rows = ((room / grids.len() as i32 - fixed) / GRID_ROW).clamp(GRID_ROWS_MIN, GRID_ROWS);
+        let height = GRID_HEADER + rows * GRID_ROW + 2;
         layout.items.push(Item {
             widget: widget.name.clone(),
-            area: Rect::new(MARGIN, y, STATIC_WIDTH - 2 * MARGIN, height),
+            area: Rect::new(MARGIN, y, width - 2 * MARGIN, height),
             part: Part::Grid,
         });
         y += height + 9;
@@ -405,12 +471,10 @@ fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
         y = area.bottom() + 9;
     }
 
-    let buttons: Vec<&Widget> =
-        widgets.iter().filter(|w| w.kind == WidgetKind::Button).copied().collect();
     layout.height = if buttons.is_empty() {
         y
     } else {
-        button_rows(&buttons, fonts, left, y, right, 96, &mut layout.items) + 14
+        button_rows(&buttons, fonts, left, y, right, minimum, &mut layout.items) + 14
     };
     layout
 }

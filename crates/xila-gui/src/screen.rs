@@ -6,15 +6,16 @@
 
 use xila_core::api::{Api, Widget};
 use xila_core::input::{edit_line, Key};
-use xila_core::session::{GridState, Session, View};
+use xila_core::session::{GridState, Question, Session, View};
 
 use crate::chrome::{
-    self, close_box_of, content_of, draw_button, draw_field, draw_paper, draw_window,
-    field_cursor_at, field_scroll, window_around, ButtonLook, WindowStyle,
+    self, button_width, close_box_of, content_of, draw_button, draw_check, draw_choice, draw_field,
+    draw_paper, draw_window, field_cursor_at, field_scroll, window_around, wrap, ButtonLook,
+    WindowStyle, BUTTON_HEIGHT,
 };
 use crate::font::Fonts;
 use crate::frame::{Frame, Rect};
-use crate::layout::{self, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW};
+use crate::layout::{self, FieldKind, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW};
 use crate::palette::slot;
 
 /// Longest text a field accepts when its widget sets no limit.
@@ -81,11 +82,62 @@ fn max_length(view: &View, name: &str) -> usize {
         .map_or(DEFAULT_MAX_LENGTH, |n| n as usize)
 }
 
-fn column_of(layout: &GraphicLayout, name: &str) -> Option<String> {
+/// The column of a field in which text is typed, as opposed to one whose
+/// value is chosen.
+fn typed_column_of(layout: &GraphicLayout, name: &str) -> Option<String> {
     match &layout.item(name)?.part {
-        Part::Field { column, .. } => Some(column.clone()),
+        Part::Field { column, kind: FieldKind::Text, .. } => Some(column.clone()),
         _ => None,
     }
+}
+
+/// A question is asked in a small window of its own, over the screen.
+struct QuestionBox {
+    window: Rect,
+    lines: Vec<String>,
+    /// Where the text starts.
+    text: (i32, i32),
+    cancel: Rect,
+    accept: Rect,
+}
+
+const QUESTION_WIDTH: i32 = 250;
+const QUESTION_LINE: i32 = 12;
+
+impl QuestionBox {
+    fn of(question: &Question, fonts: &Fonts) -> Self {
+        let lines = wrap(fonts, &question.text, QUESTION_WIDTH - 28);
+        let text_height = lines.len() as i32 * QUESTION_LINE;
+        let height = 12 + text_height + 10 + BUTTON_HEIGHT + 10;
+        let window = window_around(QUESTION_WIDTH, height);
+        let content = content_of(window);
+
+        let look = ButtonLook { primary: true, ..ButtonLook::default() };
+        let accept_width = button_width(fonts, &question.label, look).max(70);
+        let buttons_y = content.y + 12 + text_height + 10;
+        let accept =
+            Rect::new(content.right() - 14 - accept_width, buttons_y, accept_width, BUTTON_HEIGHT);
+        let cancel = Rect::new(accept.x - 5 - 70, buttons_y, 70, BUTTON_HEIGHT);
+        QuestionBox { window, lines, text: (content.x + 14, content.y + 12), cancel, accept }
+    }
+
+    fn draw(&self, question: &Question, fonts: &Fonts, frame: &mut Frame) {
+        // What is behind steps back while the question is asked.
+        frame.dither(chrome::DESKTOP, slot::INK, 8);
+        draw_window(frame, fonts, self.window, "Confirm", WindowStyle::SYSTEM);
+        for (index, line) in self.lines.iter().enumerate() {
+            let baseline = self.text.1 + 9 + index as i32 * QUESTION_LINE;
+            fonts.regular.draw(frame, self.text.0, baseline, line, slot::INK);
+        }
+        draw_button(frame, fonts, self.cancel, "Cancel", ButtonLook::default());
+        let look = ButtonLook { primary: true, focused: true, ..ButtonLook::default() };
+        draw_button(frame, fonts, self.accept, &question.label, look);
+    }
+}
+
+/// The keys shown while a question is asked.
+fn question_keys(question: &Question) -> [(&str, &str); 2] {
+    [("Enter", question.label.as_str()), ("F12", "Cancel")]
 }
 
 fn part_of<'a>(layout: &'a GraphicLayout, focus: &Option<String>) -> Option<&'a Part> {
@@ -95,15 +147,34 @@ fn part_of<'a>(layout: &'a GraphicLayout, focus: &Option<String>) -> Option<&'a 
 /// Handles a key: moves the focus, edits a field, or asks the server to run
 /// an action.
 pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, key: Key) {
+    // A question waits for its answer and nothing else.
+    if session.question().is_some() {
+        match key {
+            Key::Enter => session.answer(true),
+            Key::Escape | Key::F(12) => session.answer(false),
+            _ => {}
+        }
+        settle(session, ui, fonts);
+        return;
+    }
+
     let layout = Geometry::of(session.view(), fonts).layout;
     let focus = focus_of(session.view(), &layout);
     sync_cursor(session, ui, &layout, &focus);
 
     let on_grid = matches!(part_of(&layout, &focus), Some(Part::Grid));
     let on_button = matches!(part_of(&layout, &focus), Some(Part::Button { .. }));
+    let on_choice = matches!(
+        part_of(&layout, &focus),
+        Some(Part::Field { kind: FieldKind::Choice | FieldKind::Check, .. })
+    );
     let name = focus.clone().unwrap_or_default();
     match key {
         Key::Interrupt => {}
+        // Escape leaves the screen, like the close box of its window.
+        Key::Escape => {
+            session.press("F12");
+        }
         Key::F(number) => {
             if !session.press(&format!("F{number}")) {
                 session.say("This key is not active on this screen.");
@@ -115,6 +186,13 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         Key::BackTab | Key::Up => move_focus(session, &layout, &focus, -1),
         Key::Enter if on_grid || on_button => session.activate(&name),
         Key::Char(' ') if on_button => session.activate(&name),
+        // A field whose value is chosen goes through its values.
+        Key::Char(' ') | Key::Right if on_choice => {
+            session.cycle(&name, true);
+        }
+        Key::Left if on_choice => {
+            session.cycle(&name, false);
+        }
         // In a field, Enter is a key like any other; when the screen gives
         // it no meaning, it moves on to the next field.
         Key::Enter => {
@@ -123,7 +201,7 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
             }
         }
         _ => {
-            if let Some(column) = column_of(&layout, &name) {
+            if let Some(column) = typed_column_of(&layout, &name) {
                 let mut text = session.view().value(&column).to_owned();
                 let limit = max_length(session.view(), &name);
                 if edit_line(&mut text, &mut ui.cursor, key, limit) {
@@ -176,7 +254,7 @@ fn sync_cursor<A: Api>(
     if ui.anchor != anchor {
         ui.cursor = focus
             .as_ref()
-            .and_then(|name| column_of(layout, name))
+            .and_then(|name| typed_column_of(layout, name))
             .map_or(0, |column| view.value(&column).chars().count());
         ui.anchor = anchor;
     }
@@ -185,6 +263,26 @@ fn sync_cursor<A: Api>(
 /// The pointer was pressed at a point of the screen.
 pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, x: i32, y: i32) {
     settle(session, ui, fonts);
+
+    // While a question is asked, only its two buttons and its two keys act.
+    if let Some(question) = session.question().cloned() {
+        let asked = QuestionBox::of(&question, fonts);
+        let key = chrome::key_slots(fonts, question_keys(&question).into_iter())
+            .into_iter()
+            .find(|(_, _, area)| area.contains(x, y))
+            .map(|(name, _, _)| name.to_owned());
+        if asked.accept.contains(x, y) || key.as_deref() == Some("Enter") {
+            session.answer(true);
+        } else if asked.cancel.contains(x, y)
+            || close_box_of(asked.window).contains(x, y)
+            || key.is_some()
+        {
+            session.answer(false);
+        }
+        settle(session, ui, fonts);
+        return;
+    }
+
     let geometry = Geometry::of(session.view(), fonts);
 
     // The function key bar: a click is the key.
@@ -213,6 +311,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
         Part::Button { .. } => {
             session.set_focus(Some(item.widget.clone()));
             ui.pressed = Some(item.widget.clone());
+        }
+        Part::Field { kind: FieldKind::Choice | FieldKind::Check, .. } => {
+            // A click moves on to the next value.
+            session.set_focus(Some(item.widget.clone()));
+            session.cycle(&item.widget, true);
         }
         Part::Field { column, .. } => {
             // The text is scrolled only in the field that has the focus.
@@ -263,14 +366,9 @@ fn position_text(view: &View) -> String {
     }
 }
 
-/// The text a text widget shows: computed by the server, or else its label.
+/// The text a text widget shows.
 fn text_of<'a>(view: &'a View, name: &str) -> &'a str {
-    view.card
-        .texts
-        .get(name)
-        .map(String::as_str)
-        .or_else(|| widget(view, name).and_then(|w| w.label.as_deref()))
-        .unwrap_or("")
+    view.text(name)
 }
 
 /// Draws the session. `blink` says whether the cursor is in the visible half
@@ -359,11 +457,22 @@ pub fn draw<A: Api>(
                 fonts.regular.draw(frame, area.x + value_x, text_baseline(area), text, slot::INK);
                 frame.set_clip(clip);
             }
-            Part::Field { column, label } => {
+            Part::Field { column, label, kind } => {
                 let label_x = area.x - 5 - fonts.regular.width(label);
                 fonts.regular.draw(frame, label_x, area.y + 11, label, slot::COCOA);
-                let cursor = focused.then_some(ui.cursor);
-                draw_field(frame, fonts, area, view.value(column), cursor, blink);
+                let value = view.value(column);
+                match kind {
+                    FieldKind::Text => {
+                        let cursor = focused.then_some(ui.cursor);
+                        draw_field(frame, fonts, area, value, cursor, blink);
+                    }
+                    FieldKind::Choice => {
+                        let shown = widget(view, &item.widget)
+                            .map_or_else(|| value.to_owned(), |w| w.shown(value));
+                        draw_choice(frame, fonts, area, &shown, focused);
+                    }
+                    FieldKind::Check => draw_check(frame, area, value == "true", focused),
+                }
             }
             Part::Picture => {
                 frame.outline(area, slot::INK);
@@ -401,6 +510,11 @@ pub fn draw<A: Api>(
     }
     frame.set_clip(previous);
 
+    if let Some(question) = session.question() {
+        QuestionBox::of(question, fonts).draw(question, fonts, frame);
+        chrome::draw_key_bar(frame, fonts, question_keys(question).into_iter());
+        return;
+    }
     if let Some(message) = session.message() {
         chrome::draw_message(frame, fonts, message);
     }
@@ -652,6 +766,205 @@ mod tests {
         click(&mut session, &mut ui, list.x + 30, list.y + 4);
         assert_eq!(session.view().stack(), "stacks");
         assert_eq!(session.view().grids["list"].selected, 1);
+    }
+
+    /// A session in author mode on the address book.
+    fn author_session() -> (Session<Fake>, Ui) {
+        let (mut session, mut ui) = addressbook_session();
+        session.run("author");
+        settle(&mut session, &mut ui, &fonts());
+        assert_eq!(session.view().stack(), "author");
+        (session, ui)
+    }
+
+    #[test]
+    fn author_mode_is_a_dialog_with_fields_a_list_and_buttons() {
+        let (session, ui) = author_session();
+        let frame = render(&session, &ui);
+        snapshot(&frame, "author");
+        let geometry = Geometry::of(session.view(), &fonts());
+
+        // A system window, although it shows a card: no sheet of paper.
+        let window = geometry.window;
+        assert_eq!(frame.pixel(window.x + 2, window.y + 2), Some(slot::AZURE));
+        assert_eq!(geometry.layout.paper, None);
+        assert!(window.bottom() <= chrome::KEYS_TOP - 3, "the window fits on the desktop");
+
+        // The two fields start at the same place, under one another.
+        let (title, card_title) = (area_of(&session, "title"), area_of(&session, "card_title"));
+        assert_eq!(title.x, card_title.x);
+        assert!(card_title.y > title.y);
+        // The list shows the fields of the stack, in four columns.
+        let list = area_of(&session, "fields");
+        assert!(list.w > 300);
+        assert_eq!(session.view().grids["fields"].page.rows.len(), 3);
+        assert!(has_slot(&frame, list, slot::INK));
+        // Every key of the screen is in the bar.
+        let bound = session.view().screen.keys.len();
+        let shown = chrome::key_slots(
+            &fonts(),
+            session.view().screen.keys.iter().map(|k| (k.key.as_str(), k.label.as_str())),
+        );
+        assert_eq!(shown.len(), bound);
+    }
+
+    #[test]
+    fn the_key_bar_makes_room_for_many_keys() {
+        let keys = crate::testing::keys_of_a_built_stack();
+        let slots = chrome::key_slots(&fonts(), keys.iter().copied());
+        assert_eq!(slots.len(), keys.len());
+        let last = slots.last().unwrap().2;
+        assert!(last.right() <= crate::frame::WIDTH, "{last:?}");
+        // They do not overlap.
+        for pair in slots.windows(2) {
+            assert!(pair[0].2.right() <= pair[1].2.x, "{:?} {:?}", pair[0].2, pair[1].2);
+        }
+        // A few keys keep their usual places.
+        let few = chrome::key_slots(&fonts(), [("F3", "Quit"), ("F12", "Back")].into_iter());
+        assert_eq!(few[0].2.x, 6);
+    }
+
+    #[test]
+    fn enter_saves_from_a_field_and_opens_from_the_list() {
+        let (mut session, mut ui) = author_session();
+        // The first field has the focus: Enter is the key of the screen.
+        press(&mut session, &mut ui, &[Key::Char('!'), Key::Enter]);
+        let (action, context) = *actions(&session).last().unwrap();
+        assert_eq!(action, "save");
+        assert_eq!(context.card.as_deref(), Some("addressbook"));
+        assert_eq!(context.dirty["title"], "Address book!");
+
+        // On the list, Enter opens the selected field.
+        let (mut session, mut ui) = author_session();
+        press(&mut session, &mut ui, &[Key::Tab, Key::Tab, Key::Down, Key::Enter]);
+        assert_eq!(session.view().stack(), "field");
+        assert_eq!(actions(&session).last().unwrap().1.row.as_deref(), Some("f2"));
+    }
+
+    #[test]
+    fn a_field_with_choices_goes_through_them() {
+        let (mut session, mut ui) = author_session();
+        press(&mut session, &mut ui, &[Key::Tab, Key::Tab, Key::Enter]);
+        assert_eq!(session.view().stack(), "field");
+        let frame = render(&session, &ui);
+        snapshot(&frame, "field");
+
+        // Typing does not change a choice; space and the arrows do.
+        press(&mut session, &mut ui, &[Key::Tab, Key::Tab]);
+        assert_eq!(session.view().focus.as_deref(), Some("type"));
+        press(&mut session, &mut ui, &[Key::Char('x')]);
+        assert_eq!(session.view().value("type"), "text");
+        press(&mut session, &mut ui, &[Key::Char(' ')]);
+        assert_eq!(session.view().value("type"), "number");
+        press(&mut session, &mut ui, &[Key::Right]);
+        assert_eq!(session.view().value("type"), "date");
+        press(&mut session, &mut ui, &[Key::Left, Key::Left, Key::Left]);
+        assert_eq!(session.view().value("type"), "boolean", "it goes round");
+
+        // A click moves on to the next value.
+        let (x, y) = centre(area_of(&session, "type"));
+        click(&mut session, &mut ui, x, y);
+        assert_eq!(session.view().value("type"), "text");
+    }
+
+    #[test]
+    fn a_boolean_field_is_a_check_box() {
+        let (mut session, mut ui) = author_session();
+        press(&mut session, &mut ui, &[Key::Tab, Key::Tab, Key::Enter]);
+        let required = area_of(&session, "required");
+        let square = chrome::check_box_of(required);
+
+        let ticked = render(&session, &ui);
+        assert!(has_slot(&ticked, square, slot::FERN), "yes is a tick");
+        click(&mut session, &mut ui, square.x + 4, square.y + 4);
+        assert_eq!(session.view().value("required"), "false");
+        let empty = render(&session, &ui);
+        assert!(!has_slot(&empty, square, slot::FERN));
+        // The box has the focus: a blue line around it.
+        assert_eq!(empty.pixel(square.x - 1, square.y - 1), Some(slot::BLUE));
+
+        press(&mut session, &mut ui, &[Key::Char(' ')]);
+        assert_eq!(session.view().value("required"), "true");
+    }
+
+    #[test]
+    fn a_new_field_starts_with_what_the_server_filled_in() {
+        let (mut session, mut ui) = author_session();
+        press(&mut session, &mut ui, &[Key::F(6)]);
+        assert_eq!(session.view().stack(), "field");
+        assert!(session.view().is_new);
+        assert_eq!(session.view().value("type"), "text");
+        assert_eq!(session.view().value("label"), "");
+
+        press(&mut session, &mut ui, &[Key::Char('C'), Key::Char('i'), Key::Enter]);
+        let (action, context) = *actions(&session).last().unwrap();
+        assert_eq!(action, "save");
+        assert_eq!(context.card, None);
+        assert_eq!(context.dirty["label"], "Ci");
+        assert_eq!(context.dirty["stack"], "addressbook", "the dialog knows its stack");
+    }
+
+    #[test]
+    fn a_question_is_asked_in_a_window_and_waits_for_its_answer() {
+        let (mut session, mut ui) = author_session();
+        let (x, y) = centre(area_of(&session, "delete_stack"));
+        click(&mut session, &mut ui, x, y);
+        let question = session.question().expect("deleting asks first").clone();
+        let frame = render(&session, &ui);
+        snapshot(&frame, "question");
+
+        let asked = QuestionBox::of(&question, &fonts());
+        assert!(asked.lines.len() > 1, "a long question is cut into lines");
+        assert!(count_slot(&frame, asked.accept, slot::YELLOW) > 300);
+        assert_eq!(frame.pixel(asked.window.x + 2, asked.window.y + 2), Some(slot::AZURE));
+        // The bar shows the two answers and nothing else.
+        let before = actions(&session).len();
+
+        // Any other key leaves the question where it is.
+        press(&mut session, &mut ui, &[Key::F(6), Key::Char('x'), Key::Tab]);
+        assert!(session.question().is_some());
+        assert_eq!(actions(&session).len(), before);
+
+        // Escape gives up.
+        press(&mut session, &mut ui, &[Key::Escape]);
+        assert_eq!(session.question(), None);
+        assert_eq!(session.view().stack(), "author");
+        assert_eq!(actions(&session).len(), before);
+
+        // Asked again and accepted with Enter: the action runs for good.
+        click(&mut session, &mut ui, x, y);
+        press(&mut session, &mut ui, &[Key::Enter]);
+        let (action, context) = *actions(&session).last().unwrap();
+        assert_eq!(action, "delete_stack");
+        assert!(context.confirmed);
+        assert_eq!(session.message(), Some("Stack “Address book” deleted."));
+    }
+
+    #[test]
+    fn a_question_is_answered_with_the_pointer_too() {
+        let (mut session, mut ui) = author_session();
+        session.run("delete_stack");
+        let question = session.question().unwrap().clone();
+        let asked = QuestionBox::of(&question, &fonts());
+
+        // A click elsewhere does nothing; Cancel gives up.
+        click(&mut session, &mut ui, 3, 100);
+        assert!(session.question().is_some());
+        let (x, y) = centre(asked.cancel);
+        click(&mut session, &mut ui, x, y);
+        assert_eq!(session.question(), None);
+
+        session.run("delete_stack");
+        let (x, y) = centre(asked.accept);
+        click(&mut session, &mut ui, x, y);
+        assert!(actions(&session).last().unwrap().1.confirmed);
+    }
+
+    #[test]
+    fn escape_leaves_a_screen_like_its_close_box() {
+        let (mut session, mut ui) = author_session();
+        press(&mut session, &mut ui, &[Key::Escape]);
+        assert_eq!(session.view().stack(), "addressbook");
     }
 
     #[test]

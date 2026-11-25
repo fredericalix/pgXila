@@ -6,9 +6,14 @@
 -- the xila tables. It is used as a test fixture and as a demonstration.
 --
 -- Load it with scripts/load-example.sh addressbook. Loading it again replaces
--- it.
+-- it. The stack belongs to whoever loads it; add "--owner ada" to hand it to
+-- an author, who can then change it in author mode.
 -- All names and values are fictitious.
 
+-- Replacing a previous load is not a change worth remembering: without this,
+-- the old copy would show up among the deleted stacks of its owner. Only a
+-- superuser is believed here (see xila.restoring in the extension).
+SET xila.restoring = on;
 DELETE FROM xila.stack WHERE name = 'addressbook';
 -- The portraits of a previous load live in xila.image.
 DO $$
@@ -19,6 +24,7 @@ BEGIN
 END
 $$;
 DROP SCHEMA IF EXISTS addressbook CASCADE;
+RESET xila.restoring;
 
 -- The data: one row per card.
 CREATE SCHEMA addressbook;
@@ -136,29 +142,39 @@ GRANT USAGE ON SCHEMA addressbook TO xila_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON addressbook.contacts TO xila_user;
 
 -- The stack, its background, its actions, its keys and its widgets.
+--
+-- "managed" says that the table was made for this stack and that pgXila may
+-- alter it: in author mode, adding a field adds a column. Leave it out for a
+-- table that exists for other reasons; pgXila then never alters it.
 WITH s AS (
     INSERT INTO xila.stack (name, title) VALUES ('addressbook', 'Address book')
     RETURNING id),
 b AS (
-    INSERT INTO xila.background (stack_id, source_schema, source_table, key_column, order_columns)
-    SELECT id, 'addressbook', 'contacts', 'id', '{last_name,first_name}' FROM s
+    INSERT INTO xila.background
+        (stack_id, source_schema, source_table, key_column, order_columns, managed)
+    SELECT id, 'addressbook', 'contacts', 'id', '{last_name,first_name}', true FROM s
     RETURNING id),
 a AS (
-    INSERT INTO xila.action (background_id, name, label, handler)
-    SELECT b.id, v.name, v.label, v.name
+    INSERT INTO xila.action (background_id, name, label, handler, args)
+    SELECT b.id, v.name, v.label, v.handler, v.args::jsonb
     FROM b, (VALUES
-        ('previous_card', 'Prev.'),
-        ('next_card',     'Next'),
-        ('new_card',      'New'),
-        ('save_card',     'Save')) AS v(name, label)
+        ('previous_card', 'Prev.',   'previous_card', '{}'),
+        ('next_card',     'Next',    'next_card',     '{}'),
+        ('new_card',      'New',     'new_card',      '{}'),
+        ('save_card',     'Save',    'save_card',     '{}'),
+        ('delete_card',   'Delete',  'delete_card',   '{}'),
+        ('history',       'History', 'history',       '{"of": "cards"}')
+    ) AS v(name, label, handler, args)
     RETURNING id, background_id, name),
 k AS (
     INSERT INTO xila.key_binding (background_id, key, action_id)
     SELECT a.background_id, v.key, a.id
     FROM a JOIN (VALUES
+        ('F4',    'delete_card'),
         ('F6',    'new_card'),
         ('F7',    'previous_card'),
         ('F8',    'next_card'),
+        ('F10',   'history'),
         ('Enter', 'save_card')) AS v(key, action) ON v.action = a.name),
 w AS (
     INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)

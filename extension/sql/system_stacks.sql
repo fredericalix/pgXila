@@ -59,3 +59,217 @@ SELECT background_id, 'list', 'grid', 10, id, '{
         {"column": "cards", "label": "Cards", "align": "right"}
     ]}'
 FROM a;
+
+-- ---------------------------------------------------------------------------
+-- Author mode
+-- ---------------------------------------------------------------------------
+-- The author screens are stacks too. Each one is a card of a view: the key of
+-- the card says what the dialog is about (the name of a stack, the identifier
+-- of a field), and what is typed on it goes to an action, never to the view.
+
+-- F11 enters author mode from any stack the current role may change.
+INSERT INTO xila.action (name, label, handler, args)
+VALUES ('author', 'Author', 'author', '{"for": "editor"}');
+INSERT INTO xila.key_binding (key, action_id) VALUES ('F11', xila.action_id(NULL, 'author'));
+
+-- What authors find in the list of stacks.
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('stacks'), 'new_stack', 'New stack', 'new_stack', '{"for": "author"}'),
+    (xila.background_id('stacks'), 'deleted',   'Deleted',   'history',
+     '{"for": "author", "of": "deleted"}'),
+    (xila.background_id('stacks'), 'author',    'Author',    'author',    '{"for": "author"}');
+INSERT INTO xila.key_binding (background_id, key, action_id) VALUES
+    (xila.background_id('stacks'), 'F6',  xila.action_id('stacks', 'new_stack')),
+    (xila.background_id('stacks'), 'F10', xila.action_id('stacks', 'deleted')),
+    (xila.background_id('stacks'), 'F11', xila.action_id('stacks', 'author'));
+
+-- New stack.
+INSERT INTO xila.stack (name, title, kind) VALUES ('new_stack', 'New stack', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'new_stack_form', 'name' FROM xila.stack WHERE name = 'new_stack';
+INSERT INTO xila.action (background_id, name, label, handler)
+VALUES (xila.background_id('new_stack'), 'create', 'Create', 'create_stack');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+VALUES (xila.background_id('new_stack'), 'Enter', xila.action_id('new_stack', 'create'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('new_stack'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "New stack", "style": "title"}'),
+    (xila.background_id('new_stack'), 'hint', 'text', 20, NULL, NULL, NULL,
+     '{"template": "The name may be left empty.", "style": "subtitle"}'),
+    (xila.background_id('new_stack'), 'title', 'field', 30, 'Title', 'title', NULL, '{}'),
+    (xila.background_id('new_stack'), 'name', 'field', 40, 'Name', 'name', NULL, '{}'),
+    (xila.background_id('new_stack'), 'source', 'field', 50, 'Start from', 'source', NULL,
+     '{"choices": [{"value": "", "label": "An empty stack"}],
+       "choices_from": {"schema": "xila", "table": "own_table", "value": "name"}}'),
+    (xila.background_id('new_stack'), 'create', 'button', 60, 'Create', NULL,
+     xila.action_id('new_stack', 'create'), '{}'),
+    (xila.background_id('new_stack'), 'cancel', 'button', 70, 'Cancel', NULL,
+     xila.action_id(NULL, 'back'), '{}');
+
+-- Author mode: one stack, its title and its fields.
+INSERT INTO xila.stack (name, title, kind) VALUES ('author', 'Author mode', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'stack_info', 'name' FROM xila.stack WHERE name = 'author';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('author'), 'save',         'Save',         'save_stack',   '{}'),
+    (xila.background_id('author'), 'new_field',    'New field',    'new_field',    '{}'),
+    (xila.background_id('author'), 'edit_field',   'Edit',         'edit_field',   '{}'),
+    (xila.background_id('author'), 'up',           'Up',           'move_field',   '{"by": -1}'),
+    (xila.background_id('author'), 'down',         'Down',         'move_field',   '{"by": 1}'),
+    (xila.background_id('author'), 'history',      'History',      'history',      '{"of": "stack"}'),
+    (xila.background_id('author'), 'browse',       'Browse',       'browse',       '{}'),
+    (xila.background_id('author'), 'delete_stack', 'Delete stack', 'delete_stack', '{}');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+SELECT xila.background_id('author'), k.key, xila.action_id('author', k.action)
+FROM (VALUES ('Enter', 'save'), ('F6', 'new_field'), ('F7', 'up'), ('F8', 'down'),
+             ('F10', 'history'), ('F11', 'browse')) AS k(key, action);
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('author'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "{title}", "style": "title"}'),
+    (xila.background_id('author'), 'mode', 'text', 20, NULL, NULL, NULL,
+     '{"template": "Author mode", "style": "subtitle"}'),
+    (xila.background_id('author'), 'title', 'field', 30, 'Title', 'title', NULL, '{}'),
+    (xila.background_id('author'), 'card_title', 'field', 40, 'Card title', 'card_title', NULL, '{}'),
+    (xila.background_id('author'), 'fields', 'grid', 50, NULL, NULL,
+     xila.action_id('author', 'edit_field'),
+     '{"schema": "xila", "table": "field", "key": "id",
+       "where": {"stack": "name"}, "order": ["ord", "name"],
+       "columns": [
+           {"column": "label", "label": "Field"},
+           {"column": "name", "label": "Name"},
+           {"column": "type_label", "label": "Type"},
+           {"column": "required_label", "label": "Required"}
+       ]}'),
+    (xila.background_id('author'), 'new_field', 'button', 60, 'New field', NULL,
+     xila.action_id('author', 'new_field'), '{}'),
+    (xila.background_id('author'), 'history', 'button', 70, 'History', NULL,
+     xila.action_id('author', 'history'), '{}'),
+    (xila.background_id('author'), 'delete_stack', 'button', 80, 'Delete stack', NULL,
+     xila.action_id('author', 'delete_stack'), '{}');
+
+-- One field of a stack.
+INSERT INTO xila.stack (name, title, kind) VALUES ('field', 'Field', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'field', 'id' FROM xila.stack WHERE name = 'field';
+INSERT INTO xila.action (background_id, name, label, handler) VALUES
+    (xila.background_id('field'), 'save',   'Save',   'save_field'),
+    (xila.background_id('field'), 'remove', 'Remove', 'remove_field');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+VALUES (xila.background_id('field'), 'Enter', xila.action_id('field', 'save'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('field'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "Field", "style": "title"}'),
+    (xila.background_id('field'), 'hint', 'text', 20, NULL, NULL, NULL,
+     '{"template": "The name may be left empty.", "style": "subtitle"}'),
+    (xila.background_id('field'), 'label', 'field', 30, 'Label', 'label', NULL, '{}'),
+    (xila.background_id('field'), 'name', 'field', 40, 'Name', 'name', NULL, '{}'),
+    (xila.background_id('field'), 'type', 'field', 50, 'Type', 'type', NULL,
+     '{"choices": [
+           {"value": "text", "label": "Text"},
+           {"value": "number", "label": "Number"},
+           {"value": "date", "label": "Date"},
+           {"value": "boolean", "label": "Yes or no"}
+       ]}'),
+    (xila.background_id('field'), 'required', 'field', 60, 'Required', 'required', NULL, '{}'),
+    (xila.background_id('field'), 'save', 'button', 70, 'Save', NULL,
+     xila.action_id('field', 'save'), '{}'),
+    (xila.background_id('field'), 'remove', 'button', 80, 'Remove', NULL,
+     xila.action_id('field', 'remove'), '{}'),
+    (xila.background_id('field'), 'cancel', 'button', 90, 'Cancel', NULL,
+     xila.action_id(NULL, 'back'), '{}');
+
+-- The history of a stack: every change, newest first.
+INSERT INTO xila.stack (name, title, kind) VALUES ('history', 'History', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'stack_info', 'name' FROM xila.stack WHERE name = 'history';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('history'), 'rewind_screen', 'Rewind screen', 'rewind', '{"scope": "screen"}'),
+    (xila.background_id('history'), 'rewind_all',    'Rewind all',    'rewind', '{"scope": "stack"}');
+INSERT INTO xila.key_binding (background_id, key, action_id) VALUES
+    (xila.background_id('history'), 'F6', xila.action_id('history', 'rewind_screen')),
+    (xila.background_id('history'), 'F7', xila.action_id('history', 'rewind_all'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('history'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "{title}", "style": "title"}'),
+    (xila.background_id('history'), 'hint', 'text', 20, NULL, NULL, NULL,
+     '{"template": "A rewind undoes the selected change and all later ones.", "style": "subtitle"}'),
+    (xila.background_id('history'), 'changes', 'grid', 30, NULL, NULL,
+     xila.action_id('history', 'rewind_all'),
+     '{"schema": "xila", "table": "history_line", "key": "id",
+       "where": {"stack": "name"}, "order": ["id"], "descending": true,
+       "columns": [
+           {"column": "at", "label": "When"},
+           {"column": "actor", "label": "Who"},
+           {"column": "summary", "label": "What"}
+       ]}'),
+    (xila.background_id('history'), 'rewind_screen', 'button', 40, 'Rewind screen', NULL,
+     xila.action_id('history', 'rewind_screen'), '{}'),
+    (xila.background_id('history'), 'rewind_all', 'button', 50, 'Rewind all', NULL,
+     xila.action_id('history', 'rewind_all'), '{}');
+
+-- The history of the cards of a stack, for whoever may write them.
+INSERT INTO xila.stack (name, title, kind) VALUES ('card_history', 'History of the cards', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'stack_info', 'name' FROM xila.stack WHERE name = 'card_history';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('card_history'), 'rewind', 'Rewind card', 'rewind', '{"scope": "card"}');
+INSERT INTO xila.key_binding (background_id, key, action_id) VALUES
+    (xila.background_id('card_history'), 'F6', xila.action_id('card_history', 'rewind'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('card_history'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "{title}", "style": "title"}'),
+    (xila.background_id('card_history'), 'hint', 'text', 20, NULL, NULL, NULL,
+     '{"template": "Undoes the selected change and later ones on that card.", "style": "subtitle"}'),
+    (xila.background_id('card_history'), 'changes', 'grid', 30, NULL, NULL,
+     xila.action_id('card_history', 'rewind'),
+     '{"schema": "xila", "table": "card_history_line", "key": "id",
+       "where": {"stack": "name"}, "order": ["id"], "descending": true,
+       "columns": [
+           {"column": "at", "label": "When"},
+           {"column": "actor", "label": "Who"},
+           {"column": "summary", "label": "What"}
+       ]}'),
+    (xila.background_id('card_history'), 'rewind', 'button', 40, 'Rewind card', NULL,
+     xila.action_id('card_history', 'rewind'), '{}');
+
+-- The stacks that were deleted and can be brought back.
+INSERT INTO xila.stack (name, title, kind) VALUES ('deleted_stacks', 'Deleted stacks', 'system');
+INSERT INTO xila.background (stack_id) SELECT id FROM xila.stack WHERE name = 'deleted_stacks';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('deleted_stacks'), 'restore', 'Restore', 'rewind', '{"scope": "deleted"}');
+INSERT INTO xila.key_binding (background_id, key, action_id) VALUES
+    (xila.background_id('deleted_stacks'), 'F6', xila.action_id('deleted_stacks', 'restore'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('deleted_stacks'), 'list', 'grid', 10, NULL, NULL,
+     xila.action_id('deleted_stacks', 'restore'),
+     '{"schema": "xila", "table": "deleted_stack", "key": "id",
+       "order": ["id"], "descending": true,
+       "columns": [
+           {"column": "title", "label": "Stack"},
+           {"column": "at", "label": "Deleted"},
+           {"column": "actor", "label": "By"}
+       ]}'),
+    (xila.background_id('deleted_stacks'), 'restore', 'button', 20, 'Restore', NULL,
+     xila.action_id('deleted_stacks', 'restore'), '{}');
+
+-- In text mode the header of the screen already carries its title.
+INSERT INTO xila.layout (widget_id, renderer, style)
+SELECT w.id, 'text', '{"hidden": true}'
+FROM xila.widget w
+WHERE w.kind = 'text' AND w.props->>'style' IN ('title', 'subtitle')
+  AND NOT EXISTS (SELECT FROM xila.layout l WHERE l.widget_id = w.id AND l.renderer = 'text');
+
+-- The main button of each dialog.
+INSERT INTO xila.layout (widget_id, renderer, style)
+SELECT w.id, 'graphic', '{"variant": "primary"}'
+FROM xila.widget w
+JOIN xila.background b ON b.id = w.background_id
+JOIN xila.stack s ON s.id = b.stack_id
+WHERE (s.name, w.name) IN (('new_stack', 'create'), ('author', 'new_field'), ('field', 'save'),
+                           ('card_history', 'rewind'), ('deleted_stacks', 'restore'));

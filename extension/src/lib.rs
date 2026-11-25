@@ -43,7 +43,9 @@ pub extern "C-unwind" fn _PG_init() {
 // queries, and SQL says them best. Rust is kept for what SQL cannot do.
 extension_sql_file!("../sql/schema.sql", name = "schema", bootstrap);
 extension_sql_file!("../sql/api.sql", name = "api", requires = [xila::version]);
-extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["api"]);
+extension_sql_file!("../sql/author.sql", name = "author", requires = ["api"]);
+extension_sql_file!("../sql/actions.sql", name = "actions", requires = ["author"]);
+extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["actions"]);
 extension_sql_file!("../sql/triggers.sql", name = "triggers", requires = ["system_stacks"]);
 
 #[pg_schema]
@@ -163,7 +165,7 @@ mod tests {
     #[pg_test]
     fn hello_names_the_home_stack() {
         let hello = json("SELECT xila.hello()");
-        assert_eq!(hello["api"], 1);
+        assert_eq!(hello["api"], 2);
         assert_eq!(hello["home"], "desktop");
     }
 
@@ -440,6 +442,749 @@ mod tests {
 
         let effects = json(r#"SELECT xila.act('stacks', 'open', '{"row": "library"}')"#);
         assert_eq!(effects, serde_json::json!([{ "do": "show", "stack": "library" }]));
+    }
+
+    // ----------------------------------------------------------------------
+    // Author mode
+    // ----------------------------------------------------------------------
+
+    /// Creates the people of the author tests: ada and bob are authors, carol
+    /// may edit what ada owns, dan is a plain user.
+    fn create_people() {
+        Spi::run(
+            "CREATE ROLE ada LOGIN IN ROLE xila_author;
+             CREATE ROLE bob LOGIN IN ROLE xila_author;
+             CREATE ROLE carol LOGIN IN ROLE xila_author, ada;
+             CREATE ROLE dan LOGIN IN ROLE xila_user;",
+        )
+        .unwrap();
+    }
+
+    /// Continues the test as another role, as if it had logged in.
+    fn become_role(role: &str) {
+        Spi::run(&format!("SET LOCAL SESSION AUTHORIZATION {role}")).unwrap();
+    }
+
+    fn become_admin() {
+        Spi::run("RESET SESSION AUTHORIZATION").unwrap();
+    }
+
+    /// As ada: a stack of books with a title and a year, and two cards.
+    fn create_books_as_ada() {
+        create_people();
+        become_role("ada");
+        Spi::run(
+            r#"SELECT xila.create_stack('Books');
+               SELECT xila.add_field('books', 'Title');
+               SELECT xila.add_field('books', 'Year', 'number');
+               SELECT xila.save_card('books', NULL, '{"title": "Candide", "year": "1759"}');
+               SELECT xila.save_card('books', NULL, '{"title": "Germinal", "year": "1885"}');"#,
+        )
+        .unwrap();
+    }
+
+    /// The table of the library stack, owned by a role, without any stack.
+    fn create_library_table_for(owner: &str) {
+        Spi::run(&format!(
+            "CREATE SCHEMA library AUTHORIZATION {owner};
+             CREATE TABLE library.books (
+                 id     integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 title  text NOT NULL,
+                 author text,
+                 year   integer,
+                 bought date
+             );
+             ALTER TABLE library.books OWNER TO {owner};
+             INSERT INTO library.books (title, author, year) VALUES
+                 ('Les Misérables', 'Hugo', 1862), ('Candide', 'Voltaire', 1759);"
+        ))
+        .unwrap();
+    }
+
+    /// The id of the first recorded change of a stack that matches a condition.
+    ///
+    /// A test runs in a single transaction, which the history of a stack
+    /// shows as a single line; the tests therefore name changes one by one.
+    /// The integration tests check the lines, with one transaction per call.
+    fn first_change(stack: &str, condition: &str) -> i64 {
+        number(&format!(
+            "SELECT min(h.id) FROM xila.history h JOIN xila.stack s ON s.id = h.stack_id
+             WHERE s.name = '{stack}' AND {condition}"
+        ))
+    }
+
+    fn last_change() -> i64 {
+        number("SELECT max(id) FROM xila.history")
+    }
+
+    /// The keys of a screen, as "F6=New".
+    fn keys_of(screen: &serde_json::Value) -> Vec<String> {
+        screen["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| format!("{}={}", k["key"].as_str().unwrap(), k["label"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// The names of the fields of a stack, in their order.
+    fn fields_of(stack: &str) -> serde_json::Value {
+        json(&format!(
+            "SELECT coalesce(jsonb_agg(name ORDER BY ord), '[]') FROM xila.field
+             WHERE stack = '{stack}'"
+        ))
+    }
+
+    #[pg_test]
+    fn an_author_builds_a_stack_without_sql() {
+        create_books_as_ada();
+
+        // The stack keeps its cards in a table of its own, which ada owns.
+        assert_eq!(
+            text(
+                "SELECT tableowner::text FROM pg_tables
+                 WHERE schemaname = 'books' AND tablename = 'cards'"
+            )
+            .as_deref(),
+            Some("ada")
+        );
+        assert_eq!(
+            text("SELECT owner::text FROM xila.stack WHERE name = 'books'").as_deref(),
+            Some("ada")
+        );
+
+        let screen = json("SELECT xila.open_stack('books')");
+        assert_eq!(screen["stack"]["may_edit"], true);
+        let fields: Vec<_> = screen["widgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["kind"] == "field")
+            .map(|w| (w["name"].as_str().unwrap(), w["type"].as_str().unwrap()))
+            .collect();
+        assert_eq!(fields, [("title", "text"), ("year", "number")]);
+
+        // The first field became the title of the cards.
+        let card = json("SELECT xila.card('books')");
+        assert_eq!(card["count"], 2);
+        assert_eq!(card["texts"]["heading"], "Candide");
+
+        // A new stack can be browsed, saved, and its cards deleted.
+        assert_eq!(
+            keys_of(&screen),
+            [
+                "F3=Quit",
+                "F4=Delete",
+                "F6=New",
+                "F7=Prev.",
+                "F8=Next",
+                "F10=History",
+                "F11=Author",
+                "F12=Back",
+                "Enter=Save"
+            ]
+        );
+    }
+
+    #[pg_test]
+    fn the_name_of_a_stack_is_made_from_its_title() {
+        create_people();
+        become_role("ada");
+        assert_eq!(
+            text("SELECT xila.create_stack('Mes recettes préférées')").as_deref(),
+            Some("mes_recettes_preferees")
+        );
+        let (state, message) = error_of("SELECT xila.create_stack('Mes recettes préférées')");
+        assert_eq!(state, "XL003");
+        assert_eq!(message, "A stack named “mes_recettes_preferees” already exists.");
+        let (state, _) = error_of("SELECT xila.create_stack('Tables', 'pg_tables')");
+        assert_eq!(state, "XL003");
+        let (state, message) = error_of("SELECT xila.create_stack('   ')");
+        assert_eq!((state.as_str(), message.as_str()), ("XL003", "A stack needs a title."));
+    }
+
+    #[pg_test]
+    fn only_authors_create_stacks() {
+        create_people();
+        become_role("dan");
+        let (state, message) = error_of("SELECT xila.create_stack('Notes')");
+        assert_eq!(
+            (state.as_str(), message.as_str()),
+            ("XL004", "Only authors can create stacks.")
+        );
+        // The function that creates the schema cannot be used on its own.
+        let (state, _) = error_of_statement("PERFORM xila.make_schema('notes')");
+        assert_eq!(state, "42501");
+    }
+
+    #[pg_test]
+    fn a_stack_can_only_be_changed_by_its_owner() {
+        create_books_as_ada();
+
+        become_role("bob");
+        let (state, message) = error_of("SELECT xila.add_field('books', 'Author')");
+        assert_eq!(state, "XL004");
+        assert_eq!(message, "The stack “Books” belongs to ada: you cannot change it.");
+        let (state, _) = error_of(r#"SELECT xila.set_stack('books', '{"title": "Mine"}')"#);
+        assert_eq!(state, "XL004");
+        let (state, _) = error_of("SELECT xila.delete_stack('books')");
+        assert_eq!(state, "XL004");
+        let (state, _) = error_of("SELECT xila.rewind('books', 'stack', 1)");
+        assert_eq!(state, "XL004");
+
+        // Writing the rows in SQL does not get around it: the tables refuse.
+        Spi::run("UPDATE xila.stack SET title = 'Mine' WHERE name = 'books'").unwrap();
+        Spi::run("DELETE FROM xila.widget WHERE name = 'title'").unwrap();
+        let (state, _) = error_of_statement(
+            "INSERT INTO xila.widget (background_id, name, kind)
+             VALUES (xila.background_id('books'), 'spy', 'text')",
+        );
+        assert_eq!(state, "42501");
+        let (state, _) = error_of_statement(
+            "INSERT INTO xila.stack (name, title, owner) VALUES ('fake', 'Fake', 'ada')",
+        );
+        assert_eq!(state, "42501");
+
+        // Nor may an author touch a system stack.
+        Spi::run("UPDATE xila.stack SET title = 'Hacked' WHERE name = 'desktop'").unwrap();
+        Spi::run("DELETE FROM xila.action WHERE name = 'quit'").unwrap();
+        assert_eq!(json("SELECT xila.open_stack('desktop')")["stack"]["may_edit"], false);
+
+        become_admin();
+        assert_eq!(
+            text("SELECT title FROM xila.stack WHERE name = 'books'").as_deref(),
+            Some("Books")
+        );
+        assert_eq!(
+            text("SELECT title FROM xila.stack WHERE name = 'desktop'").as_deref(),
+            Some("Main menu")
+        );
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+        assert_eq!(number("SELECT count(*) FROM xila.action WHERE name = 'quit'"), 1);
+
+        // A member of the owner role may edit: that is how editing is shared.
+        become_role("carol");
+        assert_eq!(text("SELECT xila.add_field('books', 'Author')").as_deref(), Some("author"));
+    }
+
+    #[pg_test]
+    fn a_field_is_renamed_moved_and_made_required() {
+        create_books_as_ada();
+        Spi::run(
+            r#"SELECT xila.set_field('books', 'year', '{"label": "Published", "name": "published"}');
+               SELECT xila.move_field('books', 'published', -1);"#,
+        )
+        .unwrap();
+        let fields = json(
+            "SELECT jsonb_agg(jsonb_build_array(name, label, type) ORDER BY ord)
+             FROM xila.field WHERE stack = 'books'",
+        );
+        assert_eq!(
+            fields,
+            serde_json::json!([["published", "Published", "number"], ["title", "Title", "text"]])
+        );
+        assert_eq!(json("SELECT xila.card('books')")["values"]["published"], "1759");
+
+        // Required is refused while a card has no value, and says how many.
+        Spi::run(r#"SELECT xila.save_card('books', NULL, '{"title": "Nana"}')"#).unwrap();
+        let (state, message) =
+            error_of(r#"SELECT xila.set_field('books', 'published', '{"required": true}')"#);
+        assert_eq!(state, "XL003");
+        assert_eq!(
+            message,
+            "The field “published” cannot be required yet: 1 card has no value for it."
+        );
+        Spi::run(r#"SELECT xila.set_field('books', 'title', '{"required": true}')"#).unwrap();
+        let (state, message) =
+            error_of(r#"SELECT xila.save_card('books', NULL, '{"published": "1900"}')"#);
+        assert_eq!((state.as_str(), message.as_str()), ("XL003", "The field “title” is required."));
+
+        // A renamed field is renamed in the title of the cards too.
+        Spi::run(r#"SELECT xila.set_field('books', 'title', '{"name": "work"}')"#).unwrap();
+        assert_eq!(
+            text("SELECT card_title FROM xila.stack_info WHERE name = 'books'").as_deref(),
+            Some("{work}")
+        );
+    }
+
+    #[pg_test]
+    fn a_removed_field_comes_back_with_its_values() {
+        create_books_as_ada();
+        Spi::run("SELECT xila.remove_field('books', 'year')").unwrap();
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'books' AND column_name = 'year'"
+            ),
+            0
+        );
+        assert_eq!(json("SELECT xila.card('books')")["values"].get("year"), None);
+
+        let removal = first_change(
+            "books",
+            "h.object_kind = 'widget' AND h.op = 'delete' AND h.before->>'name' = 'year'",
+        );
+        let before_rewind = last_change();
+        let undone = json(&format!("SELECT xila.rewind('books', 'screen', {removal})"));
+        assert_eq!(undone["undone"], 2, "the widget and the column");
+
+        let years = json("SELECT jsonb_agg(year ORDER BY title) FROM books.cards");
+        assert_eq!(years, serde_json::json!([1759, 1885]));
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+
+        // The rewind is itself in history, and can be rewound.
+        assert_eq!(
+            text(
+                "SELECT xila.describe_change(object_kind, op, before, after)
+                  FROM xila.history ORDER BY id DESC LIMIT 1"
+            )
+            .as_deref(),
+            Some("Screen rewound (2 changes undone)")
+        );
+        Spi::run(&format!("SELECT xila.rewind('books', 'screen', {})", before_rewind + 1)).unwrap();
+        assert_eq!(fields_of("books"), serde_json::json!(["title"]));
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'books' AND column_name = 'year'"
+            ),
+            0
+        );
+    }
+
+    #[pg_test]
+    fn a_card_is_rewound_alone() {
+        create_books_as_ada();
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+        Spi::run(&format!(
+            r#"SELECT xila.save_card('books', '{key}', '{{"year": "1760"}}');
+               SELECT xila.save_card('books', '{key}', '{{"title": "Candide ou l''Optimisme"}}');
+               UPDATE books.cards SET year = 1 WHERE title = 'Germinal';"#
+        ))
+        .unwrap();
+
+        let first_change = number(&format!(
+            "SELECT min(id) FROM xila.card_history_line
+             WHERE stack = 'books' AND card = '{key}' AND summary LIKE '%changed: year'"
+        ));
+        let undone = json(&format!("SELECT xila.rewind('books', 'card', {first_change}, '{key}')"));
+        assert_eq!(undone["undone"], 2);
+        let card = json(&format!("SELECT xila.card('books', '{key}', 'at')"));
+        assert_eq!(card["values"]["title"], "Candide");
+        assert_eq!(card["values"]["year"], "1759");
+        // The other card was left alone.
+        assert_eq!(number("SELECT year::bigint FROM books.cards WHERE title = 'Germinal'"), 1);
+    }
+
+    #[pg_test]
+    fn a_deleted_card_comes_back() {
+        create_books_as_ada();
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+
+        // Deleting asks first, then shows the next card.
+        let asked = json(&format!(r#"SELECT xila.act('books', 'delete', '{{"card": "{key}"}}')"#));
+        assert_eq!(
+            asked,
+            serde_json::json!([{ "do": "confirm", "text": "Delete this card?", "label": "Delete" }])
+        );
+        assert_eq!(number("SELECT count(*) FROM books.cards"), 2);
+        let effects = json(&format!(
+            r#"SELECT xila.act('books', 'delete', '{{"card": "{key}", "confirmed": true}}')"#
+        ));
+        assert_eq!(effects[0]["do"], "show");
+        assert_ne!(effects[0]["card"], key.as_str());
+        assert_eq!(effects[1]["text"], "Card deleted.");
+        assert_eq!(number("SELECT count(*) FROM books.cards"), 1);
+
+        let line = text(
+            "SELECT id::text || ' ' || summary FROM xila.card_history_line
+             WHERE stack = 'books' ORDER BY id DESC LIMIT 1",
+        )
+        .unwrap();
+        let (id, summary) = line.split_once(' ').unwrap();
+        assert_eq!(summary, "Card “Candide” deleted");
+        Spi::run(&format!("SELECT xila.rewind('books', 'card', {id}, '{key}')")).unwrap();
+        assert_eq!(
+            json(&format!("SELECT xila.card('books', '{key}', 'at')"))["values"]["title"],
+            "Candide"
+        );
+    }
+
+    #[pg_test]
+    fn the_screen_and_the_whole_stack_are_rewound_separately() {
+        create_books_as_ada();
+        // After this point: a field is added, a card is changed.
+        Spi::run("SELECT xila.add_field('books', 'Author')").unwrap();
+        Spi::run("UPDATE books.cards SET author = 'Voltaire', year = 1760 WHERE title = 'Candide'")
+            .unwrap();
+        let since = first_change("books", "h.object_kind = 'column' AND h.object_key = 'author'");
+
+        // The screen alone: the field goes, the year typed since stays.
+        Spi::run(&format!("SELECT xila.rewind('books', 'screen', {since})")).unwrap();
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+        assert_eq!(number("SELECT year::bigint FROM books.cards WHERE title = 'Candide'"), 1760);
+
+        // The whole stack: the cards go back too.
+        Spi::run(&format!("SELECT xila.rewind('books', 'stack', {since})")).unwrap();
+        assert_eq!(number("SELECT year::bigint FROM books.cards WHERE title = 'Candide'"), 1759);
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year"]));
+    }
+
+    #[pg_test]
+    fn a_rewind_is_all_or_nothing() {
+        create_books_as_ada();
+        let since = first_change("books", "h.object_kind = 'column' AND h.object_key = 'year'");
+        // Someone alters the table by hand: history does not know.
+        Spi::run("ALTER TABLE books.cards DROP COLUMN year").unwrap();
+        Spi::run(r#"SELECT xila.set_stack('books', '{"title": "Novels"}')"#).unwrap();
+
+        let (state, message) = error_of(&format!("SELECT xila.rewind('books', 'stack', {since})"));
+        assert_eq!(state, "XL003");
+        assert!(message.starts_with("The rewind stopped at the change of "), "{message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+        assert_eq!(
+            text("SELECT title FROM xila.stack WHERE name = 'books'").as_deref(),
+            Some("Novels")
+        );
+    }
+
+    #[pg_test]
+    fn a_deleted_stack_keeps_its_cards_and_can_be_restored() {
+        create_books_as_ada();
+        let screen_before = json("SELECT xila.open_stack('books')");
+        Spi::run("SELECT xila.delete_stack('books')").unwrap();
+
+        assert_eq!(number("SELECT count(*) FROM xila.stack WHERE name = 'books'"), 0);
+        assert_eq!(number("SELECT count(*) FROM books.cards"), 2, "the cards are kept");
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM pg_trigger
+                 WHERE tgrelid = 'books.cards'::regclass AND tgname = 'xila_card'"
+            ),
+            0,
+            "the table is no longer a stack"
+        );
+
+        // Only its former owner sees it among the deleted stacks.
+        become_role("bob");
+        assert_eq!(number("SELECT count(*) FROM xila.deleted_stack"), 0);
+        become_role("ada");
+        let deleted = json("SELECT to_jsonb(d) FROM xila.deleted_stack d");
+        assert_eq!(deleted["name"], "books");
+        assert_eq!(deleted["title"], "Books");
+
+        Spi::run(&format!("SELECT xila.rewind('books', 'stack', {})", deleted["id"])).unwrap();
+        assert_eq!(json("SELECT xila.open_stack('books')"), screen_before);
+        assert_eq!(json("SELECT xila.card('books')")["count"], 2);
+        assert_eq!(number("SELECT count(*) FROM xila.deleted_stack"), 0);
+        // Its cards are recorded again.
+        Spi::run("UPDATE books.cards SET year = 2 WHERE title = 'Candide'").unwrap();
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM xila.card_history_line
+                 WHERE stack = 'books' AND summary = 'Card “Candide” changed: year'"
+            ),
+            1
+        );
+    }
+
+    #[pg_test]
+    fn pgxila_never_alters_a_table_it_did_not_create() {
+        create_people();
+        create_library_table_for("ada");
+        become_role("ada");
+        assert_eq!(
+            json("SELECT coalesce(jsonb_agg(name), '[]') FROM xila.own_table"),
+            serde_json::json!(["library.books"])
+        );
+        assert_eq!(
+            text("SELECT xila.create_stack('Library', NULL, 'library.books')").as_deref(),
+            Some("library")
+        );
+        // One field per column, the key left out, and a title for the cards.
+        assert_eq!(fields_of("library"), serde_json::json!(["title", "author", "year", "bought"]));
+        assert_eq!(
+            json("SELECT xila.card('library', NULL, 'last')")["texts"]["heading"],
+            "Candide"
+        );
+        assert_eq!(
+            text("SELECT managed::text FROM xila.stack_info WHERE name = 'library'").as_deref(),
+            Some("false")
+        );
+        assert_eq!(number("SELECT count(*) FROM xila.own_table"), 0);
+
+        // Taking a field off the screen leaves the column where it is...
+        Spi::run("SELECT xila.remove_field('library', 'bought')").unwrap();
+        assert_eq!(
+            number(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'library' AND column_name = 'bought'"
+            ),
+            1
+        );
+        // ...and it can be shown again.
+        assert_eq!(
+            text("SELECT xila.add_field('library', 'Bought on', 'date', 'bought')").as_deref(),
+            Some("bought")
+        );
+        // A field that would need a new column is refused, and so is a rename.
+        let (state, message) = error_of("SELECT xila.add_field('library', 'Publisher')");
+        assert_eq!(state, "XL003");
+        assert!(
+            message.starts_with("The table of this stack has no column “publisher”."),
+            "{message}"
+        );
+        let (state, _) =
+            error_of(r#"SELECT xila.set_field('library', 'year', '{"name": "published"}')"#);
+        assert_eq!(state, "XL003");
+        let (state, _) =
+            error_of(r#"SELECT xila.set_field('library', 'year', '{"required": true}')"#);
+        assert_eq!(state, "XL003");
+
+        // A table that belongs to someone else cannot become a stack.
+        Spi::run("SELECT xila.delete_stack('library'); GRANT USAGE ON SCHEMA library TO bob")
+            .unwrap();
+        become_role("bob");
+        let (state, _) = error_of("SELECT xila.create_stack('Mine', NULL, 'library.books')");
+        assert_eq!(state, "XL004");
+    }
+
+    #[pg_test]
+    fn history_is_read_by_those_who_may_read_the_cards() {
+        create_books_as_ada();
+        Spi::run("GRANT USAGE ON SCHEMA books TO dan").unwrap();
+
+        // Without access to the table: nothing of the stack.
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.history_line WHERE stack = 'books'"), 0);
+
+        // With access to the whole table: its changes, cards included.
+        become_role("ada");
+        Spi::run("GRANT SELECT, UPDATE ON books.cards TO dan").unwrap();
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.card_history_line WHERE stack = 'books'"), 2);
+        assert_eq!(number("SELECT count(*) FROM xila.history_line WHERE stack = 'books'"), 1);
+        // ...and may rewind a card, but not the stack.
+        let key = json("SELECT xila.card('books')")["key"].as_str().unwrap().to_owned();
+        Spi::run(&format!(r#"SELECT xila.save_card('books', '{key}', '{{"year": "3"}}')"#))
+            .unwrap();
+        let change = number("SELECT max(id) FROM xila.card_history_line WHERE stack = 'books'");
+        Spi::run(&format!("SELECT xila.rewind('books', 'card', {change}, '{key}')")).unwrap();
+        assert_eq!(json("SELECT xila.card('books')")["values"]["year"], "1759");
+        let (state, _) = error_of(&format!("SELECT xila.rewind('books', 'stack', {change})"));
+        assert_eq!(state, "XL004");
+
+        // When the table hides rows, history hides the cards from all but
+        // those who may edit the stack.
+        become_role("ada");
+        Spi::run(
+            "ALTER TABLE books.cards ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY few ON books.cards FOR SELECT TO dan USING (title = 'Candide');",
+        )
+        .unwrap();
+        assert!(number("SELECT count(*) FROM xila.card_history_line WHERE stack = 'books'") > 0);
+        become_role("dan");
+        assert_eq!(number("SELECT count(*) FROM xila.card_history_line WHERE stack = 'books'"), 0);
+        assert!(number("SELECT count(*) FROM xila.history_line WHERE stack = 'books'") > 0);
+
+        // Nobody writes history by hand.
+        let (state, _) = error_of_statement(
+            "INSERT INTO xila.history (stack_id, object_kind, object_key, op)
+             SELECT id, 'card', 'x', 'delete' FROM xila.stack WHERE name = 'books'",
+        );
+        assert_eq!(state, "42501");
+    }
+
+    #[pg_test]
+    fn the_author_screens_are_stacks() {
+        create_people();
+        become_role("ada");
+
+        // The list of stacks offers authors what it hides from the others.
+        assert_eq!(
+            keys_of(&json("SELECT xila.open_stack('stacks')")),
+            ["F3=Quit", "F6=New stack", "F10=Deleted", "F11=Author", "F12=Back"]
+        );
+        become_role("dan");
+        assert_eq!(keys_of(&json("SELECT xila.open_stack('stacks')")), ["F3=Quit", "F12=Back"]);
+        let (state, _) = error_of("SELECT xila.act('stacks', 'new_stack')");
+        assert_eq!(state, "XL004");
+
+        // New stack: an empty form, then what was typed creates the stack.
+        become_role("ada");
+        assert_eq!(
+            json("SELECT xila.act('stacks', 'new_stack')"),
+            serde_json::json!([{ "do": "show", "stack": "new_stack" }, { "do": "new" }])
+        );
+        let form = json("SELECT xila.open_stack('new_stack')");
+        let widgets = form["widgets"].as_array().unwrap();
+        let source = widgets.iter().find(|w| w["name"] == "source").unwrap();
+        assert_eq!(
+            source["props"]["choices"],
+            serde_json::json!([{ "value": "", "label": "An empty stack" }])
+        );
+        let effects = json(
+            r#"SELECT xila.act('new_stack', 'create', '{"card": null, "dirty": {"title": "Books"}}')"#,
+        );
+        assert_eq!(effects[0], serde_json::json!({ "do": "back" }));
+        assert_eq!(
+            effects[1],
+            serde_json::json!({ "do": "show", "stack": "author", "card": "books" })
+        );
+
+        // Author mode shows the stack as a card, and its fields as a grid.
+        let card = json("SELECT xila.card('author', 'books', 'at')");
+        assert_eq!(card["values"]["title"], "Books");
+        assert_eq!(card["texts"]["heading"], "Books");
+        assert_eq!(
+            json(r#"SELECT xila.act('author', 'new_field', '{"card": "books"}')"#),
+            serde_json::json!([
+                { "do": "show", "stack": "field" },
+                { "do": "new", "values": { "stack": "books", "type": "text" } }
+            ])
+        );
+        for (label, kind) in [("Title", "text"), ("Read", "boolean"), ("Year", "number")] {
+            let effects = json(&format!(
+                r#"SELECT xila.act('field', 'save', '{{"card": null,
+                       "dirty": {{"stack": "books", "label": "{label}", "type": "{kind}"}}}}')"#
+            ));
+            assert_eq!(effects[0], serde_json::json!({ "do": "back" }));
+            assert_eq!(effects[1]["text"], format!("Field “{label}” added."));
+        }
+        let rows = json("SELECT xila.grid_rows('author', 'fields', 0, 100, 'books')");
+        assert_eq!(rows["total"], 3);
+        let cells: Vec<_> = rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r["cells"]["name"].as_str().unwrap(),
+                    r["cells"]["type_label"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(cells, ["title Text", "read Yes or no", "year Number"]);
+        // Without a card, a grid tied to the card has no rows.
+        assert_eq!(json("SELECT xila.grid_rows('author', 'fields')")["total"], 0);
+
+        // Moving a field keeps it selected.
+        let year = rows["rows"][2]["key"].as_str().unwrap().to_owned();
+        let effects = json(&format!(
+            r#"SELECT xila.act('author', 'up', '{{"card": "books", "row": "{year}"}}')"#
+        ));
+        assert_eq!(
+            effects,
+            serde_json::json!([{ "do": "reload" }, { "do": "select", "row": year }])
+        );
+        assert_eq!(fields_of("books"), serde_json::json!(["title", "year", "read"]));
+
+        // Editing a field: its card is the field; the type cannot change.
+        let field = json(&format!("SELECT xila.card('field', '{year}', 'at')"));
+        assert_eq!(field["values"]["label"], "Year");
+        assert_eq!(field["values"]["required"], "false");
+        let (state, _) = error_of(&format!(
+            r#"SELECT xila.act('field', 'save', '{{"card": "{year}", "dirty": {{"type": "date"}}}}')"#
+        ));
+        assert_eq!(state, "XL003");
+        Spi::run(&format!(
+            r#"SELECT xila.act('field', 'save',
+                   '{{"card": "{year}", "dirty": {{"label": "Published"}}}}')"#
+        ))
+        .unwrap();
+
+        // Removing it asks first.
+        Spi::run(r#"SELECT xila.save_card('books', NULL, '{"title": "Candide", "year": "1759"}')"#)
+            .unwrap();
+        let asked = json(&format!(r#"SELECT xila.act('field', 'remove', '{{"card": "{year}"}}')"#));
+        assert_eq!(asked[0]["do"], "confirm");
+        assert_eq!(
+            asked[0]["text"],
+            "Remove the field “Published”? 1 card has a value for it. History can bring it back."
+        );
+        let effects = json(&format!(
+            r#"SELECT xila.act('field', 'remove', '{{"card": "{year}", "confirmed": true}}')"#
+        ));
+        assert_eq!(effects[1]["text"], "Field “Published” removed.");
+        // A field that is gone is an error, not another field.
+        let (state, message) = error_of(&format!("SELECT xila.card('field', '{year}', 'at')"));
+        assert_eq!((state.as_str(), message.as_str()), ("XL002", "This no longer exists."));
+
+        // History, and rewinding from it.
+        assert_eq!(
+            json(r#"SELECT xila.act('author', 'history', '{"card": "books"}')"#),
+            serde_json::json!([{ "do": "show", "stack": "history", "card": "books" }])
+        );
+        // (This test is one transaction, hence one line: see first_change.)
+        let lines = json("SELECT xila.grid_rows('history', 'changes', 0, 100, 'books')");
+        assert_eq!(lines["total"], 1);
+        assert_eq!(lines["rows"][0]["cells"]["summary"], "Stack created");
+        assert_eq!(lines["rows"][0]["cells"]["actor"], "ada");
+        let line = first_change(
+            "books",
+            "h.object_kind = 'widget' AND h.op = 'delete' AND h.before->>'name' = 'year'",
+        );
+        let asked = json(&format!(
+            r#"SELECT xila.act('history', 'rewind_screen', '{{"card": "books", "row": "{line}"}}')"#
+        ));
+        assert_eq!(asked[0]["label"], "Rewind");
+        let effects = json(&format!(
+            r#"SELECT xila.act('history', 'rewind_screen',
+                   '{{"card": "books", "row": "{line}", "confirmed": true}}')"#
+        ));
+        assert_eq!(effects[0], serde_json::json!({ "do": "back" }));
+        assert_eq!(effects[1]["text"], "2 changes undone.");
+        assert_eq!(number("SELECT year::bigint FROM books.cards"), 1759);
+
+        // Deleting the stack, and bringing it back from the deleted stacks.
+        let asked = json(r#"SELECT xila.act('author', 'delete_stack', '{"card": "books"}')"#);
+        assert_eq!(asked[0]["do"], "confirm");
+        Spi::run(
+            r#"SELECT xila.act('author', 'delete_stack', '{"card": "books", "confirmed": true}')"#,
+        )
+        .unwrap();
+        let deleted = json("SELECT xila.grid_rows('deleted_stacks', 'list')");
+        assert_eq!(deleted["rows"][0]["cells"]["title"], "Books");
+        let row = deleted["rows"][0]["key"].as_str().unwrap();
+        let effects = json(&format!(
+            r#"SELECT xila.act('deleted_stacks', 'restore',
+                   '{{"row": "{row}", "confirmed": true}}')"#
+        ));
+        assert_eq!(effects[1]["text"], "Stack “Books” restored.");
+        assert_eq!(json("SELECT xila.card('books')")["count"], 1);
+    }
+
+    #[pg_test]
+    fn author_mode_is_offered_on_the_stacks_one_may_change() {
+        create_books_as_ada();
+        assert_eq!(
+            json("SELECT xila.act('books', 'author')"),
+            serde_json::json!([{ "do": "show", "stack": "author", "card": "books" }])
+        );
+        assert_eq!(
+            json(r#"SELECT xila.act('stacks', 'author', '{"row": "books"}')"#),
+            serde_json::json!([{ "do": "show", "stack": "author", "card": "books" }])
+        );
+        assert_eq!(
+            json(r#"SELECT xila.act('author', 'browse', '{"card": "books"}')"#),
+            serde_json::json!([{ "do": "show", "stack": "books" }])
+        );
+
+        Spi::run(
+            "GRANT USAGE ON SCHEMA books TO xila_user;
+             GRANT SELECT ON books.cards TO xila_user;",
+        )
+        .unwrap();
+        become_role("bob");
+        let screen = json("SELECT xila.open_stack('books')");
+        assert_eq!(screen["stack"]["may_edit"], false);
+        assert!(
+            keys_of(&screen).iter().all(|key| !key.starts_with("F11")),
+            "author mode is not offered on someone else's stack"
+        );
+        let (state, _) = error_of("SELECT xila.act('books', 'author')");
+        assert_eq!(state, "XL004");
     }
 
     #[pg_test]
