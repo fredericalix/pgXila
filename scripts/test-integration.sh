@@ -51,7 +51,7 @@ psql_in db-scratch -v role="$ROLE" -v outsider="$OUTSIDER" -v password="$PASSWOR
 CREATE ROLE :"role" LOGIN PASSWORD :'password' IN ROLE xila_user;
 CREATE ROLE :"outsider" LOGIN PASSWORD :'password';
 SQL
-PGXILA_SERVICE=db-scratch scripts/load-example.sh carnet
+PGXILA_SERVICE=db-scratch scripts/load-example.sh addressbook
 
 export PGXILA_TEST_HOST=localhost
 export PGXILA_TEST_PORT="$PORT"
@@ -80,8 +80,8 @@ scratch -e PGPASSWORD="$PASSWORD" db-scratch \
     psql -X -q -v ON_ERROR_STOP=1 "host=localhost dbname=pgxila user=$ROLE sslmode=require" <<'SQL'
 SET search_path = '';
 SET xila.restoring = on;
-UPDATE carnet.contacts SET ville = 'Ailleurs' WHERE nom = 'Pascal';
-UPDATE carnet.contacts SET ville = 'Clermont-Ferrand' WHERE nom = 'Pascal';
+UPDATE addressbook.contacts SET city = 'Ailleurs' WHERE last_name = 'Pascal';
+UPDATE addressbook.contacts SET city = 'Clermont-Ferrand' WHERE last_name = 'Pascal';
 SQL
 after="$(history_count)"
 [ "$after" -eq "$((before + 2))" ] || {
@@ -94,9 +94,12 @@ summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.ba
                 (SELECT count(*) FROM xila.widget), (SELECT count(*) FROM xila.layout),
                 (SELECT count(*) FROM xila.action), (SELECT count(*) FROM xila.key_binding),
                 (SELECT count(*) FROM xila.palette), (SELECT count(*) FROM xila.history),
-                (SELECT count(*) FROM carnet.contacts),
+                (SELECT count(*) FROM addressbook.contacts),
+                (SELECT count(*) FROM xila.image), (SELECT count(photo) FROM addressbook.contacts),
+                (SELECT md5(string_agg(i.pixels::text, '' ORDER BY c.last_name))
+                   FROM addressbook.contacts c JOIN xila.image i ON i.id = c.photo),
                 (SELECT count(*) FROM pg_trigger WHERE tgname = 'xila_card'),
-                xila.card('carnet')->'texts'"
+                xila.card('addressbook')->'texts'"
 scratch db-scratch sh -c '
     set -e
     pg_dump -d pgxila -Fc -f /tmp/pgxila.dump

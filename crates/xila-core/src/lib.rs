@@ -7,6 +7,8 @@
 
 pub mod api;
 pub mod connection;
+pub mod input;
+pub mod login;
 pub mod server;
 pub mod session;
 pub mod text_layout;

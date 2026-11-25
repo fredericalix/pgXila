@@ -6,8 +6,8 @@
 //! AS/400 screen:
 //!
 //! ```text
-//!  Nom . . . . . . . :  Lovelace
-//!  Prénom  . . . . . :  Ada
+//!  Last name . . . :  Lovelace
+//!  First name  . . :  Ada
 //! ```
 //!
 //! This guarantees that any stack is usable in a terminal, even one that was
@@ -72,7 +72,7 @@ impl TextLayout {
     }
 }
 
-/// A label followed by dot leaders and a colon: `Nom . . . . . . . :`.
+/// A label followed by dot leaders and a colon: `Last name . . . :`.
 pub fn leader(label: &str, width: usize) -> String {
     let mut text: String = label.chars().take(width.saturating_sub(2)).collect();
     let label_length = text.chars().count();
@@ -226,18 +226,18 @@ mod tests {
 
     #[test]
     fn leaders_fill_the_label_column() {
-        assert_eq!(leader("Nom", 17), "Nom . . . . . . :");
-        assert_eq!(leader("Prénom", 17), "Prénom  . . . . :");
-        assert_eq!(leader("Un libellé beaucoup trop long", 17), "Un libellé beau :");
+        assert_eq!(leader("Last name", 17), "Last name . . . :");
+        assert_eq!(leader("First name", 17), "First name  . . :");
+        assert_eq!(leader("A label that is far too long", 17), "A label that is :");
     }
 
     #[test]
     fn fields_without_placement_flow_down_in_logical_order() {
         let layout = layout(&screen(
             serde_json::json!([
-                { "name": "ville", "kind": "field", "ord": 30, "label": "Ville", "column": "ville" },
-                { "name": "nom", "kind": "field", "ord": 10, "label": "Nom", "column": "nom" },
-                { "name": "prenom", "kind": "field", "ord": 20, "label": "Prénom", "column": "prenom" }
+                { "name": "city", "kind": "field", "ord": 30, "label": "City", "column": "city" },
+                { "name": "last_name", "kind": "field", "ord": 10, "label": "Last name", "column": "last_name" },
+                { "name": "first_name", "kind": "field", "ord": 20, "label": "First name", "column": "first_name" }
             ]),
             serde_json::json!([]),
         ));
@@ -254,18 +254,18 @@ mod tests {
             .collect();
         assert_eq!(
             placed,
-            [("nom", 1, 20, 3, 40), ("prenom", 1, 20, 4, 40), ("ville", 1, 20, 5, 40)]
+            [("last_name", 1, 20, 3, 40), ("first_name", 1, 20, 4, 40), ("city", 1, 20, 5, 40)]
         );
-        assert_eq!(layout.focus_order, ["nom", "prenom", "ville"]);
+        assert_eq!(layout.focus_order, ["last_name", "first_name", "city"]);
     }
 
     #[test]
     fn an_explicit_placement_wins_over_the_default_one() {
         let layout = layout(&screen(
             serde_json::json!([
-                { "name": "nom", "kind": "field", "ord": 10, "label": "Nom", "column": "nom",
+                { "name": "last_name", "kind": "field", "ord": 10, "label": "Last name", "column": "last_name",
                   "layout": { "text": { "x": 50, "y": 10, "w": 12, "h": 1 } } },
-                { "name": "ville", "kind": "field", "ord": 20, "label": "Ville", "column": "ville" }
+                { "name": "city", "kind": "field", "ord": 20, "label": "City", "column": "city" }
             ]),
             serde_json::json!([]),
         ));
@@ -278,9 +278,9 @@ mod tests {
     fn a_widget_hidden_for_the_text_renderer_is_left_out() {
         let layout = layout(&screen(
             serde_json::json!([
-                { "name": "titre", "kind": "text", "ord": 10,
+                { "name": "title", "kind": "text", "ord": 10,
                   "layout": { "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } } },
-                { "name": "nom", "kind": "field", "ord": 20, "label": "Nom", "column": "nom" }
+                { "name": "last_name", "kind": "field", "ord": 20, "label": "Last name", "column": "last_name" }
             ]),
             serde_json::json!([]),
         ));
@@ -292,7 +292,7 @@ mod tests {
     fn buttons_become_a_numbered_menu() {
         let layout = layout(&screen(
             serde_json::json!([
-                { "name": "piles", "kind": "button", "ord": 10, "label": "Mes piles", "action": "open_stacks" },
+                { "name": "piles", "kind": "button", "ord": 10, "label": "My stacks", "action": "open_stacks" },
                 { "name": "docs", "kind": "button", "ord": 20, "label": "Documents", "action": "open_docs" }
             ]),
             serde_json::json!([]),
@@ -303,7 +303,7 @@ mod tests {
                 Item::Option {
                     number: 1,
                     action: "open_stacks".into(),
-                    label: "Mes piles".into(),
+                    label: "My stacks".into(),
                     x: 3,
                     y: 3
                 },
@@ -326,13 +326,13 @@ mod tests {
     fn a_button_whose_action_has_a_function_key_is_not_repeated() {
         let layout = layout(&screen(
             serde_json::json!([
-                { "name": "nom", "kind": "field", "ord": 10, "label": "Nom", "column": "nom" },
-                { "name": "suivante", "kind": "button", "ord": 20, "label": "Suiv.", "action": "next_card" }
+                { "name": "last_name", "kind": "field", "ord": 10, "label": "Last name", "column": "last_name" },
+                { "name": "next", "kind": "button", "ord": 20, "label": "Next", "action": "next_card" }
             ]),
-            serde_json::json!([{ "key": "F8", "label": "Suiv.", "action": "next_card" }]),
+            serde_json::json!([{ "key": "F8", "label": "Next", "action": "next_card" }]),
         ));
         assert_eq!(layout.items.len(), 1);
-        assert_eq!(layout.focus_order, ["nom"]);
+        assert_eq!(layout.focus_order, ["last_name"]);
     }
 
     #[test]
