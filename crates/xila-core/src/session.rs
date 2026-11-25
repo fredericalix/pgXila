@@ -12,6 +12,9 @@ use crate::api::{
     PaletteColour, Screen, Widget, WidgetKind,
 };
 
+/// The version of the API this client speaks; see `docs/api.md`.
+pub const API_VERSION: u32 = 2;
+
 /// The rows of a grid widget and the selected one.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GridState {
@@ -78,6 +81,22 @@ impl View {
         self.screen.widgets.iter().chain(self.card.widgets.iter())
     }
 
+    /// What a text widget shows. The server computes it for the card on
+    /// screen. A card that is not saved yet has no such text: a text that
+    /// depends on nothing is shown as it is written, and any other is empty.
+    pub fn text(&self, name: &str) -> &str {
+        if let Some(text) = self.card.texts.get(name) {
+            return text;
+        }
+        let widget = self.widgets().find(|w| w.name == name);
+        let template = widget.and_then(|w| w.props.get("template")).and_then(|v| v.as_str());
+        match template {
+            Some(fixed) if !fixed.contains('{') => fixed,
+            Some(_) => "",
+            None => widget.and_then(|w| w.label.as_deref()).unwrap_or(""),
+        }
+    }
+
     /// The key of the card on screen, unless it is not saved yet.
     fn card_key(&self) -> Option<&str> {
         if self.is_new {
@@ -133,6 +152,9 @@ impl<A: Api> Session<A> {
     /// Greets the server and opens the home stack.
     pub fn start(mut api: A) -> Result<Self, ApiError> {
         let hello = api.hello()?;
+        if hello.api != API_VERSION {
+            return Err(ApiError::Version { client: API_VERSION, server: hello.api });
+        }
         let palette = api.palette()?;
         let home = open(&mut api, &hello.home, None)?;
         let mut session = Session {
@@ -226,10 +248,9 @@ impl<A: Api> Session<A> {
     /// to the previous one. Returns false when the field takes any value.
     pub fn cycle(&mut self, widget: &str, forward: bool) -> bool {
         let view = self.view();
-        let next = view
-            .widgets()
-            .find(|w| w.name == widget)
-            .and_then(|w| Some((w.column.clone()?, w.next_choice(view.value(w.column.as_deref()?), forward)?)));
+        let next = view.widgets().find(|w| w.name == widget).and_then(|w| {
+            Some((w.column.clone()?, w.next_choice(view.value(w.column.as_deref()?), forward)?))
+        });
         match next {
             Some((column, value)) => {
                 self.edit(&column, value);
@@ -498,6 +519,7 @@ fn describe(error: &ApiError) -> String {
     match error {
         ApiError::User { message, .. } => message.clone(),
         ApiError::Other(message) => format!("Error: {message}"),
+        ApiError::Version { .. } => error.to_string(),
     }
 }
 
@@ -519,6 +541,8 @@ mod tests {
         grid_cards: Vec<Option<String>>,
         /// Stacks that no longer exist.
         gone: Vec<String>,
+        /// The version of the API the server claims, when not the current one.
+        api: Option<u32>,
     }
 
     impl FakeServer {
@@ -578,7 +602,7 @@ mod tests {
     impl Api for FakeServer {
         fn hello(&mut self) -> Result<Hello, ApiError> {
             Ok(Hello {
-                api: 1,
+                api: self.api.unwrap_or(API_VERSION),
                 version: "0".into(),
                 instance: "test".into(),
                 role: "ada".into(),
@@ -673,6 +697,18 @@ mod tests {
         assert_eq!(
             session.api.calls,
             ["palette", "open_stack stacks", "card stacks None first", "grid_rows stacks list"]
+        );
+    }
+
+    #[test]
+    fn a_server_of_another_version_is_refused() {
+        let server = FakeServer { api: Some(1), ..FakeServer::default() };
+        let error = Session::start(server).err().expect("a refusal");
+        assert_eq!(error, ApiError::Version { client: 2, server: 1 });
+        assert_eq!(
+            error.to_string(),
+            "This client speaks version 2 of the pgXila API and the server version 1: \
+             update the older of the two."
         );
     }
 
@@ -783,8 +819,10 @@ mod tests {
 
     #[test]
     fn a_new_card_is_empty_and_is_sent_without_a_key() {
-        let mut session =
-            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New { values: BTreeMap::new() }]));
+        let mut session = on_addressbook(
+            FakeServer::default()
+                .answering("new_card", vec![Effect::New { values: BTreeMap::new() }]),
+        );
         session.run("new_card");
         assert!(session.view().is_new);
         assert_eq!(session.view().value("city"), "");
@@ -798,10 +836,34 @@ mod tests {
     }
 
     #[test]
+    fn a_new_card_keeps_the_texts_that_depend_on_nothing() {
+        let mut session = on_addressbook(
+            FakeServer::default()
+                .answering("new_card", vec![Effect::New { values: BTreeMap::new() }]),
+        );
+        let widgets: Vec<Widget> = serde_json::from_value(serde_json::json!([
+            { "name": "heading", "kind": "text", "ord": 1, "props": { "template": "New stack" } },
+            { "name": "title", "kind": "text", "ord": 2, "props": { "template": "{city}" } },
+            { "name": "note", "kind": "text", "ord": 3, "label": "A note" }
+        ]))
+        .unwrap();
+        session.view_mut().screen.widgets.extend(widgets);
+        session.view_mut().card.texts.insert("title".into(), "Ville 1".into());
+        assert_eq!(session.view().text("title"), "Ville 1");
+
+        session.run("new_card");
+        assert_eq!(session.view().text("heading"), "New stack");
+        assert_eq!(session.view().text("title"), "", "there is no city yet");
+        assert_eq!(session.view().text("note"), "A note");
+        assert_eq!(session.view().text("nothing"), "");
+    }
+
+    #[test]
     fn a_new_card_may_come_with_some_fields_filled_in() {
         let values = BTreeMap::from([("city".to_string(), "London".to_string())]);
-        let mut session =
-            on_addressbook(FakeServer::default().answering("new_card", vec![Effect::New { values }]));
+        let mut session = on_addressbook(
+            FakeServer::default().answering("new_card", vec![Effect::New { values }]),
+        );
         session.run("new_card");
         assert_eq!(session.view().value("city"), "London");
 
@@ -815,14 +877,18 @@ mod tests {
     fn an_action_may_ask_before_it_goes_on() {
         let ask =
             vec![Effect::Confirm { text: "Delete this card?".into(), label: "Delete".into() }];
-        let server = FakeServer::default()
-            .answering("delete", ask)
-            .answering_once_confirmed("delete", vec![Effect::Message { text: "Card deleted.".into() }]);
+        let server = FakeServer::default().answering("delete", ask).answering_once_confirmed(
+            "delete",
+            vec![Effect::Message { text: "Card deleted.".into() }],
+        );
         let mut session = on_addressbook(server);
 
         session.run("delete");
         let question = session.question().expect("a question is pending");
-        assert_eq!((question.text.as_str(), question.label.as_str()), ("Delete this card?", "Delete"));
+        assert_eq!(
+            (question.text.as_str(), question.label.as_str()),
+            ("Delete this card?", "Delete")
+        );
         assert_eq!(session.message(), None);
 
         // Refusing does nothing at all.
@@ -885,8 +951,10 @@ mod tests {
 
     #[test]
     fn a_grid_lists_what_belongs_to_the_card_on_screen() {
-        let server = FakeServer::default()
-            .answering("author", vec![Effect::Show { stack: "stacks".into(), card: Some("7".into()) }]);
+        let server = FakeServer::default().answering(
+            "author",
+            vec![Effect::Show { stack: "stacks".into(), card: Some("7".into()) }],
+        );
         let mut session = Session::start(server).unwrap();
         assert_eq!(session.api.grid_cards, [Some("1".to_string())]);
 

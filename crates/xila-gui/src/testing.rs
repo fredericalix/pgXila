@@ -1,5 +1,5 @@
 //! A server in memory, for the tests of the graphical client: a desktop, a
-//! stack list and an address book with two cards.
+//! stack list, an address book with two cards, and the author screens.
 
 use std::collections::BTreeMap;
 
@@ -94,10 +94,109 @@ fn addressbook(name: &str) -> Screen {
     .unwrap()
 }
 
+/// Author mode on one stack: a dialog that shows a card of a view.
+fn author() -> Screen {
+    serde_json::from_value(serde_json::json!({
+        "stack": { "name": "author", "title": "Author mode", "kind": "system" },
+        "source": { "has_cards": true, "count": 3 },
+        "widgets": [
+            { "name": "heading", "kind": "text", "ord": 10,
+              "props": { "template": "{title}", "style": "title" } },
+            { "name": "mode", "kind": "text", "ord": 20,
+              "props": { "template": "Author mode", "style": "subtitle" } },
+            { "name": "title", "kind": "field", "ord": 30, "label": "Title",
+              "column": "title", "type": "text" },
+            { "name": "card_title", "kind": "field", "ord": 40, "label": "Card title",
+              "column": "card_title", "type": "text" },
+            { "name": "fields", "kind": "grid", "ord": 50, "action": "edit_field",
+              "props": { "columns": [
+                  { "column": "label", "label": "Field" },
+                  { "column": "name", "label": "Name" },
+                  { "column": "type_label", "label": "Type" },
+                  { "column": "required_label", "label": "Required" } ] } },
+            { "name": "new_field", "kind": "button", "ord": 60, "label": "New field",
+              "action": "new_field",
+              "layout": { "graphic": { "x": 0, "y": 0, "w": 0, "h": 0,
+                                       "style": { "variant": "primary" } } } },
+            { "name": "history", "kind": "button", "ord": 70, "label": "History",
+              "action": "history" },
+            { "name": "delete_stack", "kind": "button", "ord": 80, "label": "Delete stack",
+              "action": "delete_stack" }
+        ],
+        "actions": [],
+        "keys": [
+            { "key": "F3", "label": "Quit", "action": "quit" },
+            { "key": "F6", "label": "New field", "action": "new_field" },
+            { "key": "F7", "label": "Up", "action": "up" },
+            { "key": "F8", "label": "Down", "action": "down" },
+            { "key": "F10", "label": "History", "action": "history" },
+            { "key": "F11", "label": "Browse", "action": "browse" },
+            { "key": "F12", "label": "Back", "action": "back" },
+            { "key": "Enter", "label": "Save", "action": "save" }
+        ]
+    }))
+    .unwrap()
+}
+
+/// One field of a stack: a text, a choice and a check box.
+fn field() -> Screen {
+    serde_json::from_value(serde_json::json!({
+        "stack": { "name": "field", "title": "Field", "kind": "system" },
+        "source": { "has_cards": true, "count": 3 },
+        "widgets": [
+            { "name": "heading", "kind": "text", "ord": 10,
+              "props": { "template": "Field", "style": "title" } },
+            { "name": "label", "kind": "field", "ord": 30, "label": "Label",
+              "column": "label", "type": "text" },
+            { "name": "name", "kind": "field", "ord": 40, "label": "Name",
+              "column": "name", "type": "text" },
+            { "name": "type", "kind": "field", "ord": 50, "label": "Type",
+              "column": "type", "type": "text",
+              "props": { "choices": [
+                  { "value": "text", "label": "Text" },
+                  { "value": "number", "label": "Number" },
+                  { "value": "date", "label": "Date" },
+                  { "value": "boolean", "label": "Yes or no" } ] } },
+            { "name": "required", "kind": "field", "ord": 60, "label": "Required",
+              "column": "required", "type": "boolean" },
+            { "name": "save", "kind": "button", "ord": 70, "label": "Save", "action": "save",
+              "layout": { "graphic": { "x": 0, "y": 0, "w": 0, "h": 0,
+                                       "style": { "variant": "primary" } } } },
+            { "name": "remove", "kind": "button", "ord": 80, "label": "Remove",
+              "action": "remove" },
+            { "name": "cancel", "kind": "button", "ord": 90, "label": "Cancel",
+              "action": "back" }
+        ],
+        "actions": [],
+        "keys": [
+            { "key": "F3", "label": "Quit", "action": "quit" },
+            { "key": "F12", "label": "Back", "action": "back" },
+            { "key": "Enter", "label": "Save", "action": "save" }
+        ]
+    }))
+    .unwrap()
+}
+
+/// The keys a stack built in author mode has: more than the bar shows at
+/// its usual spacing.
+pub fn keys_of_a_built_stack() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("F3", "Quit"),
+        ("F4", "Delete"),
+        ("F6", "New"),
+        ("F7", "Prev."),
+        ("F8", "Next"),
+        ("F10", "History"),
+        ("F11", "Author"),
+        ("F12", "Back"),
+        ("Enter", "Save"),
+    ]
+}
+
 impl Api for Fake {
     fn hello(&mut self) -> Result<Hello, ApiError> {
         Ok(Hello {
-            api: 1,
+            api: 2,
             version: "0".into(),
             instance: "normandie-01".into(),
             role: "ada".into(),
@@ -125,6 +224,8 @@ impl Api for Fake {
         Ok(match stack {
             "desktop" => desktop(),
             "stacks" => stacks(),
+            "author" => author(),
+            "field" => field(),
             other => addressbook(other),
         })
     }
@@ -144,6 +245,33 @@ impl Api for Fake {
                 ..Card::default()
             },
             "stacks" => Card { position: 1, count: 1, ..Card::default() },
+            "author" => Card {
+                key: text(key.unwrap_or("addressbook")),
+                position: 1,
+                count: 3,
+                values: BTreeMap::from([
+                    ("title".to_owned(), text("Address book")),
+                    ("card_title".to_owned(), text("{last_name}, {first_name}")),
+                ]),
+                texts: BTreeMap::from([
+                    ("heading".to_owned(), "Address book".to_owned()),
+                    ("mode".to_owned(), "Author mode".to_owned()),
+                ]),
+                ..Card::default()
+            },
+            "field" => Card {
+                key: text(key.unwrap_or("f1")),
+                position: 1,
+                count: 3,
+                values: BTreeMap::from([
+                    ("label".to_owned(), text("Last name")),
+                    ("name".to_owned(), text("last_name")),
+                    ("type".to_owned(), text("text")),
+                    ("required".to_owned(), text("true")),
+                ]),
+                texts: BTreeMap::from([("heading".to_owned(), "Field".to_owned())]),
+                ..Card::default()
+            },
             _ if key == Some("2") => Card {
                 key: text("2"),
                 position: 2,
@@ -171,7 +299,33 @@ impl Api for Fake {
         })
     }
 
-    fn grid_rows(&mut self, _stack: &str, _widget: &str) -> Result<GridPage, ApiError> {
+    fn grid_rows(
+        &mut self,
+        stack: &str,
+        _widget: &str,
+        card: Option<&str>,
+    ) -> Result<GridPage, ApiError> {
+        if stack == "author" {
+            let row = |key: &str, cells: [&str; 4]| GridRow {
+                key: key.into(),
+                cells: ["label", "name", "type_label", "required_label"]
+                    .into_iter()
+                    .zip(cells)
+                    .map(|(column, cell)| (column.to_owned(), Some(cell.to_owned())))
+                    .collect(),
+            };
+            // The fields belong to the stack on screen: none without it.
+            let rows = if card.is_some() {
+                vec![
+                    row("f1", ["Last name", "last_name", "Text", "Yes"]),
+                    row("f2", ["First name", "first_name", "Text", ""]),
+                    row("f3", ["Birthday", "birthday", "Date", ""]),
+                ]
+            } else {
+                Vec::new()
+            };
+            return Ok(GridPage { total: rows.len() as u64, rows });
+        }
         let row = |key: &str, title: &str, cards: &str| GridRow {
             key: key.into(),
             cells: BTreeMap::from([
@@ -200,8 +354,29 @@ impl Api for Fake {
             "open_stacks" => vec![show("stacks", None)],
             "open" => vec![show(context.row.as_deref().unwrap_or("addressbook"), None)],
             "next_card" => vec![show(stack, Some("2"))],
-            "new_card" => vec![Effect::New],
+            "new_card" => vec![Effect::New { values: BTreeMap::new() }],
             "save_card" => vec![Effect::Message { text: "Card saved.".into() }],
+            "author" => vec![show("author", Some("addressbook"))],
+            "edit_field" => vec![show("field", context.row.as_deref())],
+            "new_field" => vec![
+                show("field", None),
+                Effect::New {
+                    values: BTreeMap::from([
+                        ("stack".to_owned(), "addressbook".to_owned()),
+                        ("type".to_owned(), "text".to_owned()),
+                    ]),
+                },
+            ],
+            "delete_stack" if !context.confirmed => vec![Effect::Confirm {
+                text: "Delete the stack “Address book”? Its cards are kept, and the stack \
+                       can be restored."
+                    .into(),
+                label: "Delete".into(),
+            }],
+            "delete_stack" => {
+                vec![Effect::Back, Effect::Message { text: "Stack “Address book” deleted.".into() }]
+            }
+            "save" => vec![Effect::Back, Effect::Message { text: "Field saved.".into() }],
             "back" => vec![Effect::Back],
             "quit" => vec![Effect::Quit],
             other => {

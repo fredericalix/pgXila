@@ -92,6 +92,15 @@ pub fn layout(screen: &Screen) -> TextLayout {
     let mut widgets: Vec<&Widget> = screen.widgets.iter().collect();
     widgets.sort_by(|a, b| (a.ord, &a.name).cmp(&(b.ord, &b.name)));
 
+    // A button that no key triggers becomes a numbered option. A list leaves
+    // room under it for the options that follow and for their prompt.
+    let is_option = |widget: &Widget| {
+        widget.kind == WidgetKind::Button
+            && !widget.layout.get(RENDERER).is_some_and(|p| p.hidden())
+            && widget.action.as_deref().is_some_and(|action| !bound_to_a_key.contains(action))
+    };
+    let mut options_left = widgets.iter().filter(|w| is_option(w)).count() as u16;
+
     let mut result = TextLayout::default();
     let mut row = CONTENT_TOP;
     let mut previous: Option<WidgetKind> = None;
@@ -159,6 +168,7 @@ pub fn layout(screen: &Screen) -> TextLayout {
                 }
                 row = flowing_row(row, previous, widget.kind);
                 options += 1;
+                options_left = options_left.saturating_sub(1);
                 result.items.push(Item::Option {
                     number: options,
                     action,
@@ -173,7 +183,9 @@ pub fn layout(screen: &Screen) -> TextLayout {
             WidgetKind::Grid => {
                 let (x, y, w, h) = explicit.unwrap_or_else(|| {
                     row = flowing_row(row, previous, widget.kind);
-                    let height = (CONTENT_BOTTOM + 1).saturating_sub(row).max(2);
+                    // A blank row, the options, a blank row and the prompt.
+                    let reserved = if options_left > 0 { options_left + 3 } else { 0 };
+                    let height = (CONTENT_BOTTOM + 1).saturating_sub(row + reserved).max(2);
                     (LEFT, row, COLUMNS - 2 * LEFT, height)
                 });
                 if explicit.is_none() {

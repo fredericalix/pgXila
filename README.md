@@ -18,7 +18,8 @@ pgXila is made of two parts:
 ## Status
 
 Early development. Phase 1 is done: one vertical slice, from the database to
-two clients.
+two clients. Phase 2, author mode, has its first step: a stack can be built from
+the client, without SQL.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -31,12 +32,16 @@ two clients.
   database;
 - **the text client**, in the manner of an AS/400 display, and **the
   graphical client**, in pixel art: connect, browse the cards of a stack, edit
-  a field and write it back. Both draw the same screens from the same rows.
+  a field and write it back. Both draw the same screens from the same rows;
+- **author mode**, in both clients: create a stack, add, rename, order and
+  remove its fields, and delete it. A stack belongs to its author;
+- **rewinding**: a card, the screen of a stack or a whole stack goes back to
+  before any recorded change, a deleted stack or a removed field included.
 
-Not there yet: author mode, the agent and multiple instances. Until author mode
-exists, a stack is built with SQL, as
-[examples/addressbook.sql](examples/addressbook.sql) shows. The interface is in
-English.
+Not there yet: placing widgets by hand, drawing pictures and scripts (the next
+steps of author mode), the agent and multiple instances. A stack can also be
+built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
+The interface is in English.
 
 ## Requirements
 
@@ -52,11 +57,11 @@ Docker image. Nothing has to be installed on the host for the server.
 # 1. Build and start the server (the first build takes several minutes)
 docker compose up --build --detach --wait
 
-# 2. Create a user; the password is asked for
-scripts/create-user.sh ada
+# 2. Create a user who may build stacks; the password is asked for
+scripts/create-user.sh ada --author
 
-# 3. Load the example stack, an address book
-scripts/load-example.sh addressbook
+# 3. Load the example stack, an address book, and hand it to that user
+scripts/load-example.sh addressbook --owner ada
 
 # 4. Run a client: in a window...
 cargo run -p xila-gui -- --user ada --ca docker/certs/ca.crt
@@ -68,9 +73,12 @@ cargo run -p xila-term -- --user ada --ca docker/certs/ca.crt
 In either client, type the password and press Enter. Open the list of stacks
 (Enter in the window, `1` then Enter in the terminal), and press Enter again to
 open the address book. `F7` and `F8` browse the cards, `Tab` moves between
-fields, Enter saves, `F6` starts a new card, `F12` goes back and `F3` quits.
-Moving to another card also saves what was typed. A change made by someone else
-appears on screen by itself.
+fields, Enter saves, `F6` starts a new card, `F4` deletes the card, `F12` goes
+back and `F3` quits. Moving to another card also saves what was typed. A change
+made by someone else appears on screen by itself.
+
+To build a stack of your own, press `F6` in the list of stacks: see
+[Author mode](#author-mode).
 
 ## The server
 
@@ -92,9 +100,9 @@ docker compose exec -u postgres db psql -d pgxila
 ```
 
 Users are PostgreSQL roles, members of `xila_user`. `scripts/create-user.sh`
-creates one; add `--author` for a member of `xila_author`, who may also write
-stack definitions. Any PostgreSQL client that verifies the certificate can
-connect with such a role:
+creates one; add `--author` for a member of `xila_author`, who may also build
+stacks. Any PostgreSQL client that verifies the certificate can connect with
+such a role:
 
 ```sh
 psql "host=localhost port=5419 dbname=pgxila user=ada sslmode=verify-full sslrootcert=docker/certs/ca.crt"
@@ -169,6 +177,41 @@ to show the pixels, without a graphics card.
 the colours of `xila.palette`, as 24-bit colours: use a terminal that supports
 them.
 
+## Author mode
+
+An author builds a stack from either client, with forms:
+
+| Where | Key | What it does |
+|-------|-----|--------------|
+| My stacks | `F6` | New stack: a title is enough. The stack gets a table of its own |
+| My stacks | `F11` | Author mode on the selected stack |
+| A stack | `F11` | Author mode on that stack, for those who may change it |
+| Author mode | `F6` | New field: a label and a type (text, number, date, yes or no) |
+| Author mode | Enter | Saves the title, or opens the selected field |
+| Author mode | `F7`, `F8` | Moves the selected field up or down |
+| Author mode | `F10` | History of the stack, to rewind its screen or all of it |
+| Author mode | `F11` | Shows the stack as its users see it |
+| A stack | `F10` | History of its cards, to bring one back to before a change |
+| My stacks | `F10` | The stacks you deleted, to bring one back |
+
+Removing a field drops its column, and deleting a stack removes its screens;
+both ask first, and both can be undone from the history. Nothing is ever lost: a
+rewind is itself recorded and can be rewound.
+
+A stack belongs to the role that created it. Only that role and its members may
+change it, and PostgreSQL enforces this on the tables themselves. A new stack is
+visible to its author alone; to let others use its cards, grant them privileges
+on its table, as for any table:
+
+```sql
+GRANT USAGE ON SCHEMA books TO xila_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON books.cards TO xila_user;
+```
+
+A stack can also be made from a table that already exists and that you own:
+choose it in the New stack dialog. pgXila then shows the table and never alters
+it; its columns are added and removed in SQL.
+
 ## Security model
 
 - **TLS 1.3 only.** `ssl_min_protocol_version` is `TLSv1.3` and `pg_hba.conf`
@@ -183,6 +226,12 @@ them.
 - **Clients verify the server.** The client code always requires TLS 1.3,
   verifies the certificate chain and the host name (the equivalent of
   `sslmode=verify-full`), and requires SCRAM channel binding.
+- **Ownership is enforced by PostgreSQL.** Row-level security on the tables of
+  the `xila` schema lets only the owner of a stack change its definition, and
+  only a superuser change the system stacks. The functions of pgXila run with
+  the privileges of the caller, so `GRANT`, `REVOKE` and row-level security on
+  the tables of the stacks apply unchanged. History follows the same rule: it
+  shows the old versions of a card only to those who may read the card.
 
 ## Tests
 
@@ -202,8 +251,9 @@ The integration tests prove, among other things, that an unencrypted connection
 is refused, both by the configuration and by the extension alone, that TLS 1.2
 is refused, and that the client rejects an untrusted certificate or a wrong
 host name. They also drive both clients from the desktop to a card, with its
-picture, and check what is written. They run against a throwaway server and do
-not touch the data of the development server.
+picture, and check what is written; and an author builds a stack from the
+client, rewinds it, deletes it and brings it back. They run against a throwaway
+server and do not touch the data of the development server.
 
 The same three suites run in GitHub Actions on every push, with the clients
 built and tested on Linux, macOS and Windows.
@@ -212,7 +262,7 @@ built and tested on Linux, macOS and Windows.
 
 | Path | Content |
 |------|---------|
-| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, and SQL) |
+| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, and SQL: schema, client API, author functions, actions, system stacks) |
 | `crates/xila-core/` | Code shared by the clients: connection, API, session, connection form |
 | `crates/xila-gui/` | The graphical client, with its fonts |
 | `crates/xila-term/` | The text client |

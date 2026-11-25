@@ -75,7 +75,7 @@ fn wait_for(server: &mut Server, wanted: impl Fn(&Notification) -> bool) -> bool
 fn the_server_introduces_itself() {
     let mut server = server();
     let hello = server.hello().unwrap();
-    assert_eq!(hello.api, 1);
+    assert_eq!(hello.api, 2);
     assert_eq!(hello.role, var("PGXILA_TEST_USER"));
     assert_eq!(hello.home, "desktop");
     assert!(!hello.author);
@@ -118,7 +118,9 @@ fn a_stack_is_described_by_the_server() {
 
     // Keys of the stack and keys available everywhere, together.
     let keys: Vec<&str> = screen.keys.iter().map(|k| k.key.as_str()).collect();
-    assert_eq!(keys, ["F3", "F6", "F7", "F8", "F12", "Enter"]);
+    assert_eq!(keys, ["F3", "F4", "F6", "F7", "F8", "F10", "F12", "Enter"]);
+    // The stack belongs to the administrator: author mode is not offered.
+    assert!(!screen.stack.may_edit);
 
     let error = server.open_stack("nowhere").unwrap_err();
     assert_eq!(
@@ -167,7 +169,7 @@ fn an_edited_field_is_written_back_when_the_user_moves_on() {
     let context = Context {
         card: Some(key),
         dirty: [("city".to_string(), "London".to_string())].into(),
-        row: None,
+        ..Context::default()
     };
     let effects = other.act("addressbook", "save_card", &context).unwrap();
     assert!(effects.contains(&Effect::Message { text: "Card saved.".into() }));
@@ -226,7 +228,7 @@ fn a_change_made_by_someone_else_is_pushed_to_the_client() {
         let context = Context {
             card: Some(key.clone()),
             dirty: [("company".to_string(), value.to_string())].into(),
-            row: None,
+            ..Context::default()
         };
         writer.act("addressbook", "save_card", &context).unwrap();
     };

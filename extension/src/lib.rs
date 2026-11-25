@@ -165,7 +165,7 @@ mod tests {
     #[pg_test]
     fn hello_names_the_home_stack() {
         let hello = json("SELECT xila.hello()");
-        assert_eq!(hello["api"], 1);
+        assert_eq!(hello["api"], 2);
         assert_eq!(hello["home"], "desktop");
     }
 
@@ -697,10 +697,7 @@ mod tests {
         Spi::run(r#"SELECT xila.set_field('books', 'title', '{"required": true}')"#).unwrap();
         let (state, message) =
             error_of(r#"SELECT xila.save_card('books', NULL, '{"published": "1900"}')"#);
-        assert_eq!(
-            (state.as_str(), message.as_str()),
-            ("XL003", "The field “title” is required.")
-        );
+        assert_eq!((state.as_str(), message.as_str()), ("XL003", "The field “title” is required."));
 
         // A renamed field is renamed in the title of the cards too.
         Spi::run(r#"SELECT xila.set_field('books', 'title', '{"name": "work"}')"#).unwrap();
@@ -737,8 +734,10 @@ mod tests {
 
         // The rewind is itself in history, and can be rewound.
         assert_eq!(
-            text("SELECT xila.describe_change(object_kind, op, before, after)
-                  FROM xila.history ORDER BY id DESC LIMIT 1")
+            text(
+                "SELECT xila.describe_change(object_kind, op, before, after)
+                  FROM xila.history ORDER BY id DESC LIMIT 1"
+            )
             .as_deref(),
             Some("Screen rewound (2 changes undone)")
         );
@@ -768,8 +767,7 @@ mod tests {
             "SELECT min(id) FROM xila.card_history_line
              WHERE stack = 'books' AND card = '{key}' AND summary LIKE '%changed: year'"
         ));
-        let undone =
-            json(&format!("SELECT xila.rewind('books', 'card', {first_change}, '{key}')"));
+        let undone = json(&format!("SELECT xila.rewind('books', 'card', {first_change}, '{key}')"));
         assert_eq!(undone["undone"], 2);
         let card = json(&format!("SELECT xila.card('books', '{key}', 'at')"));
         assert_eq!(card["values"]["title"], "Candide");
@@ -905,7 +903,10 @@ mod tests {
         );
         // One field per column, the key left out, and a title for the cards.
         assert_eq!(fields_of("library"), serde_json::json!(["title", "author", "year", "bought"]));
-        assert_eq!(json("SELECT xila.card('library', NULL, 'last')")["texts"]["heading"], "Candide");
+        assert_eq!(
+            json("SELECT xila.card('library', NULL, 'last')")["texts"]["heading"],
+            "Candide"
+        );
         assert_eq!(
             text("SELECT managed::text FROM xila.stack_info WHERE name = 'library'").as_deref(),
             Some("false")

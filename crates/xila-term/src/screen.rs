@@ -8,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use xila_core::api::{Api, Widget};
-use xila_core::session::{GridState, Session, View};
+use xila_core::session::{GridState, Question, Session, View};
 use xila_core::text_layout::{
     self, leader, Item, TextLayout, COLUMNS, KEYS_ROW, LABEL_WIDTH, MESSAGE_ROW, PROMPT, ROWS,
 };
@@ -121,6 +121,36 @@ fn column_of(layout: &TextLayout, name: &str) -> Option<String> {
     })
 }
 
+/// True for a field whose value is chosen among a few, not typed.
+fn is_choice(view: &View, name: &str) -> bool {
+    widget(view, name).is_some_and(|w| !w.choices().is_empty())
+}
+
+/// The column of a field in which text is typed.
+fn typed_column_of(view: &View, layout: &TextLayout, name: &str) -> Option<String> {
+    column_of(layout, name).filter(|_| !is_choice(view, name))
+}
+
+/// A question, cut into the two rows above the function keys.
+fn question_lines(question: &Question) -> (String, String) {
+    let width = usize::from(COLUMNS) - 2;
+    let mut first = String::new();
+    let mut second = String::new();
+    for word in question.text.split_whitespace() {
+        let line = if second.is_empty() && first.chars().count() + 1 + word.chars().count() <= width
+        {
+            &mut first
+        } else {
+            &mut second
+        };
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    (first, second)
+}
+
 fn is_grid(layout: &TextLayout, name: &str) -> bool {
     layout.items.iter().any(|item| matches!(item, Item::Grid { widget, .. } if widget == name))
 }
@@ -128,13 +158,38 @@ fn is_grid(layout: &TextLayout, name: &str) -> bool {
 /// Handles a key: moves the focus, edits a field, or asks the server to run
 /// an action.
 pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
+    // A question waits for its answer and nothing else.
+    if session.question().is_some() {
+        match key {
+            Key::Enter => session.answer(true),
+            Key::Escape | Key::F(12) => session.answer(false),
+            _ => {}
+        }
+        let layout = text_layout::layout(&session.view().screen);
+        let focus = focus_of(session.view(), &layout);
+        sync_cursor(session, ui, &layout, &focus);
+        return;
+    }
+
     let layout = text_layout::layout(&session.view().screen);
     let focus = focus_of(session.view(), &layout);
     sync_cursor(session, ui, &layout, &focus);
 
     let on_grid = focus.as_deref().is_some_and(|name| is_grid(&layout, name));
+    let on_choice = focus.as_deref().is_some_and(|name| is_choice(session.view(), name));
     match key {
         Key::Interrupt => {}
+        // Escape leaves the screen, like F12.
+        Key::Escape => {
+            session.press("F12");
+        }
+        // A field whose value is chosen goes through its values.
+        Key::Char(' ') | Key::Right if on_choice => {
+            session.cycle(focus.as_deref().unwrap_or_default(), true);
+        }
+        Key::Left if on_choice => {
+            session.cycle(focus.as_deref().unwrap_or_default(), false);
+        }
         Key::F(number) => {
             if !session.press(&format!("F{number}")) {
                 session.say("This key is not active on this screen.");
@@ -173,7 +228,7 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
                 _ => {}
             },
             Some(name) => {
-                if let Some(column) = column_of(&layout, name) {
+                if let Some(column) = typed_column_of(session.view(), &layout, name) {
                     let mut text = session.view().value(&column).to_owned();
                     let limit = max_length(session.view(), name);
                     if edit_line(&mut text, &mut ui.cursor, key, limit) {
@@ -227,7 +282,7 @@ fn sync_cursor<A: Api>(
         }
         ui.cursor = focus
             .as_ref()
-            .and_then(|name| column_of(layout, name))
+            .and_then(|name| typed_column_of(view, layout, name))
             .map_or(0, |column| view.value(&column).chars().count());
         ui.anchor = anchor;
     }
@@ -252,17 +307,16 @@ pub fn draw<A: Api>(
     for item in &layout.items {
         match item {
             Item::Text { widget: name, x, y, w } => {
-                let text = view
-                    .card
-                    .texts
-                    .get(name)
-                    .map(String::as_str)
-                    .or_else(|| widget(view, name).and_then(|w| w.label.as_deref()))
-                    .unwrap_or("");
-                put(buffer, area, *x, *y, text, *w, theme.base());
+                put(buffer, area, *x, *y, view.text(name), *w, theme.base());
             }
             Item::Field { widget: name, column, label, label_x, x, y, w } => {
                 let focused = focus.as_deref() == Some(name);
+                // A chosen value is shown by its label, the cursor at its start.
+                let chosen = is_choice(view, name);
+                let shown = match widget(view, name) {
+                    Some(definition) if chosen => definition.shown(view.value(column)),
+                    _ => view.value(column).to_owned(),
+                };
                 let at = draw_field(
                     buffer,
                     area,
@@ -272,8 +326,8 @@ pub fn draw<A: Api>(
                     *x,
                     *y,
                     *w,
-                    view.value(column),
-                    focused.then_some(ui.cursor),
+                    &shown,
+                    focused.then_some(if chosen { 0 } else { ui.cursor }),
                 );
                 cursor = cursor.or(at);
             }
@@ -307,9 +361,25 @@ pub fn draw<A: Api>(
         }
     }
 
+    // A question takes the place of the message and of the keys.
+    if let Some(question) = session.question() {
+        let (first, second) = question_lines(question);
+        let style = theme.of(theme.message);
+        if second.is_empty() {
+            put(buffer, area, 1, MESSAGE_ROW, &first, COLUMNS - 2, style);
+        } else {
+            put(buffer, area, 1, MESSAGE_ROW - 1, &first, COLUMNS - 2, style);
+            put(buffer, area, 1, MESSAGE_ROW, &second, COLUMNS - 2, style);
+        }
+        let keys = [("Enter", question.label.as_str()), ("F12", "Cancel")];
+        draw_keys(buffer, area, &theme, keys.into_iter());
+        return None;
+    }
+
     let hint = match focus.as_deref() {
         Some(PROMPT) => "Type the number of an option, then press Enter.",
         Some(name) if is_grid(&layout, name) => "Choose a row with the arrows, then press Enter.",
+        Some(name) if is_choice(view, name) => "Press the space bar to change this value.",
         _ => "",
     };
     match session.message() {
@@ -342,7 +412,8 @@ fn draw_header<A: Api>(session: &Session<A>, buffer: &mut Buffer, area: Rect, th
     let title_x = (COLUMNS.saturating_sub(title.chars().count() as u16)) / 2;
     put(buffer, area, title_x, 0, title, COLUMNS, theme.of(theme.title));
 
-    if view.screen.source.has_cards {
+    // The dialogs of the system show a card too, but not one of a stack.
+    if view.screen.source.has_cards && !view.screen.stack.is_system() {
         let position = if view.is_new {
             "New card".to_owned()
         } else if view.card.count == 0 {
@@ -541,10 +612,39 @@ mod tests {
         .unwrap()
     }
 
+    /// Author mode on one stack: fields, a list, and a button without a key.
+    fn author() -> Screen {
+        serde_json::from_value(serde_json::json!({
+            "stack": { "name": "author", "title": "Author mode", "kind": "system" },
+            "source": { "has_cards": true, "count": 3 },
+            "widgets": [
+                { "name": "heading", "kind": "text", "ord": 10, "props": { "template": "{title}" },
+                  "layout": { "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } } },
+                { "name": "title", "kind": "field", "ord": 30, "label": "Title", "column": "title", "type": "text" },
+                { "name": "kind", "kind": "field", "ord": 35, "label": "Type", "column": "kind", "type": "text",
+                  "props": { "choices": [ { "value": "text", "label": "Text" },
+                                          { "value": "date", "label": "Date" } ] } },
+                { "name": "shared", "kind": "field", "ord": 37, "label": "Shared", "column": "shared", "type": "boolean" },
+                { "name": "fields", "kind": "grid", "ord": 50, "action": "edit_field", "props": {
+                    "columns": [ { "column": "title", "label": "Field" },
+                                 { "column": "cards", "label": "Cards", "align": "right" } ] } },
+                { "name": "new_field", "kind": "button", "ord": 60, "label": "New field", "action": "new_field" },
+                { "name": "delete_stack", "kind": "button", "ord": 80, "label": "Delete stack", "action": "delete_stack" }
+            ],
+            "actions": [],
+            "keys": [
+                { "key": "F6", "label": "New field", "action": "new_field" },
+                { "key": "F12", "label": "Back", "action": "back" },
+                { "key": "Enter", "label": "Save", "action": "save" }
+            ]
+        }))
+        .unwrap()
+    }
+
     impl Api for Fake {
         fn hello(&mut self) -> Result<Hello, ApiError> {
             Ok(Hello {
-                api: 1,
+                api: 2,
                 version: "0.1.0".into(),
                 instance: "normandie-01".into(),
                 role: "fax".into(),
@@ -565,11 +665,25 @@ mod tests {
             Ok(match stack {
                 "desktop" => desktop(),
                 "stacks" => stacks(),
+                "author" => author(),
                 _ => addressbook(),
             })
         }
 
         fn card(&mut self, stack: &str, _key: Option<&str>, _to: Move) -> Result<Card, ApiError> {
+            if stack == "author" {
+                return Ok(Card {
+                    key: Some("addressbook".into()),
+                    position: 1,
+                    count: 3,
+                    values: BTreeMap::from([
+                        ("title".to_string(), Some("Address book".to_string())),
+                        ("kind".to_string(), Some("text".to_string())),
+                        ("shared".to_string(), Some("false".to_string())),
+                    ]),
+                    ..Card::default()
+                });
+            }
             if stack != "addressbook" {
                 return Ok(Card { position: 1, count: 1, ..Card::default() });
             }
@@ -585,7 +699,12 @@ mod tests {
             })
         }
 
-        fn grid_rows(&mut self, _stack: &str, _widget: &str) -> Result<GridPage, ApiError> {
+        fn grid_rows(
+            &mut self,
+            _stack: &str,
+            _widget: &str,
+            _card: Option<&str>,
+        ) -> Result<GridPage, ApiError> {
             let row = |key: &str, title: &str, cards: &str| GridRow {
                 key: key.into(),
                 cells: BTreeMap::from([
@@ -614,6 +733,14 @@ mod tests {
                 "open" => vec![Effect::Show { stack: context.row.clone().unwrap(), card: None }],
                 "back" => vec![Effect::Back],
                 "quit" => vec![Effect::Quit],
+                "author" => vec![Effect::Show { stack: "author".into(), card: None }],
+                "delete_stack" if !context.confirmed => vec![Effect::Confirm {
+                    text: "Delete the stack “Address book”? Its cards are kept, and the stack \
+                           can be restored."
+                        .into(),
+                    label: "Delete".into(),
+                }],
+                "delete_stack" => vec![Effect::Message { text: "Stack deleted.".into() }],
                 _ => vec![],
             })
         }
@@ -776,6 +903,97 @@ mod tests {
         let (mut session, mut ui) = on_addressbook();
         press(&mut session, &mut ui, &[Key::F(3)]);
         assert!(session.should_quit());
+    }
+
+    /// A session in author mode on the address book.
+    fn in_author_mode() -> (Session<Fake>, Ui) {
+        let (mut session, mut ui) = on_addressbook();
+        session.run("author");
+        handle(&mut session, &mut ui, Key::Home);
+        assert_eq!(session.view().stack(), "author");
+        (session, ui)
+    }
+
+    #[test]
+    fn a_dialog_shows_fields_a_list_and_its_options() {
+        let (session, ui) = in_author_mode();
+        let (lines, _) = render(&session, &ui);
+
+        // A dialog of the system: no position in a stack, but where we are.
+        assert_eq!(lines[0], " PGXILA                           Author mode");
+        assert!(lines[1].starts_with(" Instance: normandie-01"), "{}", lines[1]);
+        assert_eq!(lines[3], " Title . . . . . :  Address book");
+        assert_eq!(lines[4], " Type  . . . . . :  Text");
+        assert_eq!(lines[5], " Shared  . . . . :  No");
+        // The list leaves room for the option under it and for the prompt.
+        assert!(lines[7].trim_start().starts_with("Field"), "{}", lines[7]);
+        assert_eq!(
+            lines[8],
+            " > Address book                                                             42"
+        );
+        assert_eq!(lines[18], "    1. Delete stack");
+        assert_eq!(lines[20], " Option ===>");
+        assert_eq!(lines[23], " F6=New field  F12=Back  Enter=Save");
+    }
+
+    #[test]
+    fn a_field_with_choices_goes_through_them() {
+        let (mut session, mut ui) = in_author_mode();
+        press(&mut session, &mut ui, &[Key::Tab]);
+        assert_eq!(session.view().focus.as_deref(), Some("kind"));
+        assert_eq!(render(&session, &ui).0[22], " Press the space bar to change this value.");
+
+        // Typing does not change a choice; space and the arrows do.
+        press(&mut session, &mut ui, &[Key::Char('x')]);
+        assert_eq!(session.view().value("kind"), "text");
+        press(&mut session, &mut ui, &[Key::Char(' ')]);
+        assert_eq!(session.view().value("kind"), "date");
+        assert_eq!(render(&session, &ui).0[4], " Type  . . . . . :  Date");
+        press(&mut session, &mut ui, &[Key::Left]);
+        assert_eq!(session.view().value("kind"), "text");
+
+        // Yes or no is such a choice.
+        press(&mut session, &mut ui, &[Key::Tab, Key::Char(' ')]);
+        assert_eq!(session.view().value("shared"), "true");
+        assert_eq!(render(&session, &ui).0[5], " Shared  . . . . :  Yes");
+    }
+
+    #[test]
+    fn a_question_takes_the_bottom_of_the_screen_until_it_is_answered() {
+        let (mut session, mut ui) = in_author_mode();
+        // The option under the list: Tab to the prompt, 1, Enter.
+        press(&mut session, &mut ui, &[Key::Tab, Key::Tab, Key::Tab, Key::Char('1'), Key::Enter]);
+        assert!(session.question().is_some());
+        let (lines, cursor) = render(&session, &ui);
+        assert_eq!(
+            lines[21],
+            " Delete the stack “Address book”? Its cards are kept, and the stack can be"
+        );
+        assert_eq!(lines[22], " restored.");
+        assert_eq!(lines[23], " Enter=Delete  F12=Cancel");
+        assert_eq!(cursor, None, "nothing is typed while a question is asked");
+
+        // Other keys leave it there; Escape gives up.
+        let asked = session.api().actions.len();
+        press(&mut session, &mut ui, &[Key::F(6), Key::Char('x')]);
+        assert!(session.question().is_some());
+        press(&mut session, &mut ui, &[Key::Escape]);
+        assert_eq!(session.question(), None);
+        assert_eq!(session.api().actions.len(), asked);
+
+        // Asked again and accepted.
+        press(&mut session, &mut ui, &[Key::Char('1'), Key::Enter, Key::Enter]);
+        let (action, context) = session.api().actions.last().unwrap();
+        assert_eq!(action, "delete_stack");
+        assert!(context.confirmed);
+        assert_eq!(render(&session, &ui).0[22], " Stack deleted.");
+    }
+
+    #[test]
+    fn escape_goes_back_like_f12() {
+        let (mut session, mut ui) = in_author_mode();
+        press(&mut session, &mut ui, &[Key::Escape]);
+        assert_eq!(session.view().stack(), "addressbook");
     }
 
     #[test]

@@ -30,18 +30,27 @@ fn var(name: &str) -> String {
 }
 
 fn app() -> App<Server> {
+    app_of("PGXILA_TEST_USER")
+}
+
+/// The client of the user named by an environment variable.
+fn app_of(user_variable: &str) -> App<Server> {
     let options = Options {
         host: var("PGXILA_TEST_HOST"),
         port: var("PGXILA_TEST_SCRATCH_PORT").parse().expect("PGXILA_TEST_SCRATCH_PORT"),
         database: var("PGXILA_TEST_DATABASE"),
-        user: Some(var("PGXILA_TEST_USER")),
+        user: Some(var(user_variable)),
         ca: Some(PathBuf::from(var("PGXILA_TEST_SCRATCH_CA"))),
     };
     App::new(options, Box::new(open_session))
 }
 
 fn connected() -> App<Server> {
-    let mut app = app();
+    connected_as("PGXILA_TEST_USER")
+}
+
+fn connected_as(user_variable: &str) -> App<Server> {
+    let mut app = app_of(user_variable);
     app.connect_with(&var("PGXILA_TEST_PASSWORD"));
     assert!(app.session().is_some(), "{:?}", app.login_message());
     app
@@ -220,4 +229,68 @@ fn the_pointer_opens_a_stack_and_browses_it() {
     let previous = area_of(&app, "previous");
     click(&mut app, previous);
     assert_eq!(app.session().unwrap().view().card.position, 1);
+}
+
+#[test]
+#[ignore = "needs the scratch server: use scripts/test-integration.sh"]
+fn an_author_builds_a_stack_in_the_window() {
+    // The scratch server is new for each run: the name is free.
+    let mut app = connected_as("PGXILA_TEST_AUTHOR");
+
+    // My stacks, then F6: the dialog of a new stack.
+    app.key(Key::Enter);
+    app.key(Key::F(6));
+    assert_eq!(stack(&app), "new_stack");
+    type_text(&mut app, "Window test");
+    let dialog = render(&app, "new-stack");
+    assert!(count(&dialog, area_of(&app, "create"), slot::YELLOW) > 300);
+    app.key(Key::Enter);
+
+    // Author mode on the new stack, which has no field yet.
+    assert_eq!(stack(&app), "author", "{:?}", app.session().unwrap().message());
+    assert_eq!(value(&app, "title"), "Window test");
+    render(&app, "author-empty");
+
+    // F6: a field. Its label is typed, its type chosen with the space bar,
+    // "required" ticked with the pointer.
+    app.key(Key::F(6));
+    assert_eq!(stack(&app), "field");
+    type_text(&mut app, "Opened on");
+    app.key(Key::Tab);
+    app.key(Key::Tab);
+    app.key(Key::Char(' '));
+    app.key(Key::Char(' '));
+    assert_eq!(value(&app, "type"), "date");
+    let field = render(&app, "field-new");
+    assert!(count(&field, area_of(&app, "type"), slot::INK) > 60);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "author", "{:?}", app.session().unwrap().message());
+
+    let author = render(&app, "author-one-field");
+    let rows = &app.session().unwrap().view().grids["fields"].page.rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cells["name"].as_deref(), Some("opened_on"));
+    assert_eq!(rows[0].cells["type_label"].as_deref(), Some("Date"));
+    assert!(count(&author, area_of(&app, "fields"), slot::INK) > 200);
+
+    // Deleting the stack asks in a window of its own; Escape gives up.
+    let delete = area_of(&app, "delete_stack");
+    click(&mut app, delete);
+    assert!(app.session().unwrap().question().is_some());
+    render(&app, "delete-question");
+    app.key(Key::Escape);
+    assert!(app.session().unwrap().question().is_none());
+    assert_eq!(stack(&app), "author");
+
+    // F11 shows the stack as its users see it: one field, no card yet.
+    app.key(Key::F(11));
+    assert_eq!(stack(&app), "window_test");
+    render(&app, "built-stack");
+    assert_eq!(app.session().unwrap().view().card.count, 0);
+
+    // Back in author mode, the stack is deleted for good this time.
+    app.key(Key::F(11));
+    click(&mut app, delete);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
 }

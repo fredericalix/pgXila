@@ -336,6 +336,12 @@ pub enum ApiError {
     /// English and is shown as it is.
     #[error("{message}")]
     User { code: String, message: String },
+    /// The server and the client do not speak the same version of the API.
+    #[error(
+        "This client speaks version {client} of the pgXila API and the server version {server}: \
+         update the older of the two."
+    )]
+    Version { client: u32, server: u32 },
     /// Anything else: a lost connection, a bug.
     #[error("{0}")]
     Other(String),

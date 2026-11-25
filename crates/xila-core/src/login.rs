@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::api::ApiError;
 use crate::connection::{ConnectError, ConnectParams};
 use crate::input::{edit_line, Key};
 use crate::server::Server;
@@ -174,7 +175,10 @@ pub fn open_session(params: &ConnectParams) -> Result<Session<Server>, String> {
         },
         other => format!("Cannot connect: {other}"),
     })?;
-    Session::start(server).map_err(|error| format!("This account cannot use pgXila: {error}"))
+    Session::start(server).map_err(|error| match error {
+        ApiError::Version { .. } => error.to_string(),
+        other => format!("This account cannot use pgXila: {other}"),
+    })
 }
 
 /// The innermost cause of an error, which is where the useful text is.

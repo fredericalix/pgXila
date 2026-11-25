@@ -20,6 +20,7 @@ PORT="${PGXILA_PORT:-5419}"
 SCRATCH_PORT="${PGXILA_SCRATCH_PORT:-5420}"
 ROLE="xila_integration_test"
 OUTSIDER="xila_integration_outsider"
+AUTHOR="xila_integration_author"
 PASSWORD="$(openssl rand -hex 24)"
 COMPOSE=(docker compose --profile test)
 
@@ -46,9 +47,12 @@ DROP ROLE IF EXISTS :"role";
 CREATE ROLE :"role" LOGIN PASSWORD :'password';
 SQL
 
-# On the scratch server: a pgXila user, a role that is not one, and a stack.
-psql_in db-scratch -v role="$ROLE" -v outsider="$OUTSIDER" -v password="$PASSWORD" <<'SQL'
+# On the scratch server: a pgXila user, an author, a role that is neither, and
+# a stack.
+psql_in db-scratch -v role="$ROLE" -v outsider="$OUTSIDER" -v author="$AUTHOR" \
+    -v password="$PASSWORD" <<'SQL'
 CREATE ROLE :"role" LOGIN PASSWORD :'password' IN ROLE xila_user;
+CREATE ROLE :"author" LOGIN PASSWORD :'password' IN ROLE xila_author;
 CREATE ROLE :"outsider" LOGIN PASSWORD :'password';
 SQL
 PGXILA_SERVICE=db-scratch scripts/load-example.sh addressbook
@@ -58,6 +62,7 @@ export PGXILA_TEST_PORT="$PORT"
 export PGXILA_TEST_DATABASE=pgxila
 export PGXILA_TEST_USER="$ROLE"
 export PGXILA_TEST_OUTSIDER="$OUTSIDER"
+export PGXILA_TEST_AUTHOR="$AUTHOR"
 export PGXILA_TEST_PASSWORD="$PASSWORD"
 export PGXILA_TEST_CA="$PWD/docker/certs/ca.crt"
 export PGXILA_TEST_SCRATCH_PORT="$SCRATCH_PORT"

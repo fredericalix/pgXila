@@ -223,6 +223,7 @@ fn translate(key: &WindowKey, text: Option<&str>, shift: bool, command: bool) ->
                 NamedKey::End => Key::End,
                 NamedKey::Backspace => Key::Backspace,
                 NamedKey::Delete => Key::Delete,
+                NamedKey::Escape => Key::Escape,
                 NamedKey::Space if !command => Key::Char(' '),
                 // Other named keys carry no text worth typing.
                 _ => return Vec::new(),
@@ -387,6 +388,11 @@ mod tests {
             [Key::Backspace]
         );
         assert_eq!(translate(&named(NamedKey::ArrowDown), None, false, false), [Key::Down]);
+        // Escape is a key of its own, not the character it comes with.
+        assert_eq!(
+            translate(&named(NamedKey::Escape), Some("\u{1b}"), false, false),
+            [Key::Escape]
+        );
     }
 
     #[test]
@@ -401,7 +407,7 @@ mod tests {
     fn shortcuts_and_keys_without_text_type_nothing() {
         assert!(translate(&character("q"), Some("q"), false, true).is_empty());
         assert!(translate(&named(NamedKey::Shift), None, true, false).is_empty());
-        assert!(translate(&named(NamedKey::Escape), Some("\u{1b}"), false, false).is_empty());
+        assert!(translate(&named(NamedKey::CapsLock), None, false, false).is_empty());
         assert!(translate(&character("^"), None, false, false).is_empty());
         // A function key is not a shortcut of the operating system here.
         assert_eq!(translate(&named(NamedKey::F3), None, false, true), [Key::F(3)]);

@@ -96,7 +96,7 @@ VALUES
     (xila.background_id('new_stack'), 'heading', 'text', 10, NULL, NULL, NULL,
      '{"template": "New stack", "style": "title"}'),
     (xila.background_id('new_stack'), 'hint', 'text', 20, NULL, NULL, NULL,
-     '{"template": "A name is made from the title when left empty.", "style": "subtitle"}'),
+     '{"template": "The name may be left empty.", "style": "subtitle"}'),
     (xila.background_id('new_stack'), 'title', 'field', 30, 'Title', 'title', NULL, '{}'),
     (xila.background_id('new_stack'), 'name', 'field', 40, 'Name', 'name', NULL, '{}'),
     (xila.background_id('new_stack'), 'source', 'field', 50, 'Start from', 'source', NULL,
@@ -163,7 +163,7 @@ VALUES
     (xila.background_id('field'), 'heading', 'text', 10, NULL, NULL, NULL,
      '{"template": "Field", "style": "title"}'),
     (xila.background_id('field'), 'hint', 'text', 20, NULL, NULL, NULL,
-     '{"template": "A name is made from the label when left empty.", "style": "subtitle"}'),
+     '{"template": "The name may be left empty.", "style": "subtitle"}'),
     (xila.background_id('field'), 'label', 'field', 30, 'Label', 'label', NULL, '{}'),
     (xila.background_id('field'), 'name', 'field', 40, 'Name', 'name', NULL, '{}'),
     (xila.background_id('field'), 'type', 'field', 50, 'Type', 'type', NULL,
@@ -196,7 +196,7 @@ VALUES
     (xila.background_id('history'), 'heading', 'text', 10, NULL, NULL, NULL,
      '{"template": "{title}", "style": "title"}'),
     (xila.background_id('history'), 'hint', 'text', 20, NULL, NULL, NULL,
-     '{"template": "Rewinding undoes the selected change and all those after it.", "style": "subtitle"}'),
+     '{"template": "A rewind undoes the selected change and all later ones.", "style": "subtitle"}'),
     (xila.background_id('history'), 'changes', 'grid', 30, NULL, NULL,
      xila.action_id('history', 'rewind_all'),
      '{"schema": "xila", "table": "history_line", "key": "id",
@@ -224,7 +224,7 @@ VALUES
     (xila.background_id('card_history'), 'heading', 'text', 10, NULL, NULL, NULL,
      '{"template": "{title}", "style": "title"}'),
     (xila.background_id('card_history'), 'hint', 'text', 20, NULL, NULL, NULL,
-     '{"template": "Rewinding a card undoes the selected change and the later ones.", "style": "subtitle"}'),
+     '{"template": "Undoes the selected change and later ones on that card.", "style": "subtitle"}'),
     (xila.background_id('card_history'), 'changes', 'grid', 30, NULL, NULL,
      xila.action_id('card_history', 'rewind'),
      '{"schema": "xila", "table": "card_history_line", "key": "id",
@@ -242,6 +242,8 @@ INSERT INTO xila.stack (name, title, kind) VALUES ('deleted_stacks', 'Deleted st
 INSERT INTO xila.background (stack_id) SELECT id FROM xila.stack WHERE name = 'deleted_stacks';
 INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
     (xila.background_id('deleted_stacks'), 'restore', 'Restore', 'rewind', '{"scope": "deleted"}');
+INSERT INTO xila.key_binding (background_id, key, action_id) VALUES
+    (xila.background_id('deleted_stacks'), 'F6', xila.action_id('deleted_stacks', 'restore'));
 INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
 VALUES
     (xila.background_id('deleted_stacks'), 'list', 'grid', 10, NULL, NULL,

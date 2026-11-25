@@ -182,7 +182,7 @@ $$;
 CREATE FUNCTION xila.hello() RETURNS jsonb
 LANGUAGE sql STABLE AS $$
     SELECT jsonb_build_object(
-        'api', 1,
+        'api', 2,
         'version', xila.version(),
         'instance', coalesce(nullif(current_setting('cluster_name'), ''), 'pgxila'),
         'role', session_user,
