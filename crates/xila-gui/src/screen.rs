@@ -764,7 +764,7 @@ fn first_tile_row(area: Rect, state: &GridState) -> usize {
 }
 
 /// The rectangle of a tile on screen, by its place among those in sight.
-fn tile_area(area: Rect, place: usize) -> Rect {
+pub fn tile_area(area: Rect, place: usize) -> Rect {
     let across = tiles_across(area);
     // The tiles share the width, so that they are centred as a whole.
     let pitch = area.w / across as i32;

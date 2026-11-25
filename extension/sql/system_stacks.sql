@@ -194,7 +194,8 @@ VALUES
            {"value": "text", "label": "Text"},
            {"value": "number", "label": "Number"},
            {"value": "date", "label": "Date"},
-           {"value": "boolean", "label": "Yes or no"}
+           {"value": "boolean", "label": "Yes or no"},
+           {"value": "picture", "label": "Picture"}
        ]}'),
     (xila.background_id('field'), 'required', 'field', 60, 'Required', 'required', NULL, '{}'),
     (xila.background_id('field'), 'save', 'button', 70, 'Save', NULL,

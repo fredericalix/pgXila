@@ -18,8 +18,9 @@ pgXila is made of two parts:
 ## Status
 
 Early development. Phase 1 is done: one vertical slice, from the database to
-two clients. Phase 2, author mode, has its first two steps: a stack is built
-from the client, without SQL, and laid out with a visual editor.
+two clients. Phase 2, author mode, has its first three steps: a stack is built
+from the client, without SQL, laid out with a visual editor, and illustrated
+with a drawing editor.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -36,13 +37,16 @@ from the client, without SQL, and laid out with a visual editor.
 - **author mode**, in both clients: create a stack, add, rename, order and
   remove its fields, and delete it. A stack belongs to its author;
 - **the visual editor**, in the graphical client: move and resize the widgets
-  of a card with the pointer or the keyboard, add texts and buttons, on every
-  card or on one only, and undo;
+  of a card with the pointer or the keyboard, add texts, buttons and pictures,
+  on every card or on one only, and undo;
+- **the drawing editor**, in the graphical client: draw the icon of a stack,
+  the picture of a card or a picture of the background, pixel by pixel, with
+  the 32 colours of pgXila and those a stack adds;
 - **rewinding**: a card, the screen of a stack or a whole stack goes back to
   before any recorded change, a deleted stack or a removed field included.
 
-Not there yet: drawing pictures and scripts (the next steps of author mode), the
-agent and multiple instances. A stack can also be
+Not there yet: scripts (the next step of author mode), the agent and multiple
+instances. A stack can also be
 built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
 The interface is in English.
 
@@ -228,6 +232,28 @@ as things to arrange. Fields show the name of their column instead of a value.
 The layout of a stack is automatic until a widget is moved. From then on every
 widget stays where it was put; Properties, with nothing selected, offers to go
 back to the automatic layout.
+
+### The drawing editor
+
+Pictures are drawn in the graphical client, pixel by pixel:
+
+| What | How to get there | Who may |
+|------|------------------|---------|
+| The picture of a card | Click it on the card, or press Enter when it has the focus. A stack gets such pictures with a field of type Picture | Whoever may write the card |
+| The icon of a stack, shown in "My stacks" | `F5` in the visual editor | Whoever may change the stack |
+| A picture of the background | The picture tool of the visual editor, then Draw in Properties | Whoever may change the stack |
+
+The tools are on the left: pencil, eraser, fill, line, rectangle, pipette and
+selection; each also has a letter (`P`, `E`, `F`, `L`, `R`, `I`, `S`). The
+arrows move a cursor over the pixels and the space bar draws there. `+` and `-`
+change the zoom; `H`, `V` and `T` flip and turn the picture; `F6` gives it
+another size. The Colours window holds the 32 colours of pgXila and, for the
+pictures of a stack, the colours that stack adds (`+`). `F2` undoes, `F4` goes
+back to the picture as it was.
+
+Leaving the editor (`F12`) saves the drawing. An image is never changed: each
+drawing is kept as a new image, so the history of a card can bring back the
+picture it had before, and nobody can overwrite the picture of someone else.
 
 ### Who may change a stack
 

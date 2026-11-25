@@ -109,6 +109,15 @@ impl<A: Api> App<A> {
         }
     }
 
+    /// What the window remembers besides the session, once connected: the
+    /// state of the visual editor and of the drawing editor.
+    pub fn ui(&self) -> Option<&Ui> {
+        match &self.stage {
+            Stage::Session(_, ui) => Some(ui),
+            Stage::Login(_) => None,
+        }
+    }
+
     /// The message of the connection screen, while it is shown.
     pub fn login_message(&self) -> Option<&str> {
         match &self.stage {

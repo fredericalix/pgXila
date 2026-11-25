@@ -22,9 +22,12 @@ use xila_gui::font::Fonts;
 use xila_gui::frame::{Frame, Rect, HEIGHT, WIDTH};
 use xila_gui::layout::layout;
 use xila_gui::palette::{slot, Palette};
+use xila_gui::screen::tile_area;
 
 /// Palette slot of the skin of the portraits of the example.
 const SKIN: u8 = 28;
+/// Palette slot of the cover of the notebook that is the icon of the example.
+const ORANGE: u8 = 24;
 
 fn var(name: &str) -> String {
     std::env::var(name)
@@ -143,7 +146,11 @@ fn the_keyboard_goes_from_the_desktop_to_a_card_with_its_picture() {
     app.key(Key::Enter);
     assert_eq!(stack(&app), "stacks");
     let list = render(&app, "stacks");
-    assert!(count(&list, area_of(&app, "list"), slot::BLUE) > 1000, "a row is selected");
+    // The stacks are shown as icons; the first one is selected, and has the
+    // notebook of the example as its icon.
+    let stacks = area_of(&app, "list");
+    assert!(count(&list, stacks, slot::BLUE) > 300, "a stack is selected");
+    assert!(count(&list, tile_area(stacks, 0), ORANGE) > 1000, "the icon, twice its size");
 
     app.key(Key::Enter);
     assert_eq!(stack(&app), "addressbook");
@@ -220,9 +227,9 @@ fn the_pointer_opens_a_stack_and_browses_it() {
     click(&mut app, button);
     assert_eq!(stack(&app), "stacks");
 
-    // The first row is selected: a click on it opens it.
+    // The first stack is selected: a click on its icon opens it.
     let list = area_of(&app, "list");
-    click(&mut app, Rect::new(list.x, list.y + 14, list.w, 12));
+    click(&mut app, tile_area(list, 0));
     assert_eq!(stack(&app), "addressbook");
 
     let next = area_of(&app, "next");
@@ -367,6 +374,116 @@ fn an_author_builds_a_stack_in_the_window() {
     render(&app, "delete-question");
     app.key(Key::Escape);
     assert!(app.session().unwrap().question().is_none());
+    click(&mut app, delete);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
+}
+
+/// Clicks on a pixel of the picture open in the drawing editor.
+fn dab(app: &mut App<Server>, pixel: (i32, i32)) {
+    let square = app.ui().unwrap().painter.square_of(pixel);
+    click(app, square);
+}
+
+#[test]
+#[ignore = "needs the scratch server: use scripts/test-integration.sh"]
+fn a_user_draws_the_picture_of_a_card_and_history_brings_the_old_one_back() {
+    // A plain user: the picture of a card is theirs to draw.
+    let mut app = connected();
+    app.key(Key::Enter);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "addressbook");
+    let original = value(&app, "photo");
+
+    // A click on the photo opens the drawing editor on it.
+    let photo = area_of(&app, "photo");
+    click(&mut app, photo);
+    let drawing = app.session().unwrap().view().drawing.clone();
+    let drawing = drawing.unwrap_or_else(|| panic!("{:?}", app.session().unwrap().message()));
+    assert_eq!((drawing.width, drawing.height), (68, 80));
+    assert_eq!(drawing.image.as_deref(), Some(original.as_str()));
+    let editor = render(&app, "draw-portrait");
+    assert!(count(&editor, Rect::new(0, 15, 310, 255), SKIN) > 500, "the portrait, enlarged");
+
+    // A red dot on the nose, then out: the drawing is saved as a new image.
+    let red = 25;
+    let swatch = xila_gui::draw::swatches(&(0..32).collect::<Vec<u8>>())
+        .into_iter()
+        .find(|(colour, _)| *colour == red)
+        .unwrap()
+        .1;
+    click(&mut app, swatch);
+    dab(&mut app, (34, 40));
+    app.key(Key::F(12));
+    assert!(app.session().unwrap().view().drawing.is_none());
+    assert_eq!(app.session().unwrap().message(), Some("Picture saved."));
+    let drawn = value(&app, "photo");
+    assert_ne!(drawn, original, "an image is never changed: the card has another one");
+    let image = app.session().unwrap().image(&drawn).expect("the new picture was read").clone();
+    assert_eq!(image.pixel(34, 40), Some(red));
+    let card = render(&app, "addressbook-drawn");
+    assert!(count(&card, area_of(&app, "photo"), red) >= 1);
+
+    // The history of the cards undoes it: the card shows the old image again.
+    app.key(Key::F(10));
+    assert_eq!(stack(&app), "card_history");
+    app.key(Key::Enter);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "addressbook", "{:?}", app.session().unwrap().message());
+    assert_eq!(value(&app, "photo"), original);
+}
+
+#[test]
+#[ignore = "needs the scratch server: use scripts/test-integration.sh"]
+fn an_author_draws_the_icon_of_a_stack() {
+    // The scratch server is new for each run: the name is free.
+    let mut app = connected_as("PGXILA_TEST_AUTHOR");
+    app.key(Key::Enter);
+    app.key(Key::F(6));
+    type_text(&mut app, "Icon test");
+    app.key(Key::Enter);
+    assert!(designing(&app), "{:?}", app.session().unwrap().message());
+
+    // F5 in the visual editor: the icon, 28 by 26, empty.
+    app.key(Key::F(5));
+    let drawing = app.session().unwrap().view().drawing.clone();
+    let drawing = drawing.unwrap_or_else(|| panic!("{:?}", app.session().unwrap().message()));
+    assert_eq!((drawing.target.as_str(), drawing.width, drawing.height), ("icon", 28, 26));
+
+    // A filled square, with the keyboard and the pointer.
+    app.key(Key::Char('x'));
+    app.key(Key::Char('r'));
+    let from = app.ui().unwrap().painter.square_of((4, 4));
+    let to = app.ui().unwrap().painter.square_of((23, 21));
+    app.pointer_down(from.x + 2, from.y + 2);
+    app.pointer_move(to.x + 2, to.y + 2);
+    app.pointer_up(to.x + 2, to.y + 2);
+    render(&app, "draw-icon");
+    app.key(Key::F(12));
+    assert_eq!(app.session().unwrap().message(), Some("Picture saved."));
+    assert!(designing(&app), "back in the visual editor");
+
+    // The list of stacks shows it, twice its size.
+    app.key(Key::F(12));
+    assert_eq!(stack(&app), "stacks");
+    let view = app.session().unwrap().view();
+    let rows = &view.grids["list"].page.rows;
+    let at = rows.iter().position(|row| row.key == "icon_test").expect("the stack is listed");
+    let icon = rows[at].cells["icon"].clone().expect("it has an icon");
+    let image = app.session().unwrap().image(&icon).expect("the icon was read");
+    assert_eq!((image.pixel(4, 4), image.pixel(3, 3)), (Some(0), Some(255)));
+    let list = render(&app, "stacks-icons");
+    let tile = tile_area(area_of(&app, "list"), at);
+    assert!(count(&list, tile, 0) > 20 * 18 * 4 - 100, "a black square of 20 by 18, doubled");
+
+    // The stack is deleted: select it, author mode, its forms, Delete.
+    for _ in 0..at {
+        app.key(Key::Right);
+    }
+    app.key(Key::F(11));
+    assert!(designing(&app));
+    app.key(Key::F(4));
+    let delete = area_of(&app, "delete_stack");
     click(&mut app, delete);
     app.key(Key::Enter);
     assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
