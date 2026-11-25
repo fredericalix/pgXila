@@ -10,6 +10,10 @@
 -- an author, who can then change it in author mode.
 -- All names and values are fictitious.
 
+-- Replacing a previous load is not a change worth remembering: without this,
+-- the old copy would show up among the deleted stacks of its owner. Only a
+-- superuser is believed here (see xila.restoring in the extension).
+SET xila.restoring = on;
 DELETE FROM xila.stack WHERE name = 'addressbook';
 -- The portraits of a previous load live in xila.image.
 DO $$
@@ -20,6 +24,7 @@ BEGIN
 END
 $$;
 DROP SCHEMA IF EXISTS addressbook CASCADE;
+RESET xila.restoring;
 
 -- The data: one row per card.
 CREATE SCHEMA addressbook;
