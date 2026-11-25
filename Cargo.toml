@@ -1,0 +1,15 @@
+# Workspace of the pgXila clients.
+#
+# The PostgreSQL extension (extension/) is deliberately not a member: it only
+# builds against PostgreSQL headers, inside the Docker image.
+[workspace]
+resolver = "2"
+members = ["crates/xila-core"]
+exclude = ["extension"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "PostgreSQL"
+repository = "https://github.com/fredericalix/pgXila"
+publish = false
