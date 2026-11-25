@@ -551,6 +551,84 @@ and icons (2c); scripts and handlers written by authors (2d); creating a stack
 from a description with the agent (phase 3); sharing the cards of a stack from
 the client.
 
+### 10.7 Visual editor (proposal for step 2b, not implemented yet)
+
+The visual editor is a tool of the graphical client: the background of a stack
+is shown with its widgets, which are selected, moved and resized with the
+pointer or the keyboard. Nothing in this subsection exists yet.
+
+**Entering it.** The client says which renderer it is in the context of every
+action: `"renderer": "graphic"` or `"text"`. The `author` handler answers a
+graphical client with a new effect, `{"do": "design", "stack": "books"}`, which
+opens the editor on that stack, and a text client with the author dialog as
+today. From the editor, a key opens that dialog (title, list of fields,
+history, deletion); `F11` goes back to browsing.
+
+**What the editor sends.** Like everything else, an action, with what the tool
+has to say in a new member of the context, `input`. The handlers below are
+actions available on every stack one may change; each calls the function of
+the same name, which can also be called in SQL and will be a tool of the agent.
+
+| Function | What it does |
+|----------|--------------|
+| `xila.place_widgets(stack text, renderer text, placements jsonb, card text DEFAULT NULL)` | Sets the rectangle of some widgets for one renderer: `{"city": {"x": 128, "y": 94, "w": 100, "h": 14}}`. Styles are kept |
+| `xila.reset_layout(stack text, renderer text)` | Forgets every rectangle of that renderer: the placement is automatic again. Styles are kept |
+| `xila.add_widget(stack text, kind text, props jsonb DEFAULT '{}', card text DEFAULT NULL)` | Adds a `text` or a `button` and returns its name. `props` may hold `label`, `text` (a template), `action` (the name of an action of the stack) and `placement`. With `card`, the widget is on that card only |
+| `xila.set_widget(stack text, widget text, changes jsonb, card text DEFAULT NULL)` | Changes `label`, `text`, `action`, `main` (the main button of the screen) or `layer` (`background` or `card`, to move a text or a button from one to the other) |
+| `xila.remove_widget(stack text, widget text, card text DEFAULT NULL)` | Removes a widget. A field is removed as by `xila.remove_field` |
+| `xila.undo(stack text)` | Undoes the last change made to the screen of the stack; see below |
+
+Fields are still created by `xila.add_field`: the field tool of the editor opens
+the Field dialog. The screen definition also says, for each field, whether it is
+`required`, and for the stack whether its table is `managed`.
+
+**Automatic or free.** A stack is laid out automatically until one of its
+widgets is moved. At that moment the editor sends the rectangle of *every*
+widget, where the automatic placement had put it: from then on the layout is
+free, and what is on screen is what is in the database. `xila.reset_layout`
+goes back. In a free layout:
+
+- a field added later goes under the lowest field, with the same left edge and
+  width;
+- the sheet of paper is drawn behind everything that is not a button;
+- a widget without a rectangle (one added in SQL) is placed automatically, as
+  described in section 3.
+
+The text renderer is not concerned: its placement stays automatic unless `text`
+layout rows say otherwise.
+
+**The card layer.** A text or a button may belong to one card only (`layer =
+'card'`): a note on the card of Ada. The editor creates widgets on the layer
+chosen in its tool palette, and shows those of the card on screen with the
+others. Fields always belong to the background.
+
+**Undo.** `xila.undo` rewinds the most recent line of the history of the
+*screen* that is not itself an undo. Pressed again, it goes one line further
+back; any new change starts over from the most recent line. It only undoes
+changes made by the current role: when the last change is someone else's, it
+refuses and points to the History screen. An undo is a rewind like any other,
+recorded, and can be rewound from the History screen.
+
+**In the editor** (drawn by the client, as in the mockup):
+
+- a tool palette in the left margin: pointer, field, text, button; the layer
+  for new widgets (background or card); grid and guides on or off;
+- the background with a dotted grid. Fields show the name of their column, in
+  grey, instead of the values of a card;
+- selection handles; moving and resizing snap to a grid of 4 pixels, and to the
+  edges and centres of the other widgets, shown by a guide line;
+- a floating Properties window: name, kind, label or text, action, column and
+  type (read only), required, position and size as numbers. It keeps away from
+  the selected widget, can be moved, and hidden with a key;
+- with the keyboard: `Tab` selects the next widget, the arrows move it by one
+  pixel, `Shift` and the arrows resize it, `Delete` removes it after a
+  confirmation;
+- keys: `F2` Undo, `F4` Stack (the author dialog), `F6` New widget, `F7`
+  Properties, `F10` History, `F11` Browse, `F12` Back.
+
+Left for later: pictures and the image tool (2c), the script of a widget (2d),
+the Agent button (phase 3), the slider, grid and chart tools.
+
 ## 11. Not covered yet
 
 - Author mode beyond section 10 (visual editor, drawing, scripts): steps 2b to 2d.
