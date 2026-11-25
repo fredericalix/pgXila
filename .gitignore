@@ -1,0 +1,26 @@
+# Secrets and local configuration: never commit these.
+.env.local
+.env.*.local
+
+# Development certificates and private keys, generated locally.
+/docker/certs/
+*.key
+*.pem
+*.crt
+*.csr
+*.srl
+
+# Private project documents, kept out of the public repository.
+/docs/cachier-des-charges.md
+/docs/cahier-des-charges.md
+/docs/maquettes/
+/docs/mockups/
+
+# Rust build output
+target/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
