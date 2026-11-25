@@ -205,6 +205,20 @@ pub fn layout(screen: &Screen) -> TextLayout {
         result.focus_order.push(PROMPT.to_owned());
     }
     result.focus_order.extend(grids);
+
+    // The focus goes down the screen: what is higher comes first.
+    let row_of = |name: &String| {
+        result.items.iter().find_map(|item| match item {
+            Item::Field { widget, y, .. } | Item::Grid { widget, y, .. } if widget == name => {
+                Some(*y)
+            }
+            Item::Prompt { y, .. } if name == PROMPT => Some(*y),
+            _ => None,
+        })
+    };
+    let mut order = std::mem::take(&mut result.focus_order);
+    order.sort_by_key(row_of);
+    result.focus_order = order;
     result
 }
 
@@ -234,6 +248,39 @@ mod tests {
             "keys": keys,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_list_leaves_room_for_the_options_under_it_and_the_focus_goes_down() {
+        let layout = layout(&screen(
+            serde_json::json!([
+                { "name": "title", "kind": "field", "ord": 10, "label": "Title", "column": "title" },
+                { "name": "fields", "kind": "grid", "ord": 20, "action": "edit" },
+                { "name": "save", "kind": "button", "ord": 30, "label": "Save", "action": "save" },
+                { "name": "delete", "kind": "button", "ord": 40, "label": "Delete", "action": "delete" },
+                { "name": "purge", "kind": "button", "ord": 50, "label": "Purge", "action": "purge" }
+            ]),
+            serde_json::json!([{ "key": "Enter", "label": "Save", "action": "save" }]),
+        ));
+
+        // Two buttons have no key: two options and their prompt, under the
+        // list, all within the rows of the content.
+        let grid = layout.items.iter().find_map(|item| match item {
+            Item::Grid { y, h, .. } => Some((*y, *h)),
+            _ => None,
+        });
+        assert_eq!(grid, Some((5, 11)));
+        let options: Vec<_> = layout
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Option { number, label, y, .. } => Some((*number, label.as_str(), *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(options, [(1, "Delete", 17), (2, "Purge", 18)]);
+        assert!(layout.items.contains(&Item::Prompt { x: 1, y: CONTENT_BOTTOM }));
+        assert_eq!(layout.focus_order, ["title", "fields", PROMPT]);
     }
 
     #[test]

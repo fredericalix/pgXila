@@ -961,8 +961,12 @@ mod tests {
     #[test]
     fn a_question_takes_the_bottom_of_the_screen_until_it_is_answered() {
         let (mut session, mut ui) = in_author_mode();
-        // The option under the list: Tab to the prompt, 1, Enter.
-        press(&mut session, &mut ui, &[Key::Tab, Key::Tab, Key::Tab, Key::Char('1'), Key::Enter]);
+        // The option under the list: Tab past the fields and the list to the
+        // prompt, then 1 and Enter.
+        let to_the_prompt = [Key::Tab, Key::Tab, Key::Tab, Key::Tab];
+        press(&mut session, &mut ui, &to_the_prompt);
+        assert_eq!(session.view().focus.as_deref(), Some(PROMPT));
+        press(&mut session, &mut ui, &[Key::Char('1'), Key::Enter]);
         assert!(session.question().is_some());
         let (lines, cursor) = render(&session, &ui);
         assert_eq!(
