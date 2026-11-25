@@ -43,11 +43,7 @@ pub extern "C-unwind" fn _PG_init() {
 // queries, and SQL says them best. Rust is kept for what SQL cannot do.
 extension_sql_file!("../sql/schema.sql", name = "schema", bootstrap);
 extension_sql_file!("../sql/api.sql", name = "api", requires = [xila::version]);
-extension_sql_file!(
-    "../sql/system_stacks.sql",
-    name = "system_stacks",
-    requires = ["api"]
-);
+extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["api"]);
 
 #[pg_schema]
 mod xila {
@@ -68,10 +64,7 @@ mod tests {
 
     /// Runs a query that returns a single JSON value.
     fn json(query: &str) -> serde_json::Value {
-        Spi::get_one::<pgrx::JsonB>(query)
-            .unwrap()
-            .expect("a JSON value")
-            .0
+        Spi::get_one::<pgrx::JsonB>(query).unwrap().expect("a JSON value").0
     }
 
     /// Runs a query that returns a single text value.
@@ -154,10 +147,7 @@ mod tests {
 
     #[pg_test]
     fn version_is_the_crate_version() {
-        assert_eq!(
-            text("SELECT xila.version()").as_deref(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(text("SELECT xila.version()").as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 
     #[pg_test]
@@ -185,10 +175,7 @@ mod tests {
         assert_eq!(desktop["widgets"][0]["action"], "open_stacks");
 
         let effects = json("SELECT xila.act('desktop', 'open_stacks')");
-        assert_eq!(
-            effects,
-            serde_json::json!([{ "do": "show", "stack": "stacks" }])
-        );
+        assert_eq!(effects, serde_json::json!([{ "do": "show", "stack": "stacks" }]));
     }
 
     #[pg_test]
@@ -219,16 +206,10 @@ mod tests {
         create_library_stack();
         let screen = json("SELECT xila.open_stack('library')");
         assert_eq!(screen["stack"]["title"], "Bibliothèque");
-        assert_eq!(
-            screen["source"],
-            serde_json::json!({ "has_cards": true, "count": 3 })
-        );
+        assert_eq!(screen["source"], serde_json::json!({ "has_cards": true, "count": 3 }));
 
         let widgets = screen["widgets"].as_array().unwrap();
-        let names: Vec<_> = widgets
-            .iter()
-            .map(|w| w["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<_> = widgets.iter().map(|w| w["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["heading", "title", "year", "bought"]);
         assert_eq!(widgets[1]["type"], "text");
         assert_eq!(widgets[2]["type"], "number");
@@ -255,10 +236,7 @@ mod tests {
         assert_eq!(last["values"]["title"], "Les Misérables");
         let key = last["key"].as_str().unwrap();
         let after_last = json(&format!("SELECT xila.card('library', '{key}', 'next')"));
-        assert_eq!(
-            after_last["key"], last["key"],
-            "next stops at the last card"
-        );
+        assert_eq!(after_last["key"], last["key"], "next stops at the last card");
     }
 
     #[pg_test]
@@ -273,55 +251,38 @@ mod tests {
     #[pg_test]
     fn saving_a_card_writes_the_changed_columns() {
         create_library_stack();
-        let key = json("SELECT xila.card('library')")["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let key = json("SELECT xila.card('library')")["key"].as_str().unwrap().to_owned();
         let saved = json(&format!(
             r#"SELECT xila.save_card('library', '{key}', '{{"year": "1760", "bought": "2026-11-25"}}')"#
         ));
         assert_eq!(saved["values"]["year"], "1760");
         assert_eq!(saved["values"]["bought"], "2026-11-25");
         assert_eq!(saved["values"]["title"], "Candide");
-        assert_eq!(
-            number("SELECT year::bigint FROM library.books WHERE title = 'Candide'"),
-            1760
-        );
+        assert_eq!(number("SELECT year::bigint FROM library.books WHERE title = 'Candide'"), 1760);
     }
 
     #[pg_test]
     fn an_empty_input_clears_a_value_that_is_not_text() {
         create_library_stack();
-        let key = json("SELECT xila.card('library')")["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let saved = json(&format!(
-            r#"SELECT xila.save_card('library', '{key}', '{{"year": ""}}')"#
-        ));
+        let key = json("SELECT xila.card('library')")["key"].as_str().unwrap().to_owned();
+        let saved =
+            json(&format!(r#"SELECT xila.save_card('library', '{key}', '{{"year": ""}}')"#));
         assert_eq!(saved["values"]["year"], serde_json::Value::Null);
     }
 
     #[pg_test]
     fn a_rejected_value_names_the_field() {
         create_library_stack();
-        let key = json("SELECT xila.card('library')")["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let key = json("SELECT xila.card('library')")["key"].as_str().unwrap().to_owned();
 
         let (state, message) = error_of(&format!(
             r#"SELECT xila.save_card('library', '{key}', '{{"year": "soon"}}')"#
         ));
         assert_eq!(state, "XL003");
-        assert_eq!(
-            message,
-            "La valeur « soon » n'est pas valide pour le champ « year »."
-        );
+        assert_eq!(message, "La valeur « soon » n'est pas valide pour le champ « year ».");
 
-        let (state, message) = error_of(&format!(
-            r#"SELECT xila.save_card('library', '{key}', '{{"title": null}}')"#
-        ));
+        let (state, message) =
+            error_of(&format!(r#"SELECT xila.save_card('library', '{key}', '{{"title": null}}')"#));
         assert_eq!(state, "XL003");
         assert_eq!(message, "Le champ « title » est obligatoire.");
     }
@@ -340,10 +301,7 @@ mod tests {
     #[pg_test]
     fn moving_to_another_card_saves_the_current_one() {
         create_library_stack();
-        let key = json("SELECT xila.card('library')")["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let key = json("SELECT xila.card('library')")["key"].as_str().unwrap().to_owned();
         let effects = json(&format!(
             r#"SELECT xila.act('library', 'next_card',
                    '{{"card": "{key}", "dirty": {{"author": "Arouet"}}}}')"#
@@ -360,14 +318,9 @@ mod tests {
     #[pg_test]
     fn every_change_is_recorded_in_history() {
         create_library_stack();
-        let key = json("SELECT xila.card('library')")["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        Spi::run(&format!(
-            r#"SELECT xila.save_card('library', '{key}', '{{"year": "1760"}}')"#
-        ))
-        .unwrap();
+        let key = json("SELECT xila.card('library')")["key"].as_str().unwrap().to_owned();
+        Spi::run(&format!(r#"SELECT xila.save_card('library', '{key}', '{{"year": "1760"}}')"#))
+            .unwrap();
 
         let change = json(&format!(
             "SELECT jsonb_build_object('op', op, 'before', before->'year', 'after', after->'year',
@@ -417,10 +370,7 @@ mod tests {
         );
 
         let effects = json(r#"SELECT xila.act('stacks', 'open', '{"row": "library"}')"#);
-        assert_eq!(
-            effects,
-            serde_json::json!([{ "do": "show", "stack": "library" }])
-        );
+        assert_eq!(effects, serde_json::json!([{ "do": "show", "stack": "library" }]));
     }
 
     #[pg_test]
@@ -430,29 +380,19 @@ mod tests {
 
     #[pg_test]
     fn guard_accepts_tls_1_3() {
-        assert_eq!(
-            check(Transport::Tcp {
-                tls_version: Some("TLSv1.3")
-            }),
-            Ok(())
-        );
+        assert_eq!(check(Transport::Tcp { tls_version: Some("TLSv1.3") }), Ok(()));
     }
 
     #[pg_test]
     fn guard_refuses_plain_tcp() {
-        assert_eq!(
-            check(Transport::Tcp { tls_version: None }),
-            Err(Refusal::NotEncrypted)
-        );
+        assert_eq!(check(Transport::Tcp { tls_version: None }), Err(Refusal::NotEncrypted));
     }
 
     #[pg_test]
     fn guard_refuses_older_tls() {
         for version in ["TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3", ""] {
             assert_eq!(
-                check(Transport::Tcp {
-                    tls_version: Some(version)
-                }),
+                check(Transport::Tcp { tls_version: Some(version) }),
                 Err(Refusal::ProtocolTooOld),
                 "{version} must be refused"
             );

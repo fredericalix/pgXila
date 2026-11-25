@@ -20,6 +20,24 @@ pub struct Hello {
     pub home: String,
 }
 
+/// One of the 32 system colours, as returned by `xila.palette()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaletteColour {
+    pub slot: u8,
+    pub name: String,
+    /// `#rrggbb`
+    pub rgb: String,
+}
+
+impl PaletteColour {
+    /// The red, green and blue components, if `rgb` is well formed.
+    pub fn components(&self) -> Option<(u8, u8, u8)> {
+        let hex = self.rgb.strip_prefix('#').filter(|hex| hex.len() == 6 && hex.is_ascii())?;
+        let part = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        Some((part(0)?, part(2)?, part(4)?))
+    }
+}
+
 /// Answer of `xila.open_stack()`: the definition of a screen.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Screen {
@@ -108,10 +126,7 @@ pub struct Placement {
 impl Placement {
     /// True when the widget must not be drawn by this renderer.
     pub fn hidden(&self) -> bool {
-        self.style
-            .get("hidden")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        self.style.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false)
     }
 }
 
@@ -238,10 +253,7 @@ pub enum ApiError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Notification {
     /// A card was inserted, updated or deleted.
-    Card {
-        stack: Option<String>,
-        key: Option<String>,
-    },
+    Card { stack: Option<String>, key: Option<String> },
     /// A screen definition, or the palette when `stack` is None, changed.
     Screen { stack: Option<String> },
 }
@@ -252,13 +264,8 @@ impl Notification {
         let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let text = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_owned);
         match channel {
-            "xila_card" => Some(Notification::Card {
-                stack: text("stack"),
-                key: text("key"),
-            }),
-            "xila_screen" => Some(Notification::Screen {
-                stack: text("stack"),
-            }),
+            "xila_card" => Some(Notification::Card { stack: text("stack"), key: text("key") }),
+            "xila_screen" => Some(Notification::Screen { stack: text("stack") }),
             _ => None,
         }
     }
@@ -267,6 +274,7 @@ impl Notification {
 /// The calls a client makes to the server.
 pub trait Api {
     fn hello(&mut self) -> Result<Hello, ApiError>;
+    fn palette(&mut self) -> Result<Vec<PaletteColour>, ApiError>;
     fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError>;
     fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError>;
     fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError>;
@@ -312,6 +320,15 @@ mod tests {
     }
 
     #[test]
+    fn a_palette_colour_gives_its_components() {
+        let colour = |rgb: &str| PaletteColour { slot: 24, name: "orange".into(), rgb: rgb.into() };
+        assert_eq!(colour("#e8703a").components(), Some((0xe8, 0x70, 0x3a)));
+        assert_eq!(colour("e8703a").components(), None);
+        assert_eq!(colour("#e870").components(), None);
+        assert_eq!(colour("#zzzzzz").components(), None);
+    }
+
+    #[test]
     fn effects_are_read_from_their_do_tag() {
         let effects: Vec<Effect> = serde_json::from_value(serde_json::json!([
             { "do": "show", "stack": "carnet", "card": "42" },
@@ -324,17 +341,9 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::Show {
-                    stack: "carnet".into(),
-                    card: Some("42".into())
-                },
-                Effect::Show {
-                    stack: "stacks".into(),
-                    card: None
-                },
-                Effect::Message {
-                    text: "Fiche enregistrée.".into()
-                },
+                Effect::Show { stack: "carnet".into(), card: Some("42".into()) },
+                Effect::Show { stack: "stacks".into(), card: None },
+                Effect::Message { text: "Fiche enregistrée.".into() },
                 Effect::New,
                 Effect::Quit,
             ]
@@ -357,14 +366,8 @@ mod tests {
     #[test]
     fn notifications_are_decoded_by_channel() {
         assert_eq!(
-            Notification::parse(
-                "xila_card",
-                r#"{"stack":"carnet","key":"42","op":"update"}"#
-            ),
-            Some(Notification::Card {
-                stack: Some("carnet".into()),
-                key: Some("42".into())
-            })
+            Notification::parse("xila_card", r#"{"stack":"carnet","key":"42","op":"update"}"#),
+            Some(Notification::Card { stack: Some("carnet".into()), key: Some("42".into()) })
         );
         assert_eq!(
             Notification::parse("xila_screen", r#"{"stack":null}"#),

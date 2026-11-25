@@ -13,7 +13,8 @@ use tokio_postgres::types::{Json, ToSql};
 use tokio_postgres::AsyncMessage;
 
 use crate::api::{
-    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, Screen,
+    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, PaletteColour,
+    Screen,
 };
 use crate::connection::{connect, ConnectError, ConnectParams};
 
@@ -51,11 +52,7 @@ impl Server {
         });
 
         runtime.block_on(client.batch_execute("LISTEN xila_card; LISTEN xila_screen"))?;
-        Ok(Server {
-            runtime,
-            client,
-            notifications,
-        })
+        Ok(Server { runtime, client, notifications })
     }
 
     /// Runs a query that returns one JSON value and decodes it.
@@ -64,10 +61,7 @@ impl Server {
         query: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<T, ApiError> {
-        let row = self
-            .runtime
-            .block_on(self.client.query_one(query, params))
-            .map_err(api_error)?;
+        let row = self.runtime.block_on(self.client.query_one(query, params)).map_err(api_error)?;
         let value: serde_json::Value = row.try_get(0).map_err(api_error)?;
         serde_json::from_value(value)
             .map_err(|error| ApiError::Other(format!("unexpected answer from the server: {error}")))
@@ -77,10 +71,9 @@ impl Server {
 /// Errors of SQLSTATE class XL are written for the user; the rest is not.
 fn api_error(error: tokio_postgres::Error) -> ApiError {
     match error.as_db_error() {
-        Some(db) if db.code().code().starts_with("XL") => ApiError::User {
-            code: db.code().code().to_owned(),
-            message: db.message().to_owned(),
-        },
+        Some(db) if db.code().code().starts_with("XL") => {
+            ApiError::User { code: db.code().code().to_owned(), message: db.message().to_owned() }
+        }
         Some(db) => ApiError::Other(db.message().to_owned()),
         None => ApiError::Other(error.to_string()),
     }
@@ -91,15 +84,27 @@ impl Api for Server {
         self.call("SELECT xila.hello()", &[])
     }
 
+    fn palette(&mut self) -> Result<Vec<PaletteColour>, ApiError> {
+        let rows = self
+            .runtime
+            .block_on(self.client.query("SELECT slot, name, rgb FROM xila.palette()", &[]))
+            .map_err(api_error)?;
+        Ok(rows
+            .iter()
+            .map(|row| PaletteColour {
+                slot: row.get::<_, i16>("slot") as u8,
+                name: row.get("name"),
+                rgb: row.get("rgb"),
+            })
+            .collect())
+    }
+
     fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
         self.call("SELECT xila.open_stack($1)", &[&stack])
     }
 
     fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError> {
-        self.call(
-            "SELECT xila.card($1, $2, $3)",
-            &[&stack, &key, &to.as_str()],
-        )
+        self.call("SELECT xila.card($1, $2, $3)", &[&stack, &key, &to.as_str()])
     }
 
     fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
@@ -112,10 +117,7 @@ impl Api for Server {
         action: &str,
         context: &Context,
     ) -> Result<Vec<Effect>, ApiError> {
-        self.call(
-            "SELECT xila.act($1, $2, $3)",
-            &[&stack, &action, &Json(context)],
-        )
+        self.call("SELECT xila.act($1, $2, $3)", &[&stack, &action, &Json(context)])
     }
 
     fn notifications(&mut self) -> Vec<Notification> {

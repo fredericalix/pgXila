@@ -17,18 +17,23 @@ pgXila is made of two parts:
 
 ## Status
 
-Early development. What exists today:
+Early development. Phase 1 is being built in two steps; the first one is done:
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
 - mandatory encryption: the server only accepts TLS 1.3 connections, and the
   extension refuses unencrypted connections by itself;
-- the connection code shared by the future clients, with the same policy on
-  the client side;
-- a proposal for the SQL API between the extension and the clients, in
-  [docs/api.md](docs/api.md). It is not implemented yet.
+- the system schema `xila`: stacks, backgrounds, widgets, layouts, actions,
+  keys, images and the 32-colour palette, with a history of every change;
+- the SQL API the clients call, described in [docs/api.md](docs/api.md);
+- the desktop and the stack list, which are themselves stacks stored in the
+  database;
+- **the text client**: connect, browse the cards of a stack, edit a field and
+  write it back.
 
-There is no client to run yet, and no stack to open.
+Not there yet: the graphical client (next step), author mode, the agent and
+multiple instances. Until author mode exists, a stack is built with SQL, as
+[examples/carnet.sql](examples/carnet.sql) shows.
 
 ## Requirements
 
@@ -38,15 +43,37 @@ There is no client to run yet, and no stack to open.
 PostgreSQL, pgrx and the Rust toolchain needed by the extension live inside the
 Docker image. Nothing has to be installed on the host for the server.
 
-## Run the server
+## Quick start
+
+```sh
+# 1. Build and start the server (the first build takes several minutes)
+docker compose up --build --detach --wait
+
+# 2. Create a user; the password is asked for
+scripts/create-user.sh ada
+
+# 3. Load the example stack, an address book
+scripts/load-example.sh carnet
+
+# 4. Run the text client
+cargo run -p xila-term -- --user ada --ca docker/certs/ca.crt
+```
+
+In the client, type the password, choose `1` then Enter for the list of stacks,
+and Enter again to open the address book. `F7` and `F8` browse the cards, `Tab`
+moves between fields, Enter saves, `F6` starts a new card, `F12` goes back and
+`F3` quits. Moving to another card also saves what was typed. A change made by
+someone else appears on screen by itself.
+
+The terminal must be at least 80 columns by 24 rows.
+
+## The server
 
 ```sh
 docker compose up --build
 ```
 
-The first build compiles the extension and pgvector and takes several minutes.
-The server then listens on `localhost:5419`. Set `PGXILA_PORT` to use another
-port.
+The server listens on `localhost:5419`. Set `PGXILA_PORT` to use another port.
 
 On first start the container generates a development certificate authority and
 a server certificate. Private keys stay inside a Docker volume. The public
@@ -59,13 +86,10 @@ To open an administration session, use the Unix socket inside the container:
 docker compose exec -u postgres db psql -d pgxila
 ```
 
-To create a role that can connect from the host:
-
-```sql
-CREATE ROLE ada LOGIN PASSWORD 'choose a password';
-```
-
-and connect with any PostgreSQL client that verifies the certificate:
+Users are PostgreSQL roles, members of `xila_user`. `scripts/create-user.sh`
+creates one; add `--author` for a member of `xila_author`, who may also write
+stack definitions. Any PostgreSQL client that verifies the certificate can
+connect with such a role:
 
 ```sh
 psql "host=localhost port=5419 dbname=pgxila user=ada sslmode=verify-full sslrootcert=docker/certs/ca.crt"
@@ -77,12 +101,36 @@ To start again from an empty database, remove the volumes:
 docker compose down --volumes
 ```
 
+The extension has no upgrade script yet: after pulling a new version, rebuild
+the image and start again from an empty database.
+
 ### Agent settings
 
 The agent (a later phase) calls a model through an OpenAI-compatible API. Its
 endpoint and token are read from a `.env.local` file at the root of the
 repository. Copy `.env.example` to `.env.local` and fill it in. The file is
 ignored by git and is optional: the server runs without it.
+
+## The text client
+
+```sh
+cargo run -p xila-term -- --help
+```
+
+| Option | Environment | Default |
+|--------|-------------|---------|
+| `--host` | `PGXILA_HOST` | `localhost` |
+| `--port` | `PGXILA_PORT` | `5419` |
+| `--database` | `PGXILA_DATABASE` | `pgxila` |
+| `--user` | `PGXILA_USER` | asked on the connection screen |
+| `--ca` | `PGXILA_CA` | the certificate authorities of the operating system |
+
+The password is typed on the connection screen. For scripts, it can come from
+the `PGXILA_PASSWORD` environment variable; there is deliberately no command
+line option for it.
+
+The client draws with the colours of `xila.palette`, as 24-bit colours: use a
+terminal that supports them.
 
 ## Security model
 
@@ -102,10 +150,11 @@ ignored by git and is optional: the server runs without it.
 ## Tests
 
 ```sh
-# Client code: unit tests
+# Clients: unit tests of the API types, the session, the text layout and the
+# text screens
 cargo test --workspace
 
-# Extension: pgrx tests, inside Docker
+# Extension: pgrx tests of the schema and the SQL API, inside Docker
 docker compose --profile test run --rm --build extension-test
 
 # Integration tests against real servers in Docker
@@ -115,16 +164,23 @@ scripts/test-integration.sh
 The integration tests prove, among other things, that an unencrypted connection
 is refused, both by the configuration and by the extension alone, that TLS 1.2
 is refused, and that the client rejects an untrusted certificate or a wrong
-host name.
+host name. They also drive a session from the desktop to a card and check what
+is written. They run against a throwaway server and do not touch the data of
+the development server.
+
+The same three suites run in GitHub Actions on every push, with the clients
+built and tested on Linux, macOS and Windows.
 
 ## Repository layout
 
 | Path | Content |
 |------|---------|
-| `extension/` | The `pgxila` PostgreSQL extension (Rust, pgrx) |
-| `crates/xila-core/` | Code shared by the clients |
+| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, and SQL) |
+| `crates/xila-core/` | Code shared by the clients: connection, API, session, default layout |
+| `crates/xila-term/` | The text client |
 | `docker/` | Server image: Dockerfile, configuration, entrypoint |
-| `docs/api.md` | SQL API between the extension and the clients (proposal) |
+| `docs/api.md` | SQL API between the extension and the clients |
+| `examples/` | Example stacks. They are not part of pgXila |
 | `scripts/` | Development scripts |
 
 The extension is not part of the Cargo workspace: it only builds against the

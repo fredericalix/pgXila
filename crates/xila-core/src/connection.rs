@@ -77,22 +77,15 @@ pub fn tls_config(ca_file: Option<&Path>) -> Result<ClientConfig, ConnectError> 
 
 fn roots_from_file(path: &Path) -> Result<RootCertStore, ConnectError> {
     let mut roots = RootCertStore::empty();
-    let certificates =
-        CertificateDer::pem_file_iter(path).map_err(|source| ConnectError::CaFile {
-            path: path.to_owned(),
-            source,
-        })?;
+    let certificates = CertificateDer::pem_file_iter(path)
+        .map_err(|source| ConnectError::CaFile { path: path.to_owned(), source })?;
     for certificate in certificates {
-        let certificate = certificate.map_err(|source| ConnectError::CaFile {
-            path: path.to_owned(),
-            source,
-        })?;
+        let certificate =
+            certificate.map_err(|source| ConnectError::CaFile { path: path.to_owned(), source })?;
         roots.add(certificate)?;
     }
     if roots.is_empty() {
-        return Err(ConnectError::EmptyCaFile {
-            path: path.to_owned(),
-        });
+        return Err(ConnectError::EmptyCaFile { path: path.to_owned() });
     }
     Ok(roots)
 }

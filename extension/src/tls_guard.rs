@@ -39,12 +39,8 @@ pub fn check(transport: Transport) -> Result<(), Refusal> {
     match transport {
         Transport::UnixSocket => Ok(()),
         Transport::Tcp { tls_version: None } => Err(Refusal::NotEncrypted),
-        Transport::Tcp {
-            tls_version: Some(REQUIRED_TLS_VERSION),
-        } => Ok(()),
-        Transport::Tcp {
-            tls_version: Some(_),
-        } => Err(Refusal::ProtocolTooOld),
+        Transport::Tcp { tls_version: Some(REQUIRED_TLS_VERSION) } => Ok(()),
+        Transport::Tcp { tls_version: Some(_) } => Err(Refusal::ProtocolTooOld),
     }
 }
 

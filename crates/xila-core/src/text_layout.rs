@@ -44,40 +44,15 @@ const RENDERER: &str = "text";
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     /// The computed content of a `text` widget.
-    Text {
-        widget: String,
-        x: u16,
-        y: u16,
-        w: u16,
-    },
+    Text { widget: String, x: u16, y: u16, w: u16 },
     /// A field: its label with dot leaders, then its value.
-    Field {
-        widget: String,
-        column: String,
-        label: String,
-        label_x: u16,
-        x: u16,
-        y: u16,
-        w: u16,
-    },
+    Field { widget: String, column: String, label: String, label_x: u16, x: u16, y: u16, w: u16 },
     /// A numbered menu option, for a button that no function key triggers.
-    Option {
-        number: usize,
-        action: String,
-        label: String,
-        x: u16,
-        y: u16,
-    },
+    Option { number: usize, action: String, label: String, x: u16, y: u16 },
     /// Where the user types the number of an option.
     Prompt { x: u16, y: u16 },
     /// A list of rows.
-    Grid {
-        widget: String,
-        x: u16,
-        y: u16,
-        w: u16,
-        h: u16,
-    },
+    Grid { widget: String, x: u16, y: u16, w: u16, h: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -104,11 +79,7 @@ pub fn leader(label: &str, width: usize) -> String {
     // Leaders sit on even columns so that they line up from row to row, and
     // never touch the label.
     for column in label_length..width.saturating_sub(2) {
-        text.push(if column % 2 == 0 && column > label_length {
-            '.'
-        } else {
-            ' '
-        });
+        text.push(if column % 2 == 0 && column > label_length { '.' } else { ' ' });
     }
     text.push_str(" :");
     text
@@ -148,12 +119,7 @@ pub fn layout(screen: &Screen) -> TextLayout {
                     row += 1;
                     previous = Some(widget.kind);
                 }
-                result.items.push(Item::Text {
-                    widget: widget.name.clone(),
-                    x,
-                    y,
-                    w,
-                });
+                result.items.push(Item::Text { widget: widget.name.clone(), x, y, w });
             }
             WidgetKind::Field => {
                 let Some(column) = widget.column.clone() else {
@@ -166,12 +132,7 @@ pub fn layout(screen: &Screen) -> TextLayout {
                     .map_or(DEFAULT_FIELD_WIDTH, |n| n.min(u64::from(COLUMNS)) as u16);
                 let (x, y, w, _) = explicit.unwrap_or_else(|| {
                     row = flowing_row(row, previous, widget.kind);
-                    (
-                        VALUE_COLUMN,
-                        row,
-                        wanted.min(COLUMNS - VALUE_COLUMN - LEFT),
-                        1,
-                    )
+                    (VALUE_COLUMN, row, wanted.min(COLUMNS - VALUE_COLUMN - LEFT), 1)
                 });
                 if explicit.is_none() {
                     row += 1;
@@ -219,13 +180,7 @@ pub fn layout(screen: &Screen) -> TextLayout {
                     row += h;
                     previous = Some(widget.kind);
                 }
-                result.items.push(Item::Grid {
-                    widget: widget.name.clone(),
-                    x,
-                    y,
-                    w,
-                    h,
-                });
+                result.items.push(Item::Grid { widget: widget.name.clone(), x, y, w, h });
                 grids.push(widget.name.clone());
             }
             // Images, sliders and canvases have no text form yet.
@@ -234,10 +189,7 @@ pub fn layout(screen: &Screen) -> TextLayout {
     }
 
     if let Some(last) = last_option_row {
-        result.items.push(Item::Prompt {
-            x: LEFT,
-            y: last + 2,
-        });
+        result.items.push(Item::Prompt { x: LEFT, y: last + 2 });
         result.focus_order.push(PROMPT.to_owned());
     }
     result.focus_order.extend(grids);
@@ -276,10 +228,7 @@ mod tests {
     fn leaders_fill_the_label_column() {
         assert_eq!(leader("Nom", 17), "Nom . . . . . . :");
         assert_eq!(leader("Prénom", 17), "Prénom  . . . . :");
-        assert_eq!(
-            leader("Un libellé beaucoup trop long", 17),
-            "Un libellé beau :"
-        );
+        assert_eq!(leader("Un libellé beaucoup trop long", 17), "Un libellé beau :");
     }
 
     #[test]
@@ -297,24 +246,15 @@ mod tests {
             .items
             .iter()
             .map(|item| match item {
-                Item::Field {
-                    widget,
-                    label_x,
-                    x,
-                    y,
-                    w,
-                    ..
-                } => (widget.as_str(), *label_x, *x, *y, *w),
+                Item::Field { widget, label_x, x, y, w, .. } => {
+                    (widget.as_str(), *label_x, *x, *y, *w)
+                }
                 other => panic!("unexpected item: {other:?}"),
             })
             .collect();
         assert_eq!(
             placed,
-            [
-                ("nom", 1, 20, 3, 40),
-                ("prenom", 1, 20, 4, 40),
-                ("ville", 1, 20, 5, 40)
-            ]
+            [("nom", 1, 20, 3, 40), ("prenom", 1, 20, 4, 40), ("ville", 1, 20, 5, 40)]
         );
         assert_eq!(layout.focus_order, ["nom", "prenom", "ville"]);
     }
@@ -329,15 +269,7 @@ mod tests {
             ]),
             serde_json::json!([]),
         ));
-        assert!(matches!(
-            layout.items[0],
-            Item::Field {
-                x: 50,
-                y: 10,
-                w: 12,
-                ..
-            }
-        ));
+        assert!(matches!(layout.items[0], Item::Field { x: 50, y: 10, w: 12, .. }));
         // The widget placed by hand does not push the others down.
         assert!(matches!(layout.items[1], Item::Field { x: 20, y: 3, .. }));
     }
@@ -415,19 +347,8 @@ mod tests {
         assert_eq!(
             layout.items,
             [
-                Item::Text {
-                    widget: "intro".into(),
-                    x: 1,
-                    y: 3,
-                    w: 78
-                },
-                Item::Grid {
-                    widget: "liste".into(),
-                    x: 1,
-                    y: 5,
-                    w: 78,
-                    h: 16
-                },
+                Item::Text { widget: "intro".into(), x: 1, y: 3, w: 78 },
+                Item::Grid { widget: "liste".into(), x: 1, y: 5, w: 78, h: 16 },
             ]
         );
         assert_eq!(layout.focus_order, ["liste"]);

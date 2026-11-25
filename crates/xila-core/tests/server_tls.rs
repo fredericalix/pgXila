@@ -6,7 +6,7 @@
 //!
 //! - The main server uses the configuration of the image: `pg_hba.conf` only
 //!   has `hostssl` lines.
-//! - The "permissive" server is the same image with a `pg_hba.conf` that also
+//! - The "scratch" server is the same image with a `pg_hba.conf` that also
 //!   accepts unencrypted connections. It shows that the extension refuses them
 //!   on its own, whatever the configuration says.
 
@@ -38,12 +38,10 @@ fn params() -> ConnectParams {
     }
 }
 
-fn permissive_params() -> ConnectParams {
+fn scratch_params() -> ConnectParams {
     ConnectParams {
-        port: var("PGXILA_TEST_PERMISSIVE_PORT")
-            .parse()
-            .expect("PGXILA_TEST_PERMISSIVE_PORT"),
-        ca_file: Some(PathBuf::from(var("PGXILA_TEST_PERMISSIVE_CA"))),
+        port: var("PGXILA_TEST_SCRATCH_PORT").parse().expect("PGXILA_TEST_SCRATCH_PORT"),
+        ca_file: Some(PathBuf::from(var("PGXILA_TEST_SCRATCH_CA"))),
         ..params()
     }
 }
@@ -64,11 +62,7 @@ fn assert_refused_by_server(error: &tokio_postgres::Error) -> &tokio_postgres::e
     let refusal = error
         .as_db_error()
         .unwrap_or_else(|| panic!("expected a refusal sent by the server, got: {error:?}"));
-    assert_eq!(
-        refusal.code(),
-        &SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
-        "{refusal:?}"
-    );
+    assert_eq!(refusal.code(), &SqlState::INVALID_AUTHORIZATION_SPECIFICATION, "{refusal:?}");
     refusal
 }
 
@@ -79,10 +73,7 @@ async fn a_client_connects_with_tls_1_3_and_scram() {
     tokio::spawn(connection);
 
     let row = client
-        .query_one(
-            "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
-            &[],
-        )
+        .query_one("SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()", &[])
         .await
         .unwrap();
     assert!(row.get::<_, bool>("ssl"));
@@ -92,31 +83,23 @@ async fn a_client_connects_with_tls_1_3_and_scram() {
 #[tokio::test]
 #[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
 async fn an_unencrypted_connection_is_refused() {
-    let error = plaintext_config(&params())
-        .connect(NoTls)
-        .await
-        .err()
-        .expect("must be refused");
+    let error = plaintext_config(&params()).connect(NoTls).await.err().expect("must be refused");
     assert_refused_by_server(&error);
 }
 
 #[tokio::test]
 #[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
 async fn the_extension_refuses_unencrypted_connections_even_if_pg_hba_allows_them() {
-    let params = permissive_params();
+    let params = scratch_params();
 
-    // The permissive server does accept this role over TLS...
+    // The scratch server does accept this role over TLS...
     let (client, connection) = connect(&params).await.expect("TLS connection");
     tokio::spawn(connection);
     client.query_one("SELECT 1", &[]).await.unwrap();
 
     // ...and its pg_hba.conf lets the same role authenticate without TLS, but
     // the connection guard of the extension turns it away.
-    let error = plaintext_config(&params)
-        .connect(NoTls)
-        .await
-        .err()
-        .expect("must be refused");
+    let error = plaintext_config(&params).connect(NoTls).await.err().expect("must be refused");
     let refusal = assert_refused_by_server(&error);
     assert_eq!(refusal.message(), "pgXila refuses unencrypted connections");
 }
@@ -145,10 +128,7 @@ async fn a_tls_1_2_connection_is_refused() {
     // The handshake fails: there is no session, so no server error message.
     assert!(error.as_db_error().is_none(), "{error:?}");
     let text = format!("{error:?}");
-    assert!(
-        text.contains("ProtocolVersion"),
-        "expected a protocol version alert, got: {text}"
-    );
+    assert!(text.contains("ProtocolVersion"), "expected a protocol version alert, got: {text}");
 }
 
 #[tokio::test]
@@ -156,17 +136,11 @@ async fn a_tls_1_2_connection_is_refused() {
 async fn the_client_refuses_a_certificate_from_an_unknown_authority() {
     // Trust the operating system's authorities instead of the server's own:
     // the development CA is not one of them.
-    let params = ConnectParams {
-        ca_file: None,
-        ..params()
-    };
+    let params = ConnectParams { ca_file: None, ..params() };
     match connect(&params).await {
         Err(ConnectError::Postgres(error)) => {
             let text = format!("{error:?}");
-            assert!(
-                text.contains("UnknownIssuer"),
-                "expected an unknown issuer, got: {text}"
-            );
+            assert!(text.contains("UnknownIssuer"), "expected an unknown issuer, got: {text}");
         }
         Err(other) => panic!("unexpected error: {other:?}"),
         Ok(_) => panic!("the server certificate must not be trusted"),
@@ -177,23 +151,13 @@ async fn the_client_refuses_a_certificate_from_an_unknown_authority() {
 #[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
 async fn the_client_refuses_a_certificate_for_another_host_name() {
     // Reach the same server, but under a name its certificate does not cover.
-    let params = ConnectParams {
-        host: "not-the-server.example".into(),
-        ..params()
-    };
+    let params = ConnectParams { host: "not-the-server.example".into(), ..params() };
     let address: IpAddr = "127.0.0.1".parse().unwrap();
     let mut config = postgres_config(&params);
     config.hostaddr(address);
 
     let tls = MakeRustlsConnect::new(tls_config(params.ca_file.as_deref()).unwrap());
-    let error = config
-        .connect(tls)
-        .await
-        .err()
-        .expect("the host name must be verified");
+    let error = config.connect(tls).await.err().expect("the host name must be verified");
     let text = format!("{error:?}");
-    assert!(
-        text.contains("NotValidForName"),
-        "expected a host name mismatch, got: {text}"
-    );
+    assert!(text.contains("NotValidForName"), "expected a host name mismatch, got: {text}");
 }

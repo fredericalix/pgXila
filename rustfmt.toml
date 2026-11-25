@@ -1,0 +1,2 @@
+# Keep short struct literals and calls on one line: denser code, same style.
+use_small_heuristics = "Max"

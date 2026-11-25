@@ -17,10 +17,7 @@ fn main() {
         .arg("--includedir-server")
         .output()
         .unwrap_or_else(|error| panic!("cannot run {pg_config}: {error}"));
-    assert!(
-        output.status.success(),
-        "{pg_config} --includedir-server failed"
-    );
+    assert!(output.status.success(), "{pg_config} --includedir-server failed");
     let include_dir = String::from_utf8(output.stdout).expect("pg_config output is UTF-8");
 
     cc::Build::new()

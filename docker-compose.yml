@@ -39,10 +39,11 @@ services:
       timeout: 3s
       retries: 20
 
-  # TEST ONLY: the same server with a pg_hba.conf that accepts unencrypted
-  # connections, to prove that the extension refuses them by itself.
-  # Started by scripts/test-integration.sh. Its data is not kept.
-  db-permissive:
+  # TEST ONLY: a throwaway server for the integration tests, started by
+  # scripts/test-integration.sh. Its data is not kept. Its pg_hba.conf also
+  # accepts unencrypted connections, to prove that the extension refuses them
+  # by itself.
+  db-scratch:
     profiles: ["test"]
     image: pgxila/db:dev
     command:
@@ -55,10 +56,10 @@ services:
       POSTGRES_DB: pgxila
       POSTGRES_INITDB_ARGS: --auth-local=peer --auth-host=scram-sha-256
     ports:
-      - "127.0.0.1:${PGXILA_PERMISSIVE_PORT:-5420}:5432"
+      - "127.0.0.1:${PGXILA_SCRATCH_PORT:-5420}:5432"
     volumes:
       - ./docker/test/pg_hba.permissive.conf:/etc/pgxila-test/pg_hba.permissive.conf:ro
-      - ${PGXILA_PERMISSIVE_CERTS:-./docker/certs/permissive}:/export
+      - ${PGXILA_SCRATCH_CERTS:-./docker/certs/scratch}:/export
     tmpfs:
       - /var/lib/postgresql
       - /var/lib/pgxila

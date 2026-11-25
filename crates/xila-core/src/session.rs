@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::api::{
-    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, Screen, WidgetKind,
+    Api, ApiError, Card, Context, Effect, GridPage, Hello, Move, Notification, PaletteColour,
+    Screen, WidgetKind,
 };
 
 /// The rows of a grid widget and the selected one.
@@ -20,10 +21,7 @@ pub struct GridState {
 
 impl GridState {
     pub fn selected_key(&self) -> Option<&str> {
-        self.page
-            .rows
-            .get(self.selected)
-            .map(|row| row.key.as_str())
+        self.page.rows.get(self.selected).map(|row| row.key.as_str())
     }
 }
 
@@ -55,11 +53,7 @@ impl View {
     }
 
     fn saved(&self, column: &str) -> &str {
-        self.card
-            .values
-            .get(column)
-            .and_then(|v| v.as_deref())
-            .unwrap_or("")
+        self.card.values.get(column).and_then(|v| v.as_deref()).unwrap_or("")
     }
 
     /// The edits that actually change something.
@@ -74,23 +68,15 @@ impl View {
     /// What the server needs to know about this view to run an action.
     fn context(&self) -> Context {
         // The focused grid decides the selected row; a single grid needs no focus.
-        let grid = self
-            .focus
-            .as_ref()
-            .and_then(|name| self.grids.get(name))
-            .or_else(|| {
-                if self.grids.len() == 1 {
-                    self.grids.values().next()
-                } else {
-                    None
-                }
-            });
-        Context {
-            card: if self.is_new {
-                None
+        let grid = self.focus.as_ref().and_then(|name| self.grids.get(name)).or_else(|| {
+            if self.grids.len() == 1 {
+                self.grids.values().next()
             } else {
-                self.card.key.clone()
-            },
+                None
+            }
+        });
+        Context {
+            card: if self.is_new { None } else { self.card.key.clone() },
             dirty: self.dirty(),
             row: grid.and_then(|g| g.selected_key()).map(str::to_owned),
         }
@@ -100,6 +86,7 @@ impl View {
 pub struct Session<A: Api> {
     api: A,
     hello: Hello,
+    palette: Vec<PaletteColour>,
     views: Vec<View>,
     message: Option<String>,
     quit: bool,
@@ -109,18 +96,28 @@ impl<A: Api> Session<A> {
     /// Greets the server and opens the home stack.
     pub fn start(mut api: A) -> Result<Self, ApiError> {
         let hello = api.hello()?;
+        let palette = api.palette()?;
         let home = open(&mut api, &hello.home, None)?;
-        Ok(Session {
-            api,
-            hello,
-            views: vec![home],
-            message: None,
-            quit: false,
-        })
+        Ok(Session { api, hello, palette, views: vec![home], message: None, quit: false })
+    }
+
+    /// The server this session talks to.
+    pub fn api(&self) -> &A {
+        &self.api
     }
 
     pub fn hello(&self) -> &Hello {
         &self.hello
+    }
+
+    /// The system colours. Both renderers draw with these and nothing else.
+    pub fn palette(&self) -> &[PaletteColour] {
+        &self.palette
+    }
+
+    /// Shows a message to the user. The next action replaces it.
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.message = Some(text.into());
     }
 
     pub fn view(&self) -> &View {
@@ -160,13 +157,7 @@ impl<A: Api> Session<A> {
     /// Runs the action bound to a key ("F8", "Enter"). Returns false when the
     /// key is not bound on this screen.
     pub fn press(&mut self, key: &str) -> bool {
-        let bound = self
-            .view()
-            .screen
-            .keys
-            .iter()
-            .find(|k| k.key == key)
-            .map(|k| k.action.clone());
+        let bound = self.view().screen.keys.iter().find(|k| k.key == key).map(|k| k.action.clone());
         match bound {
             Some(action) => {
                 self.run(&action);
@@ -195,11 +186,10 @@ impl<A: Api> Session<A> {
         self.message = None;
         let stack = self.view().stack().to_owned();
         let context = self.view().context();
-        let outcome = self.api.act(&stack, action, &context).and_then(|effects| {
-            effects
-                .into_iter()
-                .try_for_each(|effect| self.apply(effect))
-        });
+        let outcome = self
+            .api
+            .act(&stack, action, &context)
+            .and_then(|effects| effects.into_iter().try_for_each(|effect| self.apply(effect)));
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
         }
@@ -227,10 +217,7 @@ impl<A: Api> Session<A> {
             Effect::Message { text } => self.message = Some(text),
             Effect::New => {
                 let view = self.view_mut();
-                view.card = Card {
-                    count: view.card.count,
-                    ..Card::default()
-                };
+                view.card = Card { count: view.card.count, ..Card::default() };
                 view.is_new = true;
                 view.edits.clear();
                 view.focus = None;
@@ -243,11 +230,7 @@ impl<A: Api> Session<A> {
     /// Reads a card of the current stack and shows it, dropping the edits.
     fn load_card(&mut self, key: Option<&str>, to: Move) -> Result<(), ApiError> {
         let stack = self.view().stack().to_owned();
-        let to = if key.is_none() && to == Move::At {
-            Move::First
-        } else {
-            to
-        };
+        let to = if key.is_none() && to == Move::At { Move::First } else { to };
         let card = self.api.card(&stack, key, to)?;
         let view = self.view_mut();
         view.card = card;
@@ -268,11 +251,7 @@ impl<A: Api> Session<A> {
         let names: Vec<String> = self.view().grids.keys().cloned().collect();
         for name in names {
             let page = self.api.grid_rows(&stack, &name)?;
-            let grid = self
-                .view_mut()
-                .grids
-                .get_mut(&name)
-                .expect("the grid was just listed");
+            let grid = self.view_mut().grids.get_mut(&name).expect("the grid was just listed");
             grid.selected = grid.selected.min(page.rows.len().saturating_sub(1));
             grid.page = page;
         }
@@ -297,8 +276,13 @@ impl<A: Api> Session<A> {
                         Ok(())
                     }
                 }
-                Notification::Screen { stack } => {
-                    if stack.is_none() || stack.as_deref() == Some(self.view().stack()) {
+                // Without a stack, it is the palette that changed.
+                Notification::Screen { stack: None } => {
+                    changed = true;
+                    self.api.palette().map(|palette| self.palette = palette)
+                }
+                Notification::Screen { stack: Some(stack) } => {
+                    if stack == self.view().stack() {
                         changed = true;
                         self.reopen()
                     } else {
@@ -326,25 +310,14 @@ impl<A: Api> Session<A> {
 /// Opens a stack as a new view, at a given card or at the first one.
 fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, ApiError> {
     let screen = api.open_stack(stack)?;
-    let to = if card.is_some() {
-        Move::At
-    } else {
-        Move::First
-    };
+    let to = if card.is_some() { Move::At } else { Move::First };
     let card = api.card(stack, card, to)?;
     let mut grids = BTreeMap::new();
     for widget in screen.widgets.iter().filter(|w| w.kind == WidgetKind::Grid) {
         let page = api.grid_rows(stack, &widget.name)?;
         grids.insert(widget.name.clone(), GridState { page, selected: 0 });
     }
-    Ok(View {
-        screen,
-        card,
-        is_new: false,
-        edits: BTreeMap::new(),
-        grids,
-        focus: None,
-    })
+    Ok(View { screen, card, is_new: false, edits: BTreeMap::new(), grids, focus: None })
 }
 
 /// What to tell the user about an error.
@@ -378,10 +351,7 @@ mod tests {
         fn failing(mut self, action: &str, message: &str) -> Self {
             self.effects.insert(
                 action.to_owned(),
-                Err(ApiError::User {
-                    code: "XL003".into(),
-                    message: message.into(),
-                }),
+                Err(ApiError::User { code: "XL003".into(), message: message.into() }),
             );
             self
         }
@@ -421,14 +391,18 @@ mod tests {
             })
         }
 
+        fn palette(&mut self) -> Result<Vec<PaletteColour>, ApiError> {
+            self.calls.push("palette".into());
+            Ok(vec![PaletteColour { slot: 0, name: "noir".into(), rgb: "#14121f".into() }])
+        }
+
         fn open_stack(&mut self, stack: &str) -> Result<Screen, ApiError> {
             self.calls.push(format!("open_stack {stack}"));
             Ok(screen(stack, stack == "stacks"))
         }
 
         fn card(&mut self, stack: &str, key: Option<&str>, to: Move) -> Result<Card, ApiError> {
-            self.calls
-                .push(format!("card {stack} {key:?} {}", to.as_str()));
+            self.calls.push(format!("card {stack} {key:?} {}", to.as_str()));
             let key = key.unwrap_or("1").to_owned();
             Ok(Card {
                 values: BTreeMap::from([("ville".to_string(), Some(format!("Ville {key}")))]),
@@ -441,14 +415,8 @@ mod tests {
 
         fn grid_rows(&mut self, stack: &str, widget: &str) -> Result<GridPage, ApiError> {
             self.calls.push(format!("grid_rows {stack} {widget}"));
-            let row = |key: &str| GridRow {
-                key: key.into(),
-                cells: BTreeMap::new(),
-            };
-            Ok(GridPage {
-                total: 2,
-                rows: vec![row("carnet"), row("recettes")],
-            })
+            let row = |key: &str| GridRow { key: key.into(), cells: BTreeMap::new() };
+            Ok(GridPage { total: 2, rows: vec![row("carnet"), row("recettes")] })
         }
 
         fn act(
@@ -469,13 +437,8 @@ mod tests {
 
     /// A session showing the "carnet" stack on top of the stack list.
     fn on_carnet(server: FakeServer) -> Session<FakeServer> {
-        let server = server.answering(
-            "open",
-            vec![Effect::Show {
-                stack: "carnet".into(),
-                card: None,
-            }],
-        );
+        let server =
+            server.answering("open", vec![Effect::Show { stack: "carnet".into(), card: None }]);
         let mut session = Session::start(server).unwrap();
         session.activate("list");
         assert_eq!(session.view().stack(), "carnet");
@@ -491,23 +454,14 @@ mod tests {
         assert_eq!(session.hello().role, "ada");
         assert_eq!(
             session.api.calls,
-            [
-                "open_stack stacks",
-                "card stacks None first",
-                "grid_rows stacks list"
-            ]
+            ["palette", "open_stack stacks", "card stacks None first", "grid_rows stacks list"]
         );
     }
 
     #[test]
     fn activating_a_grid_sends_its_selected_row() {
-        let server = FakeServer::default().answering(
-            "open",
-            vec![Effect::Show {
-                stack: "recettes".into(),
-                card: None,
-            }],
-        );
+        let server = FakeServer::default()
+            .answering("open", vec![Effect::Show { stack: "recettes".into(), card: None }]);
         let mut session = Session::start(server).unwrap();
         session.select_row("list", 1);
         session.select_row("list", 5);
@@ -549,10 +503,7 @@ mod tests {
     fn showing_another_card_of_the_same_stack_replaces_the_card_and_drops_the_edits() {
         let server = FakeServer::default().answering(
             "next_card",
-            vec![Effect::Show {
-                stack: "carnet".into(),
-                card: Some("2".into()),
-            }],
+            vec![Effect::Show { stack: "carnet".into(), card: Some("2".into()) }],
         );
         let mut session = on_carnet(server);
         session.edit("ville", "Paris".into());
@@ -561,10 +512,7 @@ mod tests {
         assert_eq!(session.view().card.key.as_deref(), Some("2"));
         assert_eq!(session.view().value("ville"), "Ville 2");
         assert!(session.view().edits.is_empty());
-        assert_eq!(
-            session.api.calls,
-            ["act carnet next_card", "card carnet Some(\"2\") at"]
-        );
+        assert_eq!(session.api.calls, ["act carnet next_card", "card carnet Some(\"2\") at"]);
     }
 
     #[test]
@@ -574,11 +522,7 @@ mod tests {
         assert_eq!(session.view().stack(), "stacks");
         assert_eq!(
             session.api.calls,
-            [
-                "act carnet back",
-                "card stacks Some(\"1\") at",
-                "grid_rows stacks list"
-            ]
+            ["act carnet back", "card stacks Some(\"1\") at", "grid_rows stacks list"]
         );
 
         // There is nothing behind the first screen.
@@ -600,12 +544,8 @@ mod tests {
 
     #[test]
     fn a_message_lasts_until_the_next_action() {
-        let server = FakeServer::default().answering(
-            "save_card",
-            vec![Effect::Message {
-                text: "Fiche enregistrée.".into(),
-            }],
-        );
+        let server = FakeServer::default()
+            .answering("save_card", vec![Effect::Message { text: "Fiche enregistrée.".into() }]);
         let mut session = on_carnet(server);
         session.run("save_card");
         assert_eq!(session.message(), Some("Fiche enregistrée."));
@@ -640,10 +580,10 @@ mod tests {
     fn a_change_made_elsewhere_refreshes_the_card_but_keeps_what_is_being_typed() {
         let mut session = on_carnet(FakeServer::default());
         session.edit("ville", "Paris".into());
-        session.api.pending.push(Notification::Card {
-            stack: Some("carnet".into()),
-            key: Some("1".into()),
-        });
+        session
+            .api
+            .pending
+            .push(Notification::Card { stack: Some("carnet".into()), key: Some("1".into()) });
 
         assert!(session.poll());
         assert_eq!(session.api.calls, ["card carnet Some(\"1\") at"]);
@@ -653,24 +593,25 @@ mod tests {
     #[test]
     fn a_change_in_another_stack_is_ignored() {
         let mut session = on_carnet(FakeServer::default());
-        session.api.pending.push(Notification::Card {
-            stack: Some("recettes".into()),
-            key: None,
-        });
+        session.api.pending.push(Notification::Card { stack: Some("recettes".into()), key: None });
         assert!(!session.poll());
         assert!(session.api.calls.is_empty());
     }
 
     #[test]
+    fn a_changed_palette_is_read_again() {
+        let mut session = on_carnet(FakeServer::default());
+        session.api.pending.push(Notification::Screen { stack: None });
+        assert!(session.poll());
+        assert_eq!(session.api.calls, ["palette"]);
+        assert_eq!(session.palette().len(), 1);
+    }
+
+    #[test]
     fn a_changed_screen_definition_is_read_again() {
         let mut session = on_carnet(FakeServer::default());
-        session.api.pending.push(Notification::Screen {
-            stack: Some("carnet".into()),
-        });
+        session.api.pending.push(Notification::Screen { stack: Some("carnet".into()) });
         assert!(session.poll());
-        assert_eq!(
-            session.api.calls,
-            ["open_stack carnet", "card carnet Some(\"1\") at"]
-        );
+        assert_eq!(session.api.calls, ["open_stack carnet", "card carnet Some(\"1\") at"]);
     }
 }

@@ -4,7 +4,7 @@
 # builds against PostgreSQL headers, inside the Docker image.
 [workspace]
 resolver = "2"
-members = ["crates/xila-core"]
+members = ["crates/xila-core", "crates/xila-term"]
 exclude = ["extension"]
 
 [workspace.package]
