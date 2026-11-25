@@ -13,6 +13,7 @@ use crate::chrome::{
     draw_paper, draw_window, field_cursor_at, field_scroll, window_around, wrap, ButtonLook,
     WindowStyle, BUTTON_HEIGHT,
 };
+use crate::design::{self, Designer};
 use crate::font::Fonts;
 use crate::frame::{Frame, Rect};
 use crate::layout::{self, FieldKind, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW};
@@ -33,6 +34,8 @@ pub struct Ui {
     anchor: Option<(String, Option<String>, String)>,
     /// The button the pointer is held on.
     pressed: Option<String>,
+    /// What the visual editor remembers, while a stack is open in it.
+    pub designer: Designer,
 }
 
 /// Where everything is on the screen, for one view.
@@ -158,6 +161,13 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         return;
     }
 
+    // A stack open in the visual editor: the keys are those of the editor.
+    if session.view().designing {
+        design::handle_key(session, &mut ui.designer, fonts, key);
+        settle(session, ui, fonts);
+        return;
+    }
+
     let layout = Geometry::of(session.view(), fonts).layout;
     let focus = focus_of(session.view(), &layout);
     sync_cursor(session, ui, &layout, &focus);
@@ -216,6 +226,12 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
 /// After anything that may have changed the card, the stack or the focus:
 /// makes the focus and the cursor agree with what is on screen.
 pub fn settle<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) {
+    // In the visual editor nothing is typed on the card: there is no field
+    // to keep the cursor in, but a selection to keep up to date.
+    if session.view().designing {
+        design::settle(session, &mut ui.designer, fonts);
+        return;
+    }
     let layout = Geometry::of(session.view(), fonts).layout;
     let focus = focus_of(session.view(), &layout);
     sync_cursor(session, ui, &layout, &focus);
@@ -283,6 +299,12 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
         return;
     }
 
+    if session.view().designing {
+        design::pointer_down(session, &mut ui.designer, fonts, x, y);
+        settle(session, ui, fonts);
+        return;
+    }
+
     let geometry = Geometry::of(session.view(), fonts);
 
     // The function key bar: a click is the key.
@@ -346,6 +368,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
 /// The pointer was released. A button acts when the pointer is released on
 /// it, so that one can change one's mind by moving away.
 pub fn pointer_up<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, x: i32, y: i32) {
+    if session.view().designing && session.question().is_none() {
+        design::pointer_up(session, &mut ui.designer, fonts, x, y);
+        settle(session, ui, fonts);
+        return;
+    }
     let Some(pressed) = ui.pressed.take() else { return };
     let geometry = Geometry::of(session.view(), fonts);
     let released_on_it = geometry.item_at(x, y).is_some_and(|item| item.widget == pressed);
@@ -353,6 +380,25 @@ pub fn pointer_up<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         session.activate(&pressed);
         settle(session, ui, fonts);
     }
+}
+
+/// The pointer moved. Only the visual editor follows it: it drags widgets.
+/// Returns true when the screen must be drawn again.
+pub fn pointer_move<A: Api>(
+    session: &mut Session<A>,
+    ui: &mut Ui,
+    fonts: &Fonts,
+    x: i32,
+    y: i32,
+) -> bool {
+    session.view().designing
+        && session.question().is_none()
+        && design::pointer_move(session, &mut ui.designer, fonts, x, y)
+}
+
+/// Time passes. Returns true when the screen must be drawn again.
+pub fn tick<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) -> bool {
+    session.view().designing && design::tick(session, &mut ui.designer, fonts)
 }
 
 /// What to say about the position in the stack.
@@ -374,6 +420,46 @@ fn text_of<'a>(view: &'a View, name: &str) -> &'a str {
 /// Draws the session. `blink` says whether the cursor is in the visible half
 /// of its blinking.
 pub fn draw<A: Api>(
+    session: &Session<A>,
+    ui: &Ui,
+    fonts: &Fonts,
+    frame: &mut Frame,
+    clock: &str,
+    blink: bool,
+) {
+    let view = session.view();
+    if view.designing {
+        design::draw(session, &ui.designer, fonts, frame, clock, blink);
+        draw_over(session, fonts, frame, design::hint(&ui.designer), design::KEYS.into_iter());
+        return;
+    }
+    draw_stack(session, ui, fonts, frame, clock, blink);
+    let keys = view.screen.keys.iter().map(|k| (k.key.as_str(), k.label.as_str()));
+    draw_over(session, fonts, frame, None, keys);
+}
+
+/// What is drawn over any screen: the question being asked, or else the
+/// message for the user, and the function keys.
+fn draw_over<'a, A: Api>(
+    session: &Session<A>,
+    fonts: &Fonts,
+    frame: &mut Frame,
+    hint: Option<&str>,
+    keys: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    if let Some(question) = session.question() {
+        QuestionBox::of(question, fonts).draw(question, fonts, frame);
+        chrome::draw_key_bar(frame, fonts, question_keys(question).into_iter());
+        return;
+    }
+    if let Some(message) = session.message().or(hint) {
+        chrome::draw_message(frame, fonts, message);
+    }
+    chrome::draw_key_bar(frame, fonts, keys);
+}
+
+/// Draws a stack being browsed, or a dialog: its window and what is in it.
+fn draw_stack<A: Api>(
     session: &Session<A>,
     ui: &Ui,
     fonts: &Fonts,
@@ -509,20 +595,6 @@ pub fn draw<A: Api>(
         }
     }
     frame.set_clip(previous);
-
-    if let Some(question) = session.question() {
-        QuestionBox::of(question, fonts).draw(question, fonts, frame);
-        chrome::draw_key_bar(frame, fonts, question_keys(question).into_iter());
-        return;
-    }
-    if let Some(message) = session.message() {
-        chrome::draw_message(frame, fonts, message);
-    }
-    chrome::draw_key_bar(
-        frame,
-        fonts,
-        view.screen.keys.iter().map(|k| (k.key.as_str(), k.label.as_str())),
-    );
 }
 
 /// The baseline of a line of text in its rectangle: aligned with the text of

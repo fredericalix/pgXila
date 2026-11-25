@@ -258,7 +258,8 @@ BEGIN
             'managed', bg.managed),
         'widgets', xila.widgets_json(bg, NULL),
         'actions', (
-            SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'label', a.label)
+            SELECT coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+                       'name', a.name, 'label', a.label, 'for', a.args->>'for'))
                                       ORDER BY a.name), '[]')
             FROM xila.action a
             WHERE (a.background_id = bg.id OR a.background_id IS NULL)

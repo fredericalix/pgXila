@@ -125,11 +125,22 @@ pub struct GraphicLayout {
     pub items: Vec<Item>,
     /// The widgets that can take the focus, in order.
     pub focus_order: Vec<String>,
+    /// True when every widget on screen has a rectangle of its own: the
+    /// layout was made by hand, in the visual editor.
+    pub free: bool,
+    /// True when at least one widget of a card has a rectangle of its own.
+    pub by_hand: bool,
 }
 
 impl GraphicLayout {
     pub fn item(&self, widget: &str) -> Option<&Item> {
         self.items.iter().find(|item| item.widget == widget)
+    }
+
+    /// Where each widget is: what the visual editor writes to the database
+    /// when a layout stops being automatic.
+    pub fn placements(&self) -> Vec<(String, Rect)> {
+        self.items.iter().map(|item| (item.widget.clone(), item.area)).collect()
     }
 }
 
@@ -182,27 +193,36 @@ pub fn layout(screen: &Screen, card_widgets: &[Widget], fonts: &Fonts) -> Graphi
         widgets.into_iter().partition(|w| fixed(w).is_some());
 
     // The screens of the system are dialogs, even when they show a card.
-    let mut layout = if screen.source.has_cards && !screen.stack.is_system() {
+    let cards = screen.source.has_cards && !screen.stack.is_system();
+    let has_placed = !placed.is_empty();
+    let mut layout = if cards && !placed.is_empty() {
+        free_card_layout(&placed, &flowing, fonts)
+    } else if cards {
         card_layout(&flowing, fonts)
     } else {
-        static_layout(&flowing, fonts)
+        let mut layout = static_layout(&flowing, fonts);
+        for widget in placed {
+            let area = fixed(widget).expect("partitioned on having a rectangle");
+            if let Some(part) = part_of(widget, fonts) {
+                layout.width = layout.width.max(area.right() + MARGIN);
+                layout.height = layout.height.max(area.bottom() + MARGIN);
+                layout.items.push(Item { widget: widget.name.clone(), area, part });
+            }
+        }
+        layout
     };
 
-    for widget in placed {
-        let area = fixed(widget).expect("partitioned on having a rectangle");
-        if let Some(part) = part_of(widget, fonts) {
-            layout.width = layout.width.max(area.right() + MARGIN);
-            layout.height = layout.height.max(area.bottom() + MARGIN);
-            layout.items.push(Item { widget: widget.name.clone(), area, part });
-        }
-    }
-
-    layout.focus_order = layout
+    let mut focusable: Vec<&Item> = layout
         .items
         .iter()
         .filter(|item| matches!(item.part, Part::Field { .. } | Part::Grid | Part::Button { .. }))
-        .map(|item| item.widget.clone())
         .collect();
+    // Placed by hand, the widgets are visited as they are read: down the
+    // window, and from left to right.
+    if cards && has_placed {
+        focusable.sort_by_key(|item| (item.area.y, item.area.x));
+    }
+    layout.focus_order = focusable.into_iter().map(|item| item.widget.clone()).collect();
     layout
 }
 
@@ -257,6 +277,105 @@ fn button_rows(
         pen += width + BUTTON_GAP;
     }
     row + BUTTON_HEIGHT
+}
+
+/// A card whose widgets were placed by hand. Each one is drawn in its own
+/// rectangle; the sheet of paper, its header and its ruled lines follow them,
+/// so that a layout that was automatic looks the same once its rectangles are
+/// written down.
+fn free_card_layout(placed: &[&Widget], flowing: &[&Widget], fonts: &Fonts) -> GraphicLayout {
+    let mut layout =
+        GraphicLayout { width: CARD_WIDTH, free: true, by_hand: true, ..GraphicLayout::default() };
+    for widget in placed {
+        let area = fixed(widget).expect("partitioned on having a rectangle");
+        if let Some(part) = part_of(widget, fonts) {
+            layout.items.push(Item { widget: widget.name.clone(), area, part });
+        }
+    }
+
+    // A widget that has no rectangle yet, such as one added in SQL, goes
+    // under the others: fields and texts one per row, buttons in a row.
+    let is_button = |item: &Item| matches!(item.part, Part::Button { .. });
+    let lowest = |items: &[Item]| items.iter().map(|item| item.area.bottom()).max();
+    let left = MARGIN + 14;
+    let late_fields: Vec<&&Widget> = flowing
+        .iter()
+        .filter(|w| matches!(w.kind, WidgetKind::Field | WidgetKind::Text))
+        .filter(|w| w.kind != WidgetKind::Field || w.column.is_some())
+        .collect();
+    let label_width = late_fields
+        .iter()
+        .filter(|w| w.kind == WidgetKind::Field)
+        .map(|w| fonts.regular.width(&label(w)))
+        .max()
+        .unwrap_or(0);
+    let mut y = lowest(&layout.items).map_or(MARGIN + 37, |bottom| bottom + 6);
+    for widget in late_fields {
+        let x = if widget.kind == WidgetKind::Field { left + label_width + 5 } else { left };
+        if let Some(part) = part_of(widget, fonts) {
+            let area = Rect::new(x, y, CARD_WIDTH - MARGIN - 14 - x, FIELD_HEIGHT);
+            layout.items.push(Item { widget: widget.name.clone(), area, part });
+            layout.free = false;
+            y += FIELD_PITCH;
+        }
+    }
+    let late_buttons: Vec<&Widget> =
+        flowing.iter().filter(|w| w.kind == WidgetKind::Button).copied().collect();
+    if !late_buttons.is_empty() {
+        let top = lowest(&layout.items).map_or(y, |bottom| bottom + 8);
+        button_rows(&late_buttons, fonts, MARGIN, top, CARD_WIDTH - MARGIN, 0, &mut layout.items);
+        layout.free = false;
+    }
+
+    layout.width = layout
+        .items
+        .iter()
+        .map(|item| item.area.right() + MARGIN)
+        .max()
+        .unwrap_or(0)
+        .max(CARD_WIDTH);
+    let paper_w = layout.width - 2 * MARGIN;
+
+    // The sheet goes down to under the lowest thing that is not a button.
+    let sheet_bottom = layout
+        .items
+        .iter()
+        .filter(|item| !is_button(item))
+        .map(|item| {
+            item.area.bottom()
+                + match item.part {
+                    Part::Title => 18,
+                    Part::Field { .. } | Part::Text | Part::Info { .. } | Part::Grid => 11,
+                    _ => 8,
+                }
+        })
+        .max()
+        .unwrap_or(MARGIN + 36);
+    let paper = Rect::new(MARGIN, MARGIN, paper_w, sheet_bottom - MARGIN);
+    layout.paper = Some(paper);
+
+    // The header is where the title is; without a title, a strip at the top.
+    layout.header = Some(
+        layout
+            .items
+            .iter()
+            .find(|item| item.part == Part::Title)
+            .map_or(Rect::new(MARGIN + 1, MARGIN + 1, paper_w - 2, 17), |title| title.area),
+    );
+    layout.rules = layout
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(item.part, Part::Field { .. } | Part::Text | Part::Info { .. } | Part::Grid)
+        })
+        .map(|item| Rect::new(MARGIN + 1, item.area.bottom() + 3, paper_w - 2, 1))
+        .filter(|rule| rule.y < paper.bottom() - 1)
+        .collect();
+
+    let buttons_bottom =
+        layout.items.iter().filter(|item| is_button(item)).map(|i| i.area.bottom());
+    layout.height = buttons_bottom.max().unwrap_or(0).max(paper.bottom() + 2) + MARGIN;
+    layout
 }
 
 /// A stack with cards: a sheet of paper, and the buttons under it.
@@ -487,6 +606,98 @@ mod tests {
         Fonts::builtin()
     }
 
+    /// The same screen once the editor has written down where everything is.
+    fn frozen(screen: &Screen, placed: &GraphicLayout) -> Screen {
+        let mut screen = screen.clone();
+        for (name, area) in placed.placements() {
+            let widget = screen.widgets.iter_mut().find(|w| w.name == name).unwrap();
+            let style = widget.layout.get(RENDERER).map(|p| p.style.clone()).unwrap_or_default();
+            let place = Placement { x: area.x, y: area.y, w: area.w, h: area.h, style };
+            widget.layout.insert(RENDERER.to_owned(), place);
+        }
+        screen
+    }
+
+    #[test]
+    fn a_layout_written_down_looks_like_the_automatic_one() {
+        for automatic_screen in [addressbook(), {
+            // Without a picture, and with a line of text among the fields.
+            let mut screen = addressbook();
+            screen.widgets.retain(|w| w.name != "photo");
+            screen.widgets.push(
+                serde_json::from_value(serde_json::json!(
+                    { "name": "note", "kind": "text", "ord": 25, "props": { "template": "A note" } }
+                ))
+                .unwrap(),
+            );
+            screen
+        }] {
+            let automatic = layout(&automatic_screen, &[], &fonts());
+            assert!(!automatic.free);
+
+            let by_hand = layout(&frozen(&automatic_screen, &automatic), &[], &fonts());
+            assert!(by_hand.free);
+            assert_eq!(by_hand.paper, automatic.paper);
+            assert_eq!(by_hand.header, automatic.header);
+            assert_eq!((by_hand.width, by_hand.height), (automatic.width, automatic.height));
+            let sorted = |layout: &GraphicLayout| {
+                let mut items = layout.items.clone();
+                items.sort_by(|a, b| a.widget.cmp(&b.widget));
+                let mut rules = layout.rules.clone();
+                rules.sort_by_key(|rule| rule.y);
+                (items, rules)
+            };
+            assert_eq!(sorted(&by_hand), sorted(&automatic));
+        }
+    }
+
+    #[test]
+    fn a_moved_widget_stays_where_it_was_put_and_the_sheet_follows() {
+        let screen = addressbook();
+        let automatic = layout(&screen, &[], &fonts());
+        let mut by_hand = frozen(&screen, &automatic);
+        let company = by_hand.widgets.iter_mut().find(|w| w.name == "company").unwrap();
+        let place = company.layout.get_mut(RENDERER).unwrap();
+        (place.x, place.y) = (200, 150);
+
+        let moved = layout(&by_hand, &[], &fonts());
+        assert_eq!(
+            moved.item("company").unwrap().area,
+            Rect::new(200, 150, place_width(&automatic), 14)
+        );
+        // The sheet grew to hold it, and the window with the sheet.
+        assert_eq!(moved.paper.unwrap().bottom(), 150 + 14 + 11);
+        assert!(moved.height > automatic.height);
+        // The buttons did not move.
+        assert_eq!(moved.item("new").unwrap().area, automatic.item("new").unwrap().area);
+    }
+
+    fn place_width(layout: &GraphicLayout) -> i32 {
+        layout.item("company").unwrap().area.w
+    }
+
+    #[test]
+    fn a_widget_without_a_place_goes_under_those_that_have_one() {
+        let screen = addressbook();
+        let automatic = layout(&screen, &[], &fonts());
+        let mut by_hand = frozen(&screen, &automatic);
+        // A field and a button added later, in SQL, without a rectangle.
+        by_hand.widgets.extend(
+            serde_json::from_value::<Vec<Widget>>(serde_json::json!([
+                { "name": "city", "kind": "field", "ord": 40, "label": "City", "column": "city" },
+                { "name": "extra", "kind": "button", "ord": 120, "label": "Extra", "action": "x" }
+            ]))
+            .unwrap(),
+        );
+        let mixed = layout(&by_hand, &[], &fonts());
+        assert!(!mixed.free, "the editor will write the missing rectangles down");
+        let city = mixed.item("city").unwrap().area;
+        let lowest_before = automatic.items.iter().map(|item| item.area.bottom()).max().unwrap();
+        assert!(city.y > lowest_before);
+        assert!(mixed.item("extra").unwrap().area.y > city.bottom());
+        assert!(mixed.height > automatic.height);
+    }
+
     fn screen(has_cards: bool, widgets: serde_json::Value) -> Screen {
         serde_json::from_value(serde_json::json!({
             "stack": { "name": "s", "title": "S", "kind": "user" },
@@ -639,16 +850,21 @@ mod tests {
             serde_json::json!([
                 { "name": "last_name", "kind": "field", "ord": 20, "label": "Last name", "column": "last_name" },
                 { "name": "note", "kind": "field", "ord": 30, "label": "Note", "column": "note",
-                  "layout": { "graphic": { "x": 300, "y": 400, "w": 120, "h": 14, "style": {} } } }
+                  "layout": { "graphic": { "x": 300, "y": 100, "w": 120, "h": 14, "style": {} } } }
             ]),
         );
         let layout = layout(&screen, &[], &fonts());
-        assert_eq!(layout.item("note").unwrap().area, Rect::new(300, 400, 120, 14));
-        // The window grows to hold it, and it does not take a row of the sheet.
+        assert_eq!(layout.item("note").unwrap().area, Rect::new(300, 100, 120, 14));
+        // The window grows to hold it. The field that has no rectangle goes
+        // under it, and the sheet holds both.
         assert_eq!(layout.width, 427);
-        assert_eq!(layout.height, 421);
-        assert_eq!(layout.rules.len(), 1);
-        assert_eq!(layout.focus_order, ["last_name", "note"]);
+        let last_name = layout.item("last_name").unwrap().area;
+        assert!(last_name.y > 114, "{last_name:?}");
+        assert_eq!(layout.paper.unwrap().bottom(), last_name.bottom() + 11);
+        assert_eq!(layout.rules.len(), 2);
+        assert!(!layout.free);
+        // The focus goes down the window.
+        assert_eq!(layout.focus_order, ["note", "last_name"]);
     }
 
     #[test]

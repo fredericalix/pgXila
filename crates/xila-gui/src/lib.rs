@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod chrome;
+pub mod design;
 pub mod font;
 pub mod frame;
 pub mod layout;
