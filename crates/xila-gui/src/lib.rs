@@ -20,6 +20,7 @@ pub mod palette;
 pub mod present;
 pub mod screen;
 pub mod script;
+pub mod talk;
 
 #[cfg(test)]
 mod testing;

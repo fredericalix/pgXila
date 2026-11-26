@@ -75,7 +75,7 @@ fn wait_for(server: &mut Server, wanted: impl Fn(&Notification) -> bool) -> bool
 fn the_server_introduces_itself() {
     let mut server = server();
     let hello = server.hello().unwrap();
-    assert_eq!(hello.api, 3);
+    assert_eq!(hello.api, 4);
     assert_eq!(hello.role, var("PGXILA_TEST_USER"));
     assert_eq!(hello.home, "desktop");
     assert!(!hello.author);
@@ -118,7 +118,7 @@ fn a_stack_is_described_by_the_server() {
 
     // Keys of the stack and keys available everywhere, together.
     let keys: Vec<&str> = screen.keys.iter().map(|k| k.key.as_str()).collect();
-    assert_eq!(keys, ["F3", "F4", "F6", "F7", "F8", "F10", "F12", "Enter"]);
+    assert_eq!(keys, ["F3", "F4", "F6", "F7", "F8", "F9", "F10", "F12", "Enter"]);
     // The stack belongs to the administrator: author mode is not offered.
     assert!(!screen.stack.may_edit);
 

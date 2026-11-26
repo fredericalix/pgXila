@@ -169,11 +169,7 @@ fn waiting() -> Vec<(String, String)> {
     in_transaction(|| {
         Spi::connect(|client| {
             client
-                .select(
-                    "SELECT conversation::text, upto::text FROM xila.agent_work()",
-                    None,
-                    &[],
-                )
+                .select("SELECT conversation::text, upto::text FROM xila.agent_work()", None, &[])
                 .map(|rows| {
                     rows.filter_map(|row| {
                         Some((row.get::<String>(1).ok()??, row.get::<String>(2).ok()??))

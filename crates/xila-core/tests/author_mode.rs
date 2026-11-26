@@ -109,7 +109,7 @@ fn an_author_builds_a_stack_from_the_client() {
     session.activate("stacks");
     assert_eq!(
         keys(&session),
-        ["F3=Quit", "F6=New stack", "F10=Deleted", "F11=Author", "F12=Back"]
+        ["F3=Quit", "F6=New stack", "F9=Agent", "F10=Deleted", "F11=Author", "F12=Back"]
     );
     session.press("F6");
     assert_eq!(session.view().stack(), "new_stack");
@@ -147,6 +147,7 @@ fn an_author_builds_a_stack_from_the_client() {
             "F6=New",
             "F7=Prev.",
             "F8=Next",
+            "F9=Agent",
             "F10=History",
             "F11=Author",
             "F12=Back",
@@ -268,7 +269,7 @@ fn author_mode_is_kept_from_those_who_may_not_use_it() {
     let mut session = session_as("PGXILA_TEST_USER");
     assert!(!session.hello().author);
     session.activate("stacks");
-    assert_eq!(keys(&session), ["F3=Quit", "F12=Back"]);
+    assert_eq!(keys(&session), ["F3=Quit", "F9=Agent", "F12=Back"]);
     select(&mut session, "list", "title", "Test books");
     session.activate("list");
     assert_eq!(session.view().stack(), STACK);

@@ -193,7 +193,10 @@ pub fn layout(screen: &Screen) -> TextLayout {
                     previous = Some(widget.kind);
                 }
                 result.items.push(Item::Grid { widget: widget.name.clone(), x, y, w, h });
-                grids.push(widget.name.clone());
+                // A conversation is read, not walked row by row.
+                if widget.talk().is_none() {
+                    grids.push(widget.name.clone());
+                }
             }
             // Images, sliders and canvases have no text form yet.
             WidgetKind::Image | WidgetKind::Slider | WidgetKind::Canvas => {}

@@ -34,6 +34,55 @@ pub struct Fake {
     pub scripts: BTreeMap<Option<String>, String>,
     /// True when the server refuses to save a script.
     pub refuses_scripts: bool,
+    /// The conversation with the agent, oldest line first: who, and what.
+    pub talk: Vec<(String, String)>,
+}
+
+/// The screen of the agent, placed in the window as the server places it.
+fn agent() -> Screen {
+    let at = |x: i32, y: i32, w: i32, h: i32| serde_json::json!({ "graphic": { "x": x, "y": y, "w": w, "h": h, "style": {} } });
+    let hidden = serde_json::json!({ "graphic": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } });
+    serde_json::from_value(serde_json::json!({
+        "stack": { "name": "agent", "title": "Agent", "kind": "system" },
+        "source": { "has_cards": true, "count": 1 },
+        "widgets": [
+            { "name": "heading", "kind": "text", "ord": 10,
+              "props": { "template": "{title}", "style": "title" }, "layout": hidden },
+            { "name": "about", "kind": "text", "ord": 20,
+              "props": { "template": "{about}", "style": "subtitle" }, "layout": at(322, 204, 127, 23) },
+            { "name": "talk", "kind": "grid", "ord": 30,
+              "props": { "view": "talk", "who": "kind",
+                         "columns": [ { "column": "kind" }, { "column": "text" } ] },
+              "layout": at(7, 7, 304, 196) },
+            { "name": "ask", "kind": "field", "ord": 40, "label": "Ask", "column": "ask",
+              "type": "text", "props": { "max_length": 2000 }, "layout": at(34, 211, 222, 14) },
+            { "name": "send", "kind": "button", "ord": 50, "label": "Send", "action": "send",
+              "layout": { "graphic": { "x": 262, "y": 210, "w": 49, "h": 15,
+                                       "style": { "variant": "primary" } } } },
+            { "name": "model", "kind": "text", "ord": 60, "label": "Model",
+              "props": { "template": "{model}" }, "layout": at(322, 8, 127, 34) },
+            { "name": "host", "kind": "text", "ord": 70, "label": "Where",
+              "props": { "template": "{host}" }, "layout": at(322, 46, 127, 23) },
+            { "name": "tools", "kind": "text", "ord": 80, "label": "Tools",
+              "props": { "template": "{tools}" }, "layout": at(322, 73, 127, 45) },
+            { "name": "guard", "kind": "text", "ord": 90, "label": "Guard rails",
+              "props": {}, "layout": at(322, 122, 127, 45) },
+            { "name": "today", "kind": "text", "ord": 100, "label": "Today",
+              "props": { "template": "{today}" }, "layout": at(322, 171, 127, 23) },
+            { "name": "status", "kind": "text", "ord": 110, "props": {}, "layout": hidden }
+        ],
+        "actions": [],
+        "keys": [
+            { "key": "F3", "label": "Quit", "action": "quit" },
+            { "key": "F5", "label": "Stop", "action": "stop" },
+            { "key": "F6", "label": "New", "action": "new" },
+            { "key": "F9", "label": "Agent", "action": "agent" },
+            { "key": "F10", "label": "Conversations", "action": "list" },
+            { "key": "F12", "label": "Back", "action": "back" },
+            { "key": "Enter", "label": "Send", "action": "send" }
+        ]
+    }))
+    .unwrap()
 }
 
 fn desktop() -> Screen {
@@ -289,6 +338,7 @@ impl Api for Fake {
             "stacks" => stacks(),
             "author" => author(),
             "field" => field(),
+            "agent" => agent(),
             other => self.edited(other),
         })
     }
@@ -296,6 +346,23 @@ impl Api for Fake {
     fn card(&mut self, stack: &str, key: Option<&str>, _to: Move) -> Result<Card, ApiError> {
         let text = |value: &str| Some(value.to_owned());
         Ok(match stack {
+            "agent" => Card {
+                key: Some("talk-1".into()),
+                position: 1,
+                count: 1,
+                texts: [
+                    ("about", "Looking at Address book"),
+                    ("model", "test-model-with-a-rather-long-name"),
+                    ("host", "models.example"),
+                    ("tools", "List the stacks, Find cards, Read a card"),
+                    ("guard", "Reads only, restricted role, journal"),
+                    ("today", "2 actions, 0 refused"),
+                ]
+                .into_iter()
+                .map(|(name, said)| (name.to_owned(), said.to_owned()))
+                .collect(),
+                ..Card::default()
+            },
             "desktop" => Card {
                 position: 1,
                 count: 1,
@@ -368,6 +435,23 @@ impl Api for Fake {
         _widget: &str,
         card: Option<&str>,
     ) -> Result<GridPage, ApiError> {
+        if stack == "agent" {
+            // Newest first, as the server gives a conversation.
+            let rows: Vec<GridRow> = self
+                .talk
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, (kind, said))| GridRow {
+                    key: index.to_string(),
+                    cells: BTreeMap::from([
+                        ("kind".to_owned(), Some(kind.clone())),
+                        ("text".to_owned(), Some(said.clone())),
+                    ]),
+                })
+                .collect();
+            return Ok(GridPage { total: rows.len() as u64, rows });
+        }
         if stack == "author" {
             let row = |key: &str, cells: [&str; 4]| GridRow {
                 key: key.into(),
@@ -419,6 +503,14 @@ impl Api for Fake {
             card: card.map(str::to_owned),
         };
         Ok(match action {
+            "agent" => vec![show("agent", Some("talk-1"))],
+            // The question joins the conversation; the answer comes later.
+            "send" => {
+                let asked = context.dirty.get("ask").cloned().unwrap_or_default();
+                self.talk.push(("user".into(), asked));
+                self.talk.push(("wait".into(), "The agent is working…".into()));
+                vec![show("agent", Some("talk-1"))]
+            }
             "open_stacks" => vec![show("stacks", None)],
             "open" => vec![show(context.row.as_deref().unwrap_or("addressbook"), None)],
             "next_card" => vec![show(stack, Some("2"))],

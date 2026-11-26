@@ -78,6 +78,8 @@ pub enum Part {
     },
     Picture,
     Grid,
+    /// A list shown as a conversation.
+    Talk,
     Button {
         label: String,
         look: ButtonLook,
@@ -260,6 +262,7 @@ fn part_of(widget: &Widget, fonts: &Fonts) -> Option<Part> {
         },
         WidgetKind::Button => Part::Button { label: label(widget), look: look(widget) },
         WidgetKind::Image => Part::Picture,
+        WidgetKind::Grid if widget.talk().is_some() => Part::Talk,
         WidgetKind::Grid => Part::Grid,
         // Not drawn yet.
         WidgetKind::Slider | WidgetKind::Canvas => return None,
@@ -363,7 +366,11 @@ fn free_card_layout(placed: &[&Widget], flowing: &[&Widget], fonts: &Fonts) -> G
             item.area.bottom()
                 + match item.part {
                     Part::Title => 18,
-                    Part::Field { .. } | Part::Text | Part::Info { .. } | Part::Grid => 11,
+                    Part::Field { .. }
+                    | Part::Text
+                    | Part::Info { .. }
+                    | Part::Grid
+                    | Part::Talk => 11,
                     _ => 8,
                 }
         })
@@ -603,7 +610,7 @@ fn static_layout(widgets: &[&Widget], fonts: &Fonts) -> GraphicLayout {
         layout.items.push(Item {
             widget: widget.name.clone(),
             area: Rect::new(MARGIN, y, width - 2 * MARGIN, height),
-            part: Part::Grid,
+            part: if widget.talk().is_some() { Part::Talk } else { Part::Grid },
         });
         y += height + 9;
     }

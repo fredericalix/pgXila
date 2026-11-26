@@ -24,8 +24,7 @@ mod http;
 mod launcher;
 
 /// The database the workers work in: the one where the extension is created.
-static DATABASE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(c"pgxila"));
+static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"pgxila"));
 
 /// The name of that database.
 fn database() -> CString {

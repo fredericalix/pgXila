@@ -11,8 +11,8 @@ mod tests {
     use serde_json::{json, Value as Json};
 
     use crate::tests::{
-        become_admin, become_role, create_books_as_ada, error_of, error_of_statement, json,
-        number, text, widget_of,
+        become_admin, become_role, create_books_as_ada, error_of, error_of_statement, json, number,
+        text, widget_of,
     };
 
     /// Text given to SQL as it is, whatever quotes it holds.
@@ -49,10 +49,8 @@ mod tests {
     /// What a tool refuses with, as the worker, for someone.
     fn tool_error(name: &str, as_role: &str, arguments: Json) -> (String, String) {
         become_role("xila_agent");
-        let error = error_of(&format!(
-            "xila.tool_{name}('{as_role}', {})",
-            quoted(&arguments.to_string())
-        ));
+        let error =
+            error_of(&format!("xila.tool_{name}('{as_role}', {})", quoted(&arguments.to_string())));
         become_role("ada");
         error
     }
@@ -72,11 +70,10 @@ mod tests {
     /// As the worker: what to send for a conversation.
     fn request(conversation: &str) -> Option<Json> {
         become_role("xila_agent");
-        let asked = Spi::get_one::<pgrx::JsonB>(&format!(
-            "SELECT xila.agent_request('{conversation}')"
-        ))
-        .unwrap()
-        .map(|found| found.0);
+        let asked =
+            Spi::get_one::<pgrx::JsonB>(&format!("SELECT xila.agent_request('{conversation}')"))
+                .unwrap()
+                .map(|found| found.0);
         become_role("ada");
         asked
     }
@@ -150,7 +147,10 @@ mod tests {
             ),
             Some("Stack closed to the agent".to_owned())
         );
-        assert_eq!(text("SELECT agent::text FROM xila.stack_info WHERE name = 'books'").unwrap(), "false");
+        assert_eq!(
+            text("SELECT agent::text FROM xila.stack_info WHERE name = 'books'").unwrap(),
+            "false"
+        );
 
         // History brings it back like any other property.
         Spi::run("SELECT xila.rewind('books', 'screen', (SELECT max(id) FROM xila.history))")
@@ -186,7 +186,10 @@ mod tests {
         // agent itself may read.
         assert_eq!(tool("list_stacks", "dan", json!({}))["stacks"], json!([]));
         let (code, message) = tool_error("find_cards", "dan", json!({"stack": "books"}));
-        assert_eq!((code.as_str(), message.as_str()), ("XL002", "The stack “books” does not exist."));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("XL002", "The stack “books” does not exist.")
+        );
         let (code, _) = tool_error("read_card", "dan", json!({"stack": "books", "position": 1}));
         assert_eq!(code, "XL002");
 
@@ -255,7 +258,10 @@ mod tests {
             json!(0)
         );
         // A text is looked for as it is written, not as a pattern.
-        assert_eq!(tool("find_cards", "ada", json!({"stack": "books", "text": "%"}))["total"], json!(0));
+        assert_eq!(
+            tool("find_cards", "ada", json!({"stack": "books", "text": "%"}))["total"],
+            json!(0)
+        );
 
         // Without a text: the cards in the order of the stack, a few at a time.
         let page = tool("find_cards", "ada", json!({"stack": "books", "limit": 2, "offset": 1}));
@@ -276,7 +282,8 @@ mod tests {
         assert_eq!(second["title"], json!("Germinal"));
         assert_eq!(second["count"], json!(3));
 
-        let (code, message) = tool_error("read_card", "ada", json!({"stack": "books", "position": 9}));
+        let (code, message) =
+            tool_error("read_card", "ada", json!({"stack": "books", "position": 9}));
         assert_eq!(code, "XL002");
         assert_eq!(message, "There is no such card in Books. The stack has 3 cards.");
         let (code, _) = tool_error("read_card", "ada", json!({"stack": "books"}));
@@ -304,7 +311,7 @@ mod tests {
         assert_eq!(code, "XL004");
         let (code, _) = error_of("(SELECT address FROM xila.agent_setting)");
         assert_eq!(code, "42501");
-        let (code, _) = error_of(r#"xila.act('agent', 'settings', '{}')"#);
+        let (code, _) = error_of(r#"xila.act('conversations', 'settings', '{}')"#);
         assert_eq!(code, "XL004");
         // Everyone may know which model it is and where the questions go.
         assert_eq!(
@@ -318,6 +325,7 @@ mod tests {
             (r#"{"address": "http://192.168.1.20:1234/v1"}"#, "address"),
             (r#"{"address": "models.example"}"#, "address"),
             (r#"{"token_variable": "PGPASSWORD"}"#, "token_variable"),
+            (r#"{"token_variable": "PG_COLOR"}"#, "token_variable"),
             (r#"{"token_variable": "POSTGRES_PASSWORD"}"#, "token_variable"),
             (r#"{"token_variable": "my token"}"#, "token_variable"),
             (r#"{"options": "[1]"}"#, "options"),
@@ -328,6 +336,9 @@ mod tests {
         }
         let (code, _) = error_of(r#"xila.set_agent('{"token": "secret"}')"#);
         assert_eq!(code, "XL003");
+
+        // A variable of pgXila is not one of PostgreSQL.
+        Spi::run(r#"SELECT xila.set_agent('{"token_variable": "PGXILA_AGENT_TOKEN"}')"#).unwrap();
 
         // A model on the machine itself may be called without TLS.
         Spi::run(
@@ -345,7 +356,7 @@ mod tests {
 
         // The dialog of the settings.
         become_role("eve");
-        let shown = json(r#"SELECT xila.act('agent', 'settings', '{}')"#);
+        let shown = json(r#"SELECT xila.act('conversations', 'settings', '{}')"#);
         assert_eq!(shown, json!([{"do": "show", "stack": "agent_settings", "card": "agent"}]));
         assert_eq!(
             json("SELECT xila.card('agent_settings', 'agent', 'at')")["values"]["model"],
@@ -372,10 +383,7 @@ mod tests {
         assert_eq!(on_screen["values"]["about"], json!("Looking at Books"));
         assert_eq!(on_screen["values"]["model"], json!("test-model"));
         assert_eq!(on_screen["values"]["host"], json!("models.example"));
-        assert_eq!(
-            on_screen["values"]["tools"],
-            json!("List the stacks, Find cards, Read a card")
-        );
+        assert_eq!(on_screen["values"]["tools"], json!("List the stacks, Find cards, Read a card"));
         assert_eq!(on_screen["values"]["today"], json!("0 actions, 0 refused"));
 
         // Nothing to send.
@@ -395,7 +403,8 @@ mod tests {
             json!([["user", "Which books do I have?"], ["wait", "The agent is working…"]])
         );
         assert_eq!(
-            text(&format!("SELECT title FROM xila.conversation WHERE id = '{conversation}'")).unwrap(),
+            text(&format!("SELECT title FROM xila.conversation WHERE id = '{conversation}'"))
+                .unwrap(),
             "Which books do I have?"
         );
 
@@ -408,9 +417,8 @@ mod tests {
 
         // F5 gives the question up; what comes back for it later is dropped.
         let before = request(&conversation).expect("a request");
-        let stopped = json(&format!(
-            r#"SELECT xila.act('agent', 'stop', '{{"card": "{conversation}"}}')"#
-        ));
+        let stopped =
+            json(&format!(r#"SELECT xila.act('agent', 'stop', '{{"card": "{conversation}"}}')"#));
         assert_eq!(stopped[1]["text"], json!("Question given up."), "{stopped}");
         assert_eq!(state_of(&conversation), "idle");
         answer(&conversation, &before, 200, &says("Two."));
@@ -425,9 +433,8 @@ mod tests {
         );
 
         // F6 starts another one, and the list shows both.
-        let fresh = json(&format!(
-            r#"SELECT xila.act('agent', 'new', '{{"card": "{conversation}"}}')"#
-        ));
+        let fresh =
+            json(&format!(r#"SELECT xila.act('agent', 'new', '{{"card": "{conversation}"}}')"#));
         assert_ne!(fresh[0]["card"], json!(conversation));
         assert_eq!(json(r#"SELECT xila.act('agent', 'new', '{}')"#)[0]["card"], fresh[0]["card"]);
         let listed = json("SELECT xila.grid_rows('conversations', 'list')");
@@ -489,13 +496,20 @@ mod tests {
 
         // The model asks for a tool: the worker runs it, for Ada, and the
         // conversation waits for the next call.
-        answer(&conversation, &first, 200, &calls("find_cards", json!({"stack": "books", "text": "candide"})));
+        answer(
+            &conversation,
+            &first,
+            200,
+            &calls("find_cards", json!({"stack": "books", "text": "candide"})),
+        );
         assert_eq!(state_of(&conversation), "waiting");
         assert_eq!(
             lines(&conversation),
-            json!([["user", "Do I have Candide?"],
-                   ["tool", "Looked for “candide” in Books: 1 card."],
-                   ["wait", "The agent is working…"]])
+            json!([
+                ["user", "Do I have Candide?"],
+                ["tool", "Looked for “candide” in Books: 1 card."],
+                ["wait", "The agent is working…"]
+            ])
         );
 
         // The next request carries what the model said and what the tool gave.
@@ -519,9 +533,11 @@ mod tests {
         assert_eq!(state_of(&conversation), "idle");
         assert_eq!(
             lines(&conversation),
-            json!([["user", "Do I have Candide?"],
-                   ["tool", "Looked for “candide” in Books: 1 card."],
-                   ["agent", "Yes: Candide, from 1759."]])
+            json!([
+                ["user", "Do I have Candide?"],
+                ["tool", "Looked for “candide” in Books: 1 card."],
+                ["agent", "Yes: Candide, from 1759."]
+            ])
         );
         become_role("xila_agent");
         assert_eq!(number("SELECT count(*) FROM xila.agent_work()"), 0);
@@ -534,11 +550,16 @@ mod tests {
         );
         assert_eq!(
             journal,
-            json!([["ada", "model", "Model: 1.1 s, 330 tokens"],
-                   ["ada", "tool", "Looked for “candide” in Books: 1 card."],
-                   ["ada", "model", "Model: 1.1 s, 354 tokens"]])
+            json!([
+                ["ada", "model", "Model: 1.1 s, 330 tokens"],
+                ["ada", "tool", "Looked for “candide” in Books: 1 card."],
+                ["ada", "model", "Model: 1.1 s, 354 tokens"]
+            ])
         );
-        assert_eq!(number("SELECT count(*) FROM xila.agent_log l WHERE l.detail::text ILIKE '%1759%'"), 0);
+        assert_eq!(
+            number("SELECT count(*) FROM xila.agent_log l WHERE l.detail::text ILIKE '%1759%'"),
+            0
+        );
         assert_eq!(
             json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["today"],
             json!("1 action, 0 refused")
@@ -550,7 +571,8 @@ mod tests {
 
         // The screen lists the lines newest first, for the client to write
         // them from the bottom up.
-        let talk = json(&format!("SELECT xila.grid_rows('agent', 'talk', 0, 100, '{conversation}')"));
+        let talk =
+            json(&format!("SELECT xila.grid_rows('agent', 'talk', 0, 100, '{conversation}')"));
         assert_eq!(talk["total"], json!(3), "{talk}");
         assert_eq!(talk["rows"][0]["cells"]["kind"], json!("agent"));
         assert_eq!(talk["rows"][2]["cells"]["text"], json!("Do I have Candide?"));
@@ -626,7 +648,8 @@ mod tests {
         );
         // What an endpoint says about its refusal is kept for the journal.
         assert_eq!(
-            text("SELECT detail->>'said' FROM xila.agent_log WHERE detail->>'status' = '401'").unwrap(),
+            text("SELECT detail->>'said' FROM xila.agent_log WHERE detail->>'status' = '401'")
+                .unwrap(),
             "No auth credentials found"
         );
         // An error line is for people: the model is not sent it.
@@ -732,9 +755,8 @@ mod tests {
         );
 
         // Neither a script nor a key of a stack can take it.
-        let checked = json(
-            r"SELECT xila.check_script(E'keys = { F9 = ''Mine'' }\nfunction on_key() end')",
-        );
+        let checked =
+            json(r"SELECT xila.check_script(E'keys = { F9 = ''Mine'' }\nfunction on_key() end')");
         assert_eq!(checked["ok"], json!(false), "{checked}");
         let (code, _) = error_of_statement(
             "INSERT INTO xila.key_binding (background_id, key, action_id)
@@ -760,18 +782,45 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|key| format!("{}={}", key["key"].as_str().unwrap(), key["label"].as_str().unwrap()))
+            .map(|key| {
+                format!("{}={}", key["key"].as_str().unwrap(), key["label"].as_str().unwrap())
+            })
             .collect();
         assert_eq!(
             keys,
-            ["F3=Quit", "F5=Stop", "F6=New", "F7=Journal", "F9=Agent", "F10=Conversations",
-             "F12=Back", "Enter=Send"]
+            [
+                "F3=Quit",
+                "F5=Stop",
+                "F6=New",
+                "F9=Agent",
+                "F10=Conversations",
+                "F12=Back",
+                "Enter=Send"
+            ]
         );
-        // The settings are offered to administrators only.
+        // The conversation has a place on the text screen, and one line there
+        // for what the window shows on its side.
+        assert_eq!(talk["layout"]["text"]["h"], json!(14));
+        assert_eq!(widget_of(&screen, "model")["layout"]["text"]["style"]["hidden"], json!(true));
+        assert_eq!(
+            widget_of(&screen, "status")["layout"]["graphic"]["style"]["hidden"],
+            json!(true)
+        );
+
+        // The journal and the settings are reached from the list of
+        // conversations; the settings are offered to administrators only.
+        let list = json("SELECT xila.open_stack('conversations')");
+        assert!(!list["keys"].to_string().contains("Settings"), "{list}");
+        assert_eq!(
+            json(r#"SELECT xila.act('conversations', 'journal', '{}')"#),
+            json!([{"do": "show", "stack": "agent_journal"}])
+        );
         become_role("eve");
-        let keys = json("SELECT xila.open_stack('agent')")["keys"].clone();
+        let keys = json("SELECT xila.open_stack('conversations')")["keys"].clone();
         assert!(
-            keys.as_array().unwrap().contains(&json!({"key": "F4", "label": "Settings", "action": "settings"})),
+            keys.as_array()
+                .unwrap()
+                .contains(&json!({"key": "F4", "label": "Settings", "action": "settings"})),
             "{keys}"
         );
 

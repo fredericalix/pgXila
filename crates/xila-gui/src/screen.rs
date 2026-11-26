@@ -22,11 +22,14 @@ use crate::layout::{
 };
 use crate::palette::slot;
 use crate::script::{self, Scripter};
+use crate::talk;
 
 /// Longest text a field accepts when its widget sets no limit.
 const DEFAULT_MAX_LENGTH: usize = 200;
 /// Width of a right-aligned column of a list, such as a count.
 const NARROW_COLUMN: i32 = 52;
+/// Height of a line of a text written on several lines.
+const TEXT_LINE: i32 = 11;
 
 /// What the graphical client remembers between two events, besides the
 /// session.
@@ -38,6 +41,8 @@ pub struct Ui {
     anchor: Option<(String, Option<String>, String)>,
     /// The button the pointer is held on.
     pressed: Option<String>,
+    /// How far back the user went in a conversation, in pixels from its end.
+    talk_back: i32,
     /// What the visual editor remembers, while a stack is open in it.
     pub designer: Designer,
     /// What the drawing editor remembers, while a picture is open in it.
@@ -222,6 +227,20 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
                 session.say("This key is not active on this screen.");
             }
         }
+        // A conversation is read a page at a time.
+        Key::PageUp | Key::PageDown => {
+            let view = session.view();
+            let talk = layout.items.iter().find(|item| item.part == Part::Talk).and_then(|item| {
+                let definition = widget(view, &item.widget)?;
+                let state = view.grids.get(&item.widget)?;
+                let blocks = talk::blocks(fonts, definition, state, item.area.w);
+                Some((talk::overflow(&blocks, item.area), talk::page(item.area)))
+            });
+            if let Some((most, page)) = talk {
+                let step = if key == Key::PageUp { page } else { -page };
+                ui.talk_back = (ui.talk_back + step).clamp(0, most);
+            }
+        }
         // A list shown as icons is walked in two directions.
         Key::Left if on_icons => session.select_row(&name, -1),
         Key::Right if on_icons => session.select_row(&name, 1),
@@ -247,6 +266,8 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         // In a field, Enter is a key like any other; when the screen gives
         // it no meaning, it moves on to the next field.
         Key::Enter => {
+            // What is sent is answered at the end of the conversation.
+            ui.talk_back = 0;
             if !session.press("Enter") {
                 move_focus(session, &layout, &focus, 1);
             }
@@ -663,10 +684,33 @@ fn draw_stack<A: Api>(
                     fonts.regular.draw(frame, x, area.y + 39, text, slot::ICE);
                 }
             }
+            // A text in a rectangle taller than a line is written on as
+            // many lines as it needs, within the rectangle.
+            Part::Text if area.h >= 2 * TEXT_LINE => {
+                let clip = frame.clip_to(area);
+                let text = text_of(view, &item.widget);
+                for (index, line) in wrapped(fonts, text, area.w).iter().enumerate() {
+                    let baseline = area.y + 8 + index as i32 * TEXT_LINE;
+                    fonts.regular.draw(frame, area.x, baseline, line, slot::INK);
+                }
+                frame.set_clip(clip);
+            }
             Part::Text => {
                 let clip = frame.clip_to(area);
                 let text = text_of(view, &item.widget);
                 fonts.regular.draw(frame, area.x, text_baseline(area), text, slot::INK);
+                frame.set_clip(clip);
+            }
+            // The same for a text with a label: the label is then a heading
+            // over it.
+            Part::Info { label, .. } if area.h >= 2 * TEXT_LINE => {
+                let clip = frame.clip_to(area);
+                fonts.bold.draw(frame, area.x, area.y + 8, label, slot::COCOA);
+                let text = text_of(view, &item.widget);
+                for (index, line) in wrapped(fonts, text, area.w - 6).iter().enumerate() {
+                    let baseline = area.y + 8 + (index as i32 + 1) * TEXT_LINE;
+                    fonts.regular.draw(frame, area.x + 6, baseline, line, slot::INK);
+                }
                 frame.set_clip(clip);
             }
             Part::Info { label, value_x } => {
@@ -728,6 +772,13 @@ fn draw_stack<A: Api>(
                     }
                 }
             }
+            Part::Talk => {
+                if let (Some(definition), Some(state)) =
+                    (widget(view, &item.widget), view.grids.get(&item.widget))
+                {
+                    talk::draw(frame, fonts, area, definition, state, ui.talk_back);
+                }
+            }
             Part::Button { label, look } => {
                 let look = ButtonLook {
                     pressed: ui.pressed.as_deref() == Some(item.widget.as_str()),
@@ -739,6 +790,14 @@ fn draw_stack<A: Api>(
         }
     }
     frame.set_clip(previous);
+}
+
+/// A text cut into lines no wider than `width` pixels. A word wider than a
+/// line, such as the name of a model, is cut too.
+fn wrapped(fonts: &Fonts, text: &str, width: i32) -> Vec<String> {
+    xila_core::talk::wrap(text, width.max(1) as usize, |piece| {
+        fonts.regular.width(piece).max(0) as usize
+    })
 }
 
 /// The baseline of a line of text in its rectangle: aligned with the text of
@@ -1062,6 +1121,128 @@ mod tests {
         let fonts = fonts();
         pointer_down(session, ui, &fonts, x, y);
         pointer_up(session, ui, &fonts, x, y);
+    }
+
+    /// A session on the screen of the agent, with a conversation.
+    fn agent_session(talk: &[(&str, &str)]) -> (Session<Fake>, Ui) {
+        let server = Fake {
+            talk: talk.iter().map(|(who, said)| ((*who).to_owned(), (*said).to_owned())).collect(),
+            ..Fake::default()
+        };
+        let mut session = Session::start(server).unwrap();
+        let mut ui = Ui::default();
+        session.press("F9");
+        assert_eq!(session.view().stack(), "desktop", "the fake desktop has no F9 key");
+        session.run("agent");
+        assert_eq!(session.view().stack(), "agent");
+        settle(&mut session, &mut ui, &fonts());
+        (session, ui)
+    }
+
+    const TALK: [(&str, &str); 4] = [
+        ("user", "Who lives in London?"),
+        ("tool", "Looked for “London” in Address book: 2 cards."),
+        ("agent", "Two people live in London: Charles Babbage, of Difference Works, and Ada Lovelace, of Analytical Engines."),
+        ("error", "The model did not answer in time."),
+    ];
+
+    #[test]
+    fn the_agent_has_a_window_with_the_conversation_and_what_it_is() {
+        let (session, ui) = agent_session(&TALK);
+        let frame = render(&session, &ui);
+        snapshot(&frame, "agent");
+
+        // The conversation: a bubble for each of the two, what the agent did
+        // and what went wrong in between.
+        let talk = area_of(&session, "talk");
+        assert!(has_slot(&frame, talk, slot::ICE), "the bubble of the person");
+        assert!(has_slot(&frame, talk, slot::WHITE), "the bubble of the agent");
+        assert!(has_slot(&frame, talk, slot::LAVENDER), "the face of the agent");
+        assert!(has_slot(&frame, talk, slot::RED), "what went wrong");
+        // The person is on the right, the agent on the left.
+        let right = Rect::new(talk.x + talk.w * 3 / 4, talk.y, talk.w / 4, talk.h);
+        let left = Rect::new(talk.x, talk.y, talk.w / 8, talk.h);
+        assert!(has_slot(&frame, right, slot::ICE));
+        assert!(!has_slot(&frame, left, slot::ICE));
+        assert!(has_slot(&frame, left, slot::LAVENDER));
+
+        // Beside it: the model, where it is, the tools, each under its heading.
+        for name in ["model", "host", "tools", "guard", "today", "about"] {
+            assert!(has_slot(&frame, area_of(&session, name), slot::INK), "{name}");
+        }
+        // A text that does not fit on a line goes on with the next one.
+        let tools = area_of(&session, "tools");
+        let third_line = Rect::new(tools.x, tools.y + 24, tools.w, 10);
+        assert!(has_slot(&frame, third_line, slot::INK));
+
+        // The line to write on has the focus; the conversation takes none.
+        assert_eq!(session.view().focus.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn a_question_is_typed_and_sent_from_the_window() {
+        let (mut session, mut ui) = agent_session(&[]);
+        let empty = render(&session, &ui);
+        let talk = area_of(&session, "talk");
+        assert!(!has_slot(&empty, talk, slot::ICE));
+
+        press(&mut session, &mut ui, &[Key::Char('H'), Key::Char('i'), Key::Enter]);
+        let (action, context) = session.api().actions.last().unwrap();
+        assert_eq!(action, "send");
+        assert_eq!(context.dirty.get("ask").map(String::as_str), Some("Hi"));
+        assert_eq!(context.card.as_deref(), Some("talk-1"));
+
+        // The question is in the conversation, the line is empty again, and
+        // the agent is said to be working.
+        assert_eq!(session.view().value("ask"), "");
+        let frame = render(&session, &ui);
+        assert!(has_slot(&frame, talk, slot::ICE));
+        assert!(has_slot(&frame, talk, slot::AMBER));
+
+        // The answer comes later: the server says so, and the window shows it.
+        let api = session.api_mut();
+        api.talk.pop();
+        api.talk.push(("agent".into(), "Hello.".into()));
+        api.pending.push(xila_core::api::Notification::Card {
+            stack: Some("agent".into()),
+            key: Some("talk-1".into()),
+        });
+        assert!(session.poll());
+        let frame = render(&session, &ui);
+        assert!(has_slot(&frame, talk, slot::WHITE));
+        assert!(!has_slot(&frame, talk, slot::AMBER));
+
+        // The button does the same as the key.
+        press(&mut session, &mut ui, &[Key::Char('?')]);
+        let send = area_of(&session, "send");
+        click(&mut session, &mut ui, send.x + 5, send.y + 5);
+        assert_eq!(session.api().count("send"), 2);
+    }
+
+    #[test]
+    fn a_long_conversation_is_read_a_page_at_a_time() {
+        let turns: Vec<(&str, &str)> =
+            (0..30).flat_map(|_| [("user", "And then?"), ("agent", "Then this.")]).collect();
+        let (mut session, mut ui) = agent_session(&turns);
+        let talk = area_of(&session, "talk");
+        let at_the_end = render(&session, &ui);
+        // A bar on the right says there is more.
+        let bar = Rect::new(talk.right() - 5, talk.y + 2, 3, talk.h - 4);
+        assert!(has_slot(&at_the_end, bar, slot::SAND));
+
+        press(&mut session, &mut ui, &[Key::PageUp]);
+        assert!(ui.talk_back > 0);
+        let back = render(&session, &ui);
+        assert_ne!(back.pixels(), at_the_end.pixels());
+
+        // Going back stops at the first line, and coming forward at the last.
+        press(&mut session, &mut ui, &[Key::PageUp; 40]);
+        let most = ui.talk_back;
+        press(&mut session, &mut ui, &[Key::PageUp]);
+        assert_eq!(ui.talk_back, most);
+        press(&mut session, &mut ui, &[Key::PageDown; 40]);
+        assert_eq!(ui.talk_back, 0);
+        assert_eq!(render(&session, &ui).pixels(), at_the_end.pixels());
     }
 
     /// The rectangle of a widget on the screen.

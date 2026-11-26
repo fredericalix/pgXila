@@ -640,10 +640,12 @@ LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 -- The name of an environment variable that may hold the token: never one of
--- PostgreSQL itself.
+-- PostgreSQL itself, such as PGPASSWORD, PG_COLOR or POSTGRES_PASSWORD. A
+-- name like PGXILA_AGENT_TOKEN is not one of those.
 CREATE FUNCTION xila.agent_variable_ok(variable text) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
-    SELECT variable ~ '^([A-Z][A-Z0-9_]{0,63})?$' AND variable !~ '^(PG|POSTGRES)'
+    SELECT variable ~ '^([A-Z][A-Z0-9_]{0,63})?$'
+       AND variable !~ '^(PG[A-Z0-9]*|PG_.*|POSTGRES.*)$'
 $$;
 
 -- The settings of the agent, in one row. The token of the model is not here:

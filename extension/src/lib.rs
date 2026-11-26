@@ -1081,7 +1081,10 @@ mod tests {
             ["F3=Quit", "F6=New stack", "F9=Agent", "F10=Deleted", "F11=Author", "F12=Back"]
         );
         become_role("dan");
-        assert_eq!(keys_of(&json("SELECT xila.open_stack('stacks')")), ["F3=Quit", "F9=Agent", "F12=Back"]);
+        assert_eq!(
+            keys_of(&json("SELECT xila.open_stack('stacks')")),
+            ["F3=Quit", "F9=Agent", "F12=Back"]
+        );
         let (state, _) = error_of("SELECT xila.act('stacks', 'new_stack')");
         assert_eq!(state, "XL004");
 

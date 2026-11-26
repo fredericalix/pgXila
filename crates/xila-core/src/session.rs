@@ -13,7 +13,7 @@ use crate::api::{
 };
 
 /// The version of the API this client speaks; see `docs/api.md`.
-pub const API_VERSION: u32 = 3;
+pub const API_VERSION: u32 = 4;
 
 /// The rows of a grid widget and the selected one.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -940,11 +940,13 @@ mod tests {
     fn a_server_of_another_version_is_refused() {
         let server = FakeServer { api: Some(1), ..FakeServer::default() };
         let error = Session::start(server).err().expect("a refusal");
-        assert_eq!(error, ApiError::Version { client: 3, server: 1 });
+        assert_eq!(error, ApiError::Version { client: API_VERSION, server: 1 });
         assert_eq!(
             error.to_string(),
-            "This client speaks version 3 of the pgXila API and the server version 1: \
-             update the older of the two."
+            format!(
+                "This client speaks version {API_VERSION} of the pgXila API and the server \
+                 version 1: update the older of the two."
+            )
         );
     }
 

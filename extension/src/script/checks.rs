@@ -102,8 +102,14 @@ end
     #[pg_test]
     fn a_script_says_which_keys_it_wants() {
         for (source, problem) in [
-            ("keys = { F3 = 'Leave' }\nfunction on_key() end", "F3, F9, F11 and F12 cannot be taken"),
-            ("keys = { F12 = 'Stay' }\nfunction on_key() end", "F3, F9, F11 and F12 cannot be taken"),
+            (
+                "keys = { F3 = 'Leave' }\nfunction on_key() end",
+                "F3, F9, F11 and F12 cannot be taken",
+            ),
+            (
+                "keys = { F12 = 'Stay' }\nfunction on_key() end",
+                "F3, F9, F11 and F12 cannot be taken",
+            ),
             ("keys = { F6 = 'New' }", "there is no function on_key"),
             ("keys = { F25 = 'New' }\nfunction on_key() end", "is not a key"),
             ("keys = { F6 = '' }\nfunction on_key() end", "needs a label"),
