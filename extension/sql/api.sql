@@ -104,7 +104,8 @@ $$;
 -- Whether an action is offered to the current role on a stack. An action may
 -- be kept for authors ({"for": "author"}), for those who may change the
 -- stack on screen ({"for": "editor"}) or for administrators ({"for":
--- "admin"}).
+-- "admin"}). An action shared by every screen may leave some out ({"except":
+-- ["agent"]}): the key that leads to a screen is not offered on it.
 CREATE FUNCTION xila.offered(args jsonb, stack uuid) RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT CASE args->>'for'
@@ -113,6 +114,8 @@ LANGUAGE sql STABLE AS $$
         WHEN 'admin' THEN pg_has_role('xila_admin', 'USAGE')
         ELSE true
     END
+    AND NOT coalesce(args->'except' ? (SELECT s.name FROM xila.stack s WHERE s.id = stack),
+                     false)
 $$;
 
 -- The identifier of the background of a stack, and of one of its actions.
@@ -192,7 +195,7 @@ $$;
 CREATE FUNCTION xila.hello() RETURNS jsonb
 LANGUAGE sql STABLE AS $$
     SELECT jsonb_build_object(
-        'api', 4,
+        'api', 5,
         'version', xila.version(),
         'instance', coalesce(nullif(current_setting('cluster_name'), ''), 'pgxila'),
         'role', session_user,

@@ -296,7 +296,9 @@ VALUES
 -- ---------------------------------------------------------------------------
 -- See docs/api.md, section 11. F9 calls the agent from any screen; like the
 -- keys to leave a screen, it means the same everywhere.
-INSERT INTO xila.action (name, label, handler) VALUES ('agent', 'Agent', 'agent');
+INSERT INTO xila.action (name, label, handler, args) VALUES
+    ('agent', 'Agent', 'agent',
+     '{"except": ["agent", "conversations", "agent_journal", "agent_settings"]}');
 INSERT INTO xila.key_binding (key, action_id) VALUES ('F9', xila.action_id(NULL, 'agent'));
 
 INSERT INTO xila.widget (background_id, name, kind, ord, label, action_id)
@@ -309,13 +311,17 @@ INSERT INTO xila.stack (name, title, kind) VALUES ('agent', 'Agent', 'system');
 INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
 SELECT id, 'xila', 'agent_talk', 'id' FROM xila.stack WHERE name = 'agent';
 INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
-    (xila.background_id('agent'), 'send', 'Send',          'ask_agent',        '{}'),
-    (xila.background_id('agent'), 'stop', 'Stop',          'stop_agent',       '{}'),
-    (xila.background_id('agent'), 'new',  'New',           'new_conversation', '{}'),
-    (xila.background_id('agent'), 'list', 'Conversations', 'conversations',    '{}');
+    (xila.background_id('agent'), 'send',   'Send',   'ask_agent',        '{}'),
+    (xila.background_id('agent'), 'stop',   'Stop',   'stop_agent',       '{}'),
+    (xila.background_id('agent'), 'new',    'New',    'new_conversation', '{}'),
+    (xila.background_id('agent'), 'list',   'List',   'conversations',    '{}'),
+    (xila.background_id('agent'), 'apply',  'Apply',  'apply_proposal',   '{}'),
+    (xila.background_id('agent'), 'refuse', 'Refuse', 'refuse_proposal',  '{}'),
+    (xila.background_id('agent'), 'view',   'View',   'view_proposal',    '{}');
 INSERT INTO xila.key_binding (background_id, key, action_id)
 SELECT xila.background_id('agent'), k.key, xila.action_id('agent', k.action)
-FROM (VALUES ('Enter', 'send'), ('F5', 'stop'), ('F6', 'new'), ('F10', 'list')) AS k(key, action);
+FROM (VALUES ('Enter', 'send'), ('F2', 'apply'), ('F4', 'refuse'), ('F5', 'stop'), ('F6', 'new'),
+             ('F10', 'list')) AS k(key, action);
 INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
 VALUES
     (xila.background_id('agent'), 'heading', 'text', 10, NULL, NULL, NULL,
@@ -324,11 +330,14 @@ VALUES
      '{"template": "{about}", "style": "subtitle"}'),
     (xila.background_id('agent'), 'talk', 'grid', 30, NULL, NULL, NULL,
      '{"schema": "xila", "table": "agent_line", "key": "id",
-       "view": "talk", "who": "kind",
+       "view": "talk", "who": "kind", "state": "state", "code": "code",
+       "apply": "apply", "refuse": "refuse", "show": "view",
        "where": {"conversation": "id"}, "order": ["at", "id"], "descending": true,
        "columns": [
            {"column": "kind", "label": "Who"},
-           {"column": "text", "label": "Said"}
+           {"column": "text", "label": "Said"},
+           {"column": "state", "label": "State"},
+           {"column": "code", "label": "Call"}
        ]}'),
     (xila.background_id('agent'), 'ask', 'field', 40, 'Ask', 'ask', NULL, '{"max_length": 2000}'),
     (xila.background_id('agent'), 'send', 'button', 50, 'Send', NULL,
@@ -340,7 +349,7 @@ VALUES
     (xila.background_id('agent'), 'tools', 'text', 80, 'Tools', NULL, NULL,
      '{"template": "{tools}"}'),
     (xila.background_id('agent'), 'guard', 'text', 90, 'Guard rails', NULL, NULL,
-     '{"template": "Reads only, restricted role, journal"}'),
+     '{"template": "Restricted role, you validate each change, journal"}'),
     (xila.background_id('agent'), 'today', 'text', 100, 'Today', NULL, NULL,
      '{"template": "{today}"}'),
     (xila.background_id('agent'), 'status', 'text', 110, NULL, NULL, NULL,

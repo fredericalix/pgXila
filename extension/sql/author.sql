@@ -1641,7 +1641,10 @@ CREATE VIEW xila.history_line WITH (security_invoker = true) AS
            END AS summary
     FROM (
         SELECT h.stack_id, h.txid, min(h.id) AS id, min(h.at) AS at,
-               min(h.actor::text) AS actor, count(*) AS changes,
+               -- What the agent proposed and someone applied says so.
+               min(h.actor::text) || CASE WHEN bool_or(h.origin = 'agent') THEN ' (agent)'
+                                          ELSE '' END AS actor,
+               count(*) AS changes,
                (array_agg(h.id ORDER BY xila.change_rank(h.object_kind), h.id))[1] AS main
         FROM xila.history h
         WHERE h.stack_id IS NOT NULL
@@ -1652,7 +1655,8 @@ CREATE VIEW xila.history_line WITH (security_invoker = true) AS
 -- The changes made to the cards of a stack, one line per change.
 CREATE VIEW xila.card_history_line WITH (security_invoker = true) AS
     SELECT h.id, s.name AS stack, h.object_key AS card,
-           to_char(h.at, 'YYYY-MM-DD HH24:MI') AS at, h.actor::text AS actor,
+           to_char(h.at, 'YYYY-MM-DD HH24:MI') AS at,
+           h.actor::text || CASE WHEN h.origin = 'agent' THEN ' (agent)' ELSE '' END AS actor,
            xila.describe_change('card', h.op, h.before, h.after,
                xila.card_title_of(h.stack_id, coalesce(h.after, h.before))) AS summary
     FROM xila.history h JOIN xila.stack s ON s.id = h.stack_id

@@ -51,7 +51,8 @@ BEGIN
     CASE act.handler
     -- The agent: its handlers are in agent.sql.
     WHEN 'agent', 'ask_agent', 'stop_agent', 'new_conversation', 'conversations',
-         'open_conversation', 'agent_journal', 'agent_settings', 'save_agent_settings' THEN
+         'open_conversation', 'agent_journal', 'agent_settings', 'save_agent_settings',
+         'apply_proposal', 'refuse_proposal', 'view_proposal' THEN
         RETURN xila.agent_act(act.handler, stack, context);
 
     WHEN 'quit' THEN
