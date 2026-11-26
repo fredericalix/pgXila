@@ -167,7 +167,11 @@ LANGUAGE sql STABLE AS $$
                    SELECT c.attnotnull FROM pg_attribute c
                    WHERE c.attrelid = xila.source_of(bg) AND c.attname = w.bound_column
                      AND c.attnum > 0 AND NOT c.attisdropped) END,
-               'action', a.name))
+               -- A button whose script handles the click runs that script.
+               'action', CASE WHEN EXISTS (
+                                  SELECT FROM xila.script s
+                                  WHERE s.widget_id = w.id AND 'click' = ANY (s.events))
+                              THEN 'script' ELSE a.name END))
                || jsonb_build_object(
                'props', xila.resolved_props(w.props),
                'layout', coalesce((
@@ -186,7 +190,7 @@ $$;
 CREATE FUNCTION xila.hello() RETURNS jsonb
 LANGUAGE sql STABLE AS $$
     SELECT jsonb_build_object(
-        'api', 2,
+        'api', 3,
         'version', xila.version(),
         'instance', coalesce(nullif(current_setting('cluster_name'), ''), 'pgxila'),
         'role', session_user,
@@ -262,17 +266,30 @@ BEGIN
             FROM xila.action a
             WHERE (a.background_id = bg.id OR a.background_id IS NULL)
               AND xila.offered(a.args, bg.stack_id)),
-        -- A key bound on this screen wins over the same key bound everywhere.
+        -- A key a script asks for wins over the same key bound on this screen,
+        -- which wins over the same key bound everywhere.
         'keys', (
             SELECT coalesce(jsonb_agg(jsonb_build_object(
                        'key', k.key, 'label', k.label, 'action', k.action)
                        ORDER BY length(k.key), k.key), '[]')
             FROM (
-                SELECT DISTINCT ON (kb.key) kb.key, a.label, a.name AS action
-                FROM xila.key_binding kb JOIN xila.action a ON a.id = kb.action_id
-                WHERE (kb.background_id = bg.id OR kb.background_id IS NULL)
-                  AND xila.offered(a.args, bg.stack_id)
-                ORDER BY kb.key, kb.background_id NULLS LAST) k),
+                SELECT DISTINCT ON (b.key) b.key, b.label, b.action
+                FROM (
+                    SELECT e.key, e.value AS label, 'script' AS action, 0 AS rank
+                    FROM xila.script s, jsonb_each_text(s.keys) e
+                    WHERE s.background_id = bg.id
+                    UNION ALL
+                    SELECT kb.key, a.label, a.name,
+                           CASE WHEN kb.background_id IS NULL THEN 2 ELSE 1 END
+                    FROM xila.key_binding kb JOIN xila.action a ON a.id = kb.action_id
+                    WHERE (kb.background_id = bg.id OR kb.background_id IS NULL)
+                      AND xila.offered(a.args, bg.stack_id)) b
+                ORDER BY b.key, b.rank) k),
+        -- What the client has to tell the script of the screen about.
+        'events', (
+            SELECT coalesce(jsonb_agg(e), '[]')
+            FROM xila.script s, unnest(s.events) e
+            WHERE s.background_id = bg.id AND s.widget_id IS NULL AND e = 'open'),
         'colours', (
             SELECT coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                        'slot', c.slot, 'rgb', c.rgb, 'name', c.name))
@@ -456,6 +473,37 @@ BEGIN
     END;
 
     RETURN xila.card(stack, new_key, 'at');
+END
+$$;
+
+-- Deletes a card, and says which card to show in its place: the next one, or
+-- else the one before, or none when the stack is left empty.
+CREATE FUNCTION xila.delete_card(stack text, key text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+    bg     xila.background := xila.background_of(stack);
+    source regclass := xila.source_of(bg);
+    target text;
+BEGIN
+    IF source IS NULL THEN
+        RAISE EXCEPTION 'This stack has no cards.' USING ERRCODE = 'XL003';
+    END IF;
+    target := xila.card(stack, key, 'next')->>'key';
+    IF target = key THEN
+        target := xila.card(stack, key, 'previous')->>'key';
+    END IF;
+    BEGIN
+        EXECUTE format('DELETE FROM %s WHERE %I::text = $1', source, bg.key_column)
+        USING key;
+    EXCEPTION
+        WHEN insufficient_privilege THEN
+            RAISE EXCEPTION 'You are not allowed to change this stack.'
+                USING ERRCODE = 'XL004';
+        WHEN foreign_key_violation THEN
+            RAISE EXCEPTION 'This card is used elsewhere and cannot be deleted.'
+                USING ERRCODE = 'XL003';
+    END;
+    RETURN jsonb_build_object('next', nullif(target, key));
 END
 $$;
 

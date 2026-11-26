@@ -27,6 +27,12 @@ pub enum Key {
     ShiftRight,
     /// Undo the last change, where there is something to undo.
     Undo,
+    /// Do again what was just undone, in the script editor.
+    Redo,
+    /// A page up or down, and everything at once, in the script editor.
+    PageUp,
+    PageDown,
+    SelectAll,
     Char(char),
     /// Leave at once: Ctrl-C in a terminal.
     Interrupt,

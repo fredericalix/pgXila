@@ -19,6 +19,7 @@ pub mod login;
 pub mod palette;
 pub mod present;
 pub mod screen;
+pub mod script;
 
 #[cfg(test)]
 mod testing;

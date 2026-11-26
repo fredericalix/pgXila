@@ -174,6 +174,27 @@ impl<A: Api> App<A> {
         }
     }
 
+    /// What to put on the clipboard: the selected text, which is also taken
+    /// out when `cut`. None when nothing is selected.
+    pub fn copy(&mut self, cut: bool) -> Option<String> {
+        match &mut self.stage {
+            Stage::Login(_) => None,
+            Stage::Session(session, ui) => screen::copy(session, ui, &self.fonts, cut),
+        }
+    }
+
+    /// Writes the text of the clipboard where the cursor is.
+    pub fn paste(&mut self, text: &str) {
+        match &mut self.stage {
+            Stage::Login(form) => {
+                for character in text.chars().filter(|c| !c.is_control()) {
+                    form.handle(Key::Char(character));
+                }
+            }
+            Stage::Session(session, ui) => screen::paste(session, ui, &self.fonts, text),
+        }
+    }
+
     /// The pointer moved to a point of the screen. Returns true when the
     /// screen must be drawn again.
     pub fn pointer_move(&mut self, x: i32, y: i32) -> bool {

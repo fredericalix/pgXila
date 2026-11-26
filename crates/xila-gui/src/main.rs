@@ -124,6 +124,28 @@ impl Shell {
         }
     }
 
+    /// Copies or cuts what is selected to the clipboard of the system, or
+    /// pastes what it holds. A clipboard that cannot be reached is no reason
+    /// to stop: nothing is copied, and the message says so.
+    fn clipboard(&mut self, order: ClipboardOrder) {
+        let done = arboard::Clipboard::new().and_then(|mut clipboard| match order {
+            ClipboardOrder::Paste => clipboard.get_text().map(|text| self.app.paste(&text)),
+            ClipboardOrder::Copy | ClipboardOrder::Cut => {
+                match self.app.copy(order == ClipboardOrder::Cut) {
+                    Some(text) => clipboard.set_text(text),
+                    None => Ok(()),
+                }
+            }
+        });
+        if let Err(error) = done {
+            // An empty clipboard is not worth a word.
+            if !matches!(error, arboard::Error::ContentNotAvailable) {
+                eprintln!("xila-gui: clipboard: {error}");
+            }
+        }
+        self.touched();
+    }
+
     fn keys(&mut self, keys: Vec<Key>) {
         if keys.is_empty() {
             return;
@@ -225,6 +247,8 @@ fn translate(key: &WindowKey, text: Option<&str>, shift: bool, command: bool) ->
                 NamedKey::ArrowRight => Key::Right,
                 NamedKey::Home => Key::Home,
                 NamedKey::End => Key::End,
+                NamedKey::PageUp => Key::PageUp,
+                NamedKey::PageDown => Key::PageDown,
                 NamedKey::Backspace => Key::Backspace,
                 NamedKey::Delete => Key::Delete,
                 NamedKey::Escape => Key::Escape,
@@ -233,12 +257,38 @@ fn translate(key: &WindowKey, text: Option<&str>, shift: bool, command: bool) ->
                 _ => return Vec::new(),
             }]
         }
-        // Control-Z, or Command-Z on a Mac, undoes.
+        // Control-Z, or Command-Z on a Mac, undoes; with the shift key, or as
+        // Control-Y, it does again what was undone.
         WindowKey::Character(letter) if command && letter.eq_ignore_ascii_case("z") => {
-            vec![Key::Undo]
+            vec![if shift { Key::Redo } else { Key::Undo }]
+        }
+        WindowKey::Character(letter) if command && letter.eq_ignore_ascii_case("y") => {
+            vec![Key::Redo]
+        }
+        WindowKey::Character(letter) if command && letter.eq_ignore_ascii_case("a") => {
+            vec![Key::SelectAll]
         }
         _ if command => Vec::new(),
         _ => typed(text.unwrap_or_default()),
+    }
+}
+
+/// What Control or Command with C, X or V asks of the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOrder {
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl ClipboardOrder {
+    fn of(letter: &str) -> Option<Self> {
+        match letter.to_ascii_lowercase().as_str() {
+            "c" => Some(ClipboardOrder::Copy),
+            "x" => Some(ClipboardOrder::Cut),
+            "v" => Some(ClipboardOrder::Paste),
+            _ => None,
+        }
     }
 }
 
@@ -291,6 +341,13 @@ impl ApplicationHandler for Shell {
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let command = self.modifiers.control_key() || self.modifiers.super_key();
+                // Copy, cut and paste go through the clipboard of the system.
+                if let (true, WindowKey::Character(letter)) = (command, &event.logical_key) {
+                    if let Some(order) = ClipboardOrder::of(letter) {
+                        self.clipboard(order);
+                        return;
+                    }
+                }
                 let keys = translate(
                     &event.logical_key,
                     event.text.as_deref(),

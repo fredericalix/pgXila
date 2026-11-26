@@ -8,12 +8,12 @@
 use std::collections::BTreeMap;
 
 use crate::api::{
-    Api, ApiError, Card, Context, Effect, GridPage, Hello, Image, Move, Notification,
+    Api, ApiError, Card, Context, Effect, Event, GridPage, Hello, Image, Move, Notification,
     PaletteColour, Screen, Widget, WidgetKind,
 };
 
 /// The version of the API this client speaks; see `docs/api.md`.
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 
 /// The rows of a grid widget and the selected one.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -39,6 +39,8 @@ pub struct View {
     pub designing: bool,
     /// The picture open in the drawing editor, if one is.
     pub drawing: Option<Drawing>,
+    /// The script open in the script editor, if one is.
+    pub scripting: Option<Scripting>,
     /// What the user typed, by column.
     pub edits: BTreeMap<String, String>,
     pub grids: BTreeMap<String, GridState>,
@@ -116,6 +118,7 @@ impl View {
         confirmed: bool,
         renderer: &str,
         input: Option<serde_json::Value>,
+        event: Option<Event>,
     ) -> Context {
         // The focused grid decides the selected row; a single grid needs no focus.
         let grid = self.focus.as_ref().and_then(|name| self.grids.get(name)).or_else(|| {
@@ -132,8 +135,36 @@ impl View {
             confirmed,
             renderer: renderer.to_owned(),
             input,
+            event,
         }
     }
+
+    /// What tells one card on screen from another: the stack, and the card
+    /// or the fact that it is a new one.
+    fn shown(&self) -> (String, bool, Option<String>) {
+        (self.stack().to_owned(), self.is_new, self.card_key().map(str::to_owned))
+    }
+}
+
+/// A script open in the script editor of the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scripting {
+    /// The button the script belongs to; None for the script of the screen.
+    pub widget: Option<String>,
+    pub title: String,
+    /// The script as it is saved: what the editor starts from.
+    pub source: String,
+    /// What the last test did, if one was run.
+    pub report: Option<Report>,
+}
+
+/// What the test of a script did, in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub ok: bool,
+    /// The line of the error, if there is one and it has a line.
+    pub line: Option<u32>,
+    pub lines: Vec<String>,
 }
 
 /// A picture open in the drawing editor of the client.
@@ -156,9 +187,10 @@ pub struct Question {
     /// What accepting does, in a word: "Delete".
     pub label: String,
     /// The action to run again once the user has accepted, with what the
-    /// tool that ran it had to say.
+    /// tool that ran it had to say and what triggered it.
     action: String,
     input: Option<serde_json::Value>,
+    event: Option<Event>,
 }
 
 pub struct Session<A: Api> {
@@ -285,7 +317,7 @@ impl<A: Api> Session<A> {
     pub fn answer(&mut self, accepted: bool) {
         if let Some(question) = self.question.take() {
             if accepted {
-                self.perform(&question.action, true, question.input);
+                self.perform(&question.action, true, question.input, question.event);
             }
         }
     }
@@ -304,6 +336,18 @@ impl<A: Api> Session<A> {
     /// Leaves the drawing editor.
     pub fn stop_drawing(&mut self) {
         self.view_mut().drawing = None;
+    }
+
+    /// Leaves the script editor.
+    pub fn stop_scripting(&mut self) {
+        self.view_mut().scripting = None;
+    }
+
+    /// Forgets what the last test of the script said: the script has changed.
+    pub fn forget_report(&mut self) {
+        if let Some(scripting) = &mut self.view_mut().scripting {
+            scripting.report = None;
+        }
     }
 
     /// Changes a field that only takes some values to the next of them, or
@@ -352,7 +396,7 @@ impl<A: Api> Session<A> {
         let bound = self.view().screen.keys.iter().find(|k| k.key == key).map(|k| k.action.clone());
         match bound {
             Some(action) => {
-                self.run(&action);
+                self.perform(&action, false, None, Some(Event::key(key)));
                 true
             }
             None => false,
@@ -361,43 +405,68 @@ impl<A: Api> Session<A> {
 
     /// Runs the action of a widget: a button, or a grid for its selected row.
     pub fn activate(&mut self, widget: &str) {
-        let action = self
-            .view()
-            .screen
-            .widgets
-            .iter()
-            .find(|w| w.name == widget)
-            .and_then(|w| w.action.clone());
+        let action =
+            self.view().widgets().find(|w| w.name == widget).and_then(|w| w.action.clone());
         if let Some(action) = action {
-            self.run(&action);
+            self.perform(&action, false, None, Some(Event::click(widget)));
         }
     }
 
     /// Asks the server to run an action and applies the effects it answers.
     pub fn run(&mut self, action: &str) {
-        self.perform(action, false, None);
+        self.perform(action, false, None, None);
     }
 
     /// Runs an action for a tool of the client, which says what it wants in
     /// `input`. Returns false when the server refused: the message says why.
     pub fn run_with(&mut self, action: &str, input: serde_json::Value) -> bool {
-        self.perform(action, false, Some(input))
+        self.perform(action, false, Some(input), None)
     }
 
-    fn perform(&mut self, action: &str, confirmed: bool, input: Option<serde_json::Value>) -> bool {
+    fn perform(
+        &mut self,
+        action: &str,
+        confirmed: bool,
+        input: Option<serde_json::Value>,
+        event: Option<Event>,
+    ) -> bool {
         self.message = None;
         self.question = None;
+        let before = self.view().shown();
         let stack = self.view().stack().to_owned();
-        let context = self.view().context(confirmed, self.renderer, input.clone());
+        let context = self.view().context(confirmed, self.renderer, input.clone(), event.clone());
         let outcome = self.api.act(&stack, action, &context).and_then(|effects| {
-            effects.into_iter().try_for_each(|effect| self.apply(effect, action, &input))
+            effects.into_iter().try_for_each(|effect| self.apply(effect, action, &input, &event))
         });
         let done = outcome.is_ok();
         if let Err(error) = outcome {
             self.message = Some(describe(&error));
         }
+        // A card shown by the script of the screen is not announced to it
+        // again: it would never end.
+        let by_the_screen = event.as_ref().is_some_and(|event| event.on == "open");
+        if done && !by_the_screen && self.question.is_none() {
+            self.announce_card(before);
+        }
         self.fetch_images();
         done
+    }
+
+    /// Tells the script of the screen that a card came on screen, when it
+    /// asked to be told and the card is not the one that was there.
+    fn announce_card(&mut self, before: (String, bool, Option<String>)) {
+        let view = self.view();
+        let wanted = view.screen.events.iter().any(|event| event == "open");
+        let editing = view.designing || view.drawing.is_some() || view.scripting.is_some();
+        if !wanted || editing || view.shown() == before {
+            return;
+        }
+        // What the action said stays, unless the script has something to say.
+        let said = self.message.take();
+        self.perform("script", false, None, Some(Event::open()));
+        if self.message.is_none() {
+            self.message = said;
+        }
     }
 
     /// Applies one effect of an action.
@@ -406,6 +475,7 @@ impl<A: Api> Session<A> {
         effect: Effect,
         action: &str,
         input: &Option<serde_json::Value>,
+        event: &Option<Event>,
     ) -> Result<(), ApiError> {
         match effect {
             Effect::Show { stack, card } => {
@@ -458,9 +528,32 @@ impl<A: Api> Session<A> {
                 // list for a card that does not exist yet.
                 self.load_grids()?;
             }
+            Effect::Set { values } => {
+                let edits = &mut self.view_mut().edits;
+                for (column, value) in values {
+                    edits.insert(column, value.unwrap_or_default());
+                }
+            }
+            Effect::Script { widget, title, source } => {
+                if self.renderer != "graphic" {
+                    self.message = Some("Scripts are written in the graphical client.".into());
+                    return Ok(());
+                }
+                self.view_mut().scripting = Some(Scripting { widget, title, source, report: None });
+            }
+            Effect::Tested { ok, line, lines } => {
+                if let Some(scripting) = &mut self.view_mut().scripting {
+                    scripting.report = Some(Report { ok, line, lines });
+                }
+            }
             Effect::Confirm { text, label } => {
-                self.question =
-                    Some(Question { text, label, action: action.to_owned(), input: input.clone() });
+                self.question = Some(Question {
+                    text,
+                    label,
+                    action: action.to_owned(),
+                    input: input.clone(),
+                    event: event.clone(),
+                });
             }
             Effect::Select { row } => {
                 for grid in self.view_mut().grids.values_mut() {
@@ -629,6 +722,7 @@ fn open<A: Api>(api: &mut A, stack: &str, card: Option<&str>) -> Result<View, Ap
         is_new: false,
         designing: false,
         drawing: None,
+        scripting: None,
         edits: BTreeMap::new(),
         grids,
         focus: None,
@@ -666,6 +760,9 @@ mod tests {
         api: Option<u32>,
         /// True when the list of stacks is shown as icons.
         icons: bool,
+        /// True when the script of a stack wants to know that a card came on
+        /// screen.
+        opening: bool,
     }
 
     impl FakeServer {
@@ -758,6 +855,9 @@ mod tests {
                     widget.props.insert("icon".into(), "icon".into());
                 }
             }
+            if self.opening && stack != "stacks" {
+                screen.events.push("open".into());
+            }
             Ok(screen)
         }
 
@@ -840,10 +940,10 @@ mod tests {
     fn a_server_of_another_version_is_refused() {
         let server = FakeServer { api: Some(1), ..FakeServer::default() };
         let error = Session::start(server).err().expect("a refusal");
-        assert_eq!(error, ApiError::Version { client: 2, server: 1 });
+        assert_eq!(error, ApiError::Version { client: 3, server: 1 });
         assert_eq!(
             error.to_string(),
-            "This client speaks version 2 of the pgXila API and the server version 1: \
+            "This client speaks version 3 of the pgXila API and the server version 1: \
              update the older of the two."
         );
     }
@@ -876,6 +976,7 @@ mod tests {
                 card: Some("1".into()),
                 dirty: BTreeMap::from([("city".to_string(), "Paris".to_string())]),
                 renderer: "text".into(),
+                event: Some(Event::key("F8")),
                 ..Context::default()
             }
         );
@@ -1329,5 +1430,157 @@ mod tests {
         assert!(session.image("photo-missing").is_none());
         assert!(session.image("photo-broken").is_none());
         assert_eq!(session.message(), None, "a missing image is not an error for the user");
+    }
+
+    // Scripts ----------------------------------------------------------------
+
+    #[test]
+    fn the_server_is_told_what_triggered_an_action() {
+        let mut session = Session::start(FakeServer::default()).unwrap();
+        session.activate("list");
+        session.run("refresh");
+        let events: Vec<_> = session.api.contexts.iter().map(|c| c.event.clone()).collect();
+        assert_eq!(events, [Some(Event::click("list")), None]);
+    }
+
+    #[test]
+    fn a_script_writes_on_the_card_as_if_the_user_had_typed() {
+        let values = BTreeMap::from([
+            ("city".to_string(), Some("London".to_string())),
+            ("photo".to_string(), None),
+        ]);
+        let server = FakeServer::default().answering("script", vec![Effect::Set { values }]);
+        let mut session = on_addressbook(server);
+        session.run("script");
+
+        assert_eq!(session.view().value("city"), "London");
+        assert_eq!(session.view().value("photo"), "");
+        // Nothing is saved: it is sent back like what the user types.
+        assert_eq!(
+            session.view().dirty(),
+            BTreeMap::from([
+                ("city".to_string(), "London".to_string()),
+                ("photo".to_string(), String::new()),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_script_of_the_screen_is_told_when_a_card_comes_on_screen() {
+        let server = FakeServer { opening: true, ..FakeServer::default() }
+            .answering(
+                "next_card",
+                vec![Effect::Show { stack: "addressbook".into(), card: Some("2".into()) }],
+            )
+            .answering(
+                "save_card",
+                vec![
+                    Effect::Show { stack: "addressbook".into(), card: Some("2".into()) },
+                    Effect::Message { text: "Card saved.".into() },
+                ],
+            );
+        let mut session = on_addressbook(server);
+
+        // Another card: the script is told, with that card in the context.
+        session.press("F8");
+        assert_eq!(session.api.calls.last().unwrap(), "act addressbook script");
+        let told = session.api.contexts.last().unwrap();
+        assert_eq!(told.event, Some(Event::open()));
+        assert_eq!(told.card.as_deref(), Some("2"));
+
+        // The same card again is not news, and what the action said stays.
+        session.api.calls.clear();
+        session.run("save_card");
+        assert!(!session.api.calls.iter().any(|call| call == "act addressbook script"));
+        assert_eq!(session.message(), Some("Card saved."));
+    }
+
+    #[test]
+    fn opening_a_stack_announces_its_first_card() {
+        let server = FakeServer { opening: true, ..FakeServer::default() }
+            .answering("open", vec![Effect::Show { stack: "addressbook".into(), card: None }])
+            .answering("script", vec![Effect::Message { text: "Welcome.".into() }]);
+        let mut session = Session::start(server).unwrap();
+        session.activate("list");
+        assert_eq!(session.api.calls.last().unwrap(), "act addressbook script");
+        assert_eq!(session.message(), Some("Welcome."));
+    }
+
+    #[test]
+    fn a_card_shown_by_the_script_of_the_screen_is_not_announced_again() {
+        // A script that sends every card to the next one would never end.
+        let server = FakeServer { opening: true, ..FakeServer::default() }
+            .answering(
+                "next_card",
+                vec![Effect::Show { stack: "addressbook".into(), card: Some("2".into()) }],
+            )
+            .answering(
+                "script",
+                vec![Effect::Show { stack: "addressbook".into(), card: Some("3".into()) }],
+            );
+        let mut session = on_addressbook(server);
+        session.press("F8");
+
+        let scripts = session.api.calls.iter().filter(|call| *call == "act addressbook script");
+        assert_eq!(scripts.count(), 1);
+        assert_eq!(session.view().card.key.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn a_question_of_a_script_runs_the_same_event_again() {
+        let server = FakeServer::default()
+            .answering(
+                "script",
+                vec![Effect::Confirm { text: "Sure?".into(), label: "Yes".into() }],
+            )
+            .answering_once_confirmed("script", vec![Effect::Message { text: "Done.".into() }]);
+        let mut session = on_addressbook(server);
+        session.press("F8");
+        session.api.contexts.clear();
+        session.perform("script", false, None, Some(Event::key("F6")));
+        assert_eq!(session.question().map(|q| q.text.as_str()), Some("Sure?"));
+
+        session.answer(true);
+        let again = session.api.contexts.last().unwrap();
+        assert!(again.confirmed);
+        assert_eq!(again.event, Some(Event::key("F6")));
+        assert_eq!(session.message(), Some("Done."));
+    }
+
+    #[test]
+    fn the_script_editor_is_a_tool_of_the_window() {
+        let open = Effect::Script {
+            widget: Some("stamp".into()),
+            title: "Script: button “Stamp”".into(),
+            source: "function on_click() end".into(),
+        };
+        let tested = Effect::Tested { ok: false, line: Some(2), lines: vec!["Line 2: no".into()] };
+        let server = FakeServer::default()
+            .answering("edit_script", vec![open])
+            .answering("test_script", vec![tested]);
+
+        // A text client is told where scripts are written.
+        let mut session = on_addressbook(server);
+        session.run("edit_script");
+        assert_eq!(session.view().scripting, None);
+        assert_eq!(session.message(), Some("Scripts are written in the graphical client."));
+
+        session.be_graphic();
+        session.run("edit_script");
+        let scripting = session.view().scripting.clone().expect("the editor is open");
+        assert_eq!(scripting.widget.as_deref(), Some("stamp"));
+        assert_eq!(scripting.source, "function on_click() end");
+        assert_eq!(scripting.report, None);
+
+        // What a test says is kept for the editor to show, until the script
+        // changes.
+        session.run("test_script");
+        let report = session.view().scripting.as_ref().unwrap().report.clone().unwrap();
+        assert_eq!((report.ok, report.line), (false, Some(2)));
+        session.forget_report();
+        assert_eq!(session.view().scripting.as_ref().unwrap().report, None);
+
+        session.stop_scripting();
+        assert_eq!(session.view().scripting, None);
     }
 }

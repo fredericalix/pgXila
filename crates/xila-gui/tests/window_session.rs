@@ -488,3 +488,104 @@ fn an_author_draws_the_icon_of_a_stack() {
     app.key(Key::Enter);
     assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
 }
+
+/// Types a text of several lines in the script editor: a line feed is the
+/// Enter key.
+fn type_lines(app: &mut App<Server>, text: &str) {
+    for c in text.chars() {
+        app.key(if c == '\n' { Key::Enter } else { Key::Char(c) });
+    }
+}
+
+#[test]
+#[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
+fn an_author_writes_the_script_of_a_button_in_the_window() {
+    let mut app = connected_as("PGXILA_TEST_AUTHOR");
+
+    // A new stack with one field; it opens in the visual editor.
+    app.key(Key::Enter);
+    app.key(Key::F(6));
+    type_text(&mut app, "Script test");
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "script_test", "{:?}", app.session().unwrap().message());
+    add_field(&mut app, "Place", 0);
+
+    // The button "New" is selected, and F8 opens its script: there is none.
+    let target = area_of(&app, "new");
+    click(&mut app, target);
+    app.key(Key::F(8));
+    let session = app.session().unwrap();
+    let scripting = session.view().scripting.clone().expect("the script editor is open");
+    assert_eq!(scripting.title, "Script: button “New”", "{:?}", session.message());
+    assert_eq!(scripting.source, "");
+    render(&app, "script-empty");
+
+    // The script is typed as one types it: the editor indents.
+    type_lines(
+        &mut app,
+        "function on_click()\nlocal new = stack.new_card()\nnew.place = \"London\"\n\
+         go_to(new)\nfocus(\"place\")\nend",
+    );
+    let written =
+        "function on_click()\n  local new = stack.new_card()\n  new.place = \"London\"\n  \
+                   go_to(new)\n  focus(\"place\")\nend";
+    assert_eq!(app.ui().unwrap().scripter.buffer.text(), written);
+
+    // F5 tries it: the server says what it would do, and keeps nothing.
+    app.key(Key::F(5));
+    let session = app.session().unwrap();
+    let report = session.view().scripting.as_ref().unwrap().report.clone().expect("a report");
+    assert!(report.ok, "{report:?}");
+    assert_eq!(
+        report.lines,
+        ["It shows a new card with place = London.", "It puts the cursor in “place”."]
+    );
+    let tested = render(&app, "script-tested");
+    assert!(count(&tested, Rect::new(337, 129, 138, 139), slot::INK) > 200, "the report is shown");
+
+    // A mistake is found by the test, with its line.
+    app.key(Key::Up);
+    app.key(Key::Enter);
+    type_text(&mut app, "nothing()");
+    app.key(Key::F(5));
+    let session = app.session().unwrap();
+    let report = session.view().scripting.as_ref().unwrap().report.clone().expect("a report");
+    assert_eq!((report.ok, report.line), (false, Some(6)), "{report:?}");
+    render(&app, "script-error");
+    app.key(Key::Undo);
+    app.key(Key::Undo);
+    assert_eq!(app.ui().unwrap().scripter.buffer.text(), written);
+
+    // Leaving saves; the visual editor is back, and the button runs a script.
+    app.key(Key::F(12));
+    let session = app.session().unwrap();
+    assert_eq!(session.message(), Some("Script saved."));
+    assert!(session.view().scripting.is_none() && designing(&app));
+    let button = session.view().widgets().find(|w| w.name == "new").unwrap();
+    assert_eq!(button.action.as_deref(), Some("script"));
+
+    // Browsing the stack: the button does what its script says.
+    app.key(Key::F(11));
+    assert!(!designing(&app));
+    let target = area_of(&app, "new");
+    click(&mut app, target);
+    let session = app.session().unwrap();
+    assert!(session.view().is_new, "{:?}", session.message());
+    assert_eq!(value(&app, "place"), "London");
+    assert_eq!(session.view().focus.as_deref(), Some("place"));
+    render(&app, "script-ran");
+    // The card is the user's to complete and save.
+    type_text(&mut app, ", Baker Street");
+    app.key(Key::Enter);
+    let session = app.session().unwrap();
+    assert_eq!(session.message(), Some("Card saved."));
+    assert_eq!(value(&app, "place"), "London, Baker Street");
+
+    // The stack is deleted, as it was made, from its forms.
+    app.key(Key::F(11));
+    app.key(Key::F(4));
+    let target = area_of(&app, "delete_stack");
+    click(&mut app, target);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
+}

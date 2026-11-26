@@ -142,7 +142,8 @@ CREATE TABLE xila.action (
                       'remove_field', 'move_field', 'history', 'rewind',
                       'place_widgets', 'reset_layout', 'add_widget', 'set_widget',
                       'remove_widget', 'undo', 'draw', 'save_drawing', 'set_colour',
-                      'remove_colour')),
+                      'remove_colour', 'script', 'edit_script', 'save_script',
+                      'test_script')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );
@@ -186,6 +187,24 @@ CREATE TABLE xila.key_binding (
     key           text NOT NULL CHECK (key ~ '^(F([1-9]|1[0-9]|2[0-4])|Enter)$'),
     action_id     uuid NOT NULL REFERENCES xila.action ON DELETE CASCADE,
     UNIQUE NULLS NOT DISTINCT (background_id, key)
+);
+
+-- The script of a button, or of the screen itself when widget_id is null:
+-- Lua source with one function per event. events and keys say what it
+-- handles; xila.set_script works them out from the source when it saves it.
+-- The keys to leave a screen can never be taken.
+CREATE TABLE xila.script (
+    id            uuid PRIMARY KEY DEFAULT uuidv7(),
+    background_id uuid NOT NULL REFERENCES xila.background ON DELETE CASCADE,
+    widget_id     uuid REFERENCES xila.widget ON DELETE CASCADE,
+    language      text NOT NULL DEFAULT 'lua' CHECK (language = 'lua'),
+    source        text NOT NULL,
+    events        text[] NOT NULL DEFAULT '{}'
+                  CHECK (events <@ ARRAY['click', 'key', 'open']),
+    keys          jsonb NOT NULL DEFAULT '{}'
+                  CHECK (jsonb_typeof(keys) = 'object'
+                         AND NOT keys ?| ARRAY['F3', 'F11', 'F12']),
+    UNIQUE NULLS NOT DISTINCT (background_id, widget_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -495,6 +514,14 @@ CREATE POLICY edit ON xila.key_binding
     USING (xila.may_edit_background(background_id))
     WITH CHECK (xila.may_edit_background(background_id));
 
+-- A script runs with the rights of whoever triggers it: everyone who may open
+-- the stack may read it.
+ALTER TABLE xila.script ENABLE ROW LEVEL SECURITY;
+CREATE POLICY read ON xila.script FOR SELECT USING (true);
+CREATE POLICY edit ON xila.script
+    USING (xila.may_edit_background(background_id))
+    WITH CHECK (xila.may_edit_background(background_id));
+
 ALTER TABLE xila.layout ENABLE ROW LEVEL SECURITY;
 CREATE POLICY read ON xila.layout FOR SELECT USING (true);
 CREATE POLICY edit ON xila.layout
@@ -590,9 +617,9 @@ CREATE POLICY note ON xila.history FOR INSERT
 -- History is read and written within its own policies.
 GRANT USAGE ON SCHEMA xila TO xila_user;
 GRANT SELECT ON xila.palette, xila.image, xila.stack, xila.stack_colour, xila.background,
-    xila.action, xila.widget, xila.layout, xila.key_binding TO xila_user;
+    xila.action, xila.widget, xila.layout, xila.key_binding, xila.script TO xila_user;
 GRANT INSERT, UPDATE, DELETE ON xila.stack, xila.stack_colour, xila.background,
-    xila.action, xila.widget, xila.layout, xila.key_binding TO xila_author;
+    xila.action, xila.widget, xila.layout, xila.key_binding, xila.script TO xila_author;
 -- Images are added by anyone who uses pgXila, and changed or deleted by
 -- nobody but a superuser. An author may make a column refer to an image.
 GRANT INSERT ON xila.image TO xila_user;
@@ -626,5 +653,8 @@ SELECT pg_catalog.pg_extension_config_dump('xila.layout',
         JOIN xila.background b ON b.id = w.background_id
         JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);
 SELECT pg_catalog.pg_extension_config_dump('xila.key_binding',
+    $$WHERE background_id IN (SELECT b.id FROM xila.background b
+        JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);
+SELECT pg_catalog.pg_extension_config_dump('xila.script',
     $$WHERE background_id IN (SELECT b.id FROM xila.background b
         JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);

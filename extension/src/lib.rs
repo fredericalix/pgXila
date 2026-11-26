@@ -9,6 +9,7 @@
 
 use pgrx::prelude::*;
 
+mod script;
 mod tls_guard;
 mod workers;
 
@@ -44,7 +45,12 @@ pub extern "C-unwind" fn _PG_init() {
 extension_sql_file!("../sql/schema.sql", name = "schema", bootstrap);
 extension_sql_file!("../sql/api.sql", name = "api", requires = [xila::version]);
 extension_sql_file!("../sql/author.sql", name = "author", requires = ["api"]);
-extension_sql_file!("../sql/actions.sql", name = "actions", requires = ["author"]);
+extension_sql_file!(
+    "../sql/script.sql",
+    name = "script",
+    requires = ["author", xila::check_script, xila::run_script]
+);
+extension_sql_file!("../sql/actions.sql", name = "actions", requires = ["script"]);
 extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["actions"]);
 extension_sql_file!("../sql/triggers.sql", name = "triggers", requires = ["system_stacks"]);
 
@@ -57,6 +63,27 @@ mod xila {
     pub fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+
+    /// Reads a script without running its functions, and says what it
+    /// handles or where it is wrong.
+    #[pg_extern]
+    pub fn check_script(source: &str) -> pgrx::JsonB {
+        pgrx::JsonB(crate::script::check(source))
+    }
+
+    /// Runs one event of a script with the rights of the current role, and
+    /// answers with its effects or its error. Nothing it wrote is kept
+    /// unless `keep` is true and it succeeded.
+    #[pg_extern]
+    pub fn run_script(
+        stack: &str,
+        source: &str,
+        event: pgrx::JsonB,
+        context: pgrx::JsonB,
+        keep: default!(bool, true),
+    ) -> pgrx::JsonB {
+        pgrx::JsonB(crate::script::run(stack, source, &event.0, &context.0, keep))
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -66,27 +93,27 @@ mod tests {
     use pgrx::prelude::*;
 
     /// Runs a query that returns a single JSON value.
-    fn json(query: &str) -> serde_json::Value {
+    pub(crate) fn json(query: &str) -> serde_json::Value {
         Spi::get_one::<pgrx::JsonB>(query).unwrap().expect("a JSON value").0
     }
 
     /// Runs a query that returns a single text value.
-    fn text(query: &str) -> Option<String> {
+    pub(crate) fn text(query: &str) -> Option<String> {
         Spi::get_one::<String>(query).unwrap()
     }
 
     /// Runs a query that returns a single number.
-    fn number(query: &str) -> i64 {
+    pub(crate) fn number(query: &str) -> i64 {
         Spi::get_one::<i64>(query).unwrap().expect("a number")
     }
 
     /// The SQLSTATE and message of the error a query raises.
-    fn error_of(query: &str) -> (String, String) {
+    pub(crate) fn error_of(query: &str) -> (String, String) {
         error_of_statement(&format!("PERFORM ({query})"))
     }
 
     /// The SQLSTATE and message of the error a PL/pgSQL statement raises.
-    fn error_of_statement(statement: &str) -> (String, String) {
+    pub(crate) fn error_of_statement(statement: &str) -> (String, String) {
         let probe = format!(
             "DO $probe$ BEGIN {statement}; RAISE EXCEPTION 'no error' USING ERRCODE = 'P0001';
              EXCEPTION WHEN OTHERS THEN
@@ -165,7 +192,7 @@ mod tests {
     #[pg_test]
     fn hello_names_the_home_stack() {
         let hello = json("SELECT xila.hello()");
-        assert_eq!(hello["api"], 2);
+        assert_eq!(hello["api"], 3);
         assert_eq!(hello["home"], "desktop");
     }
 
@@ -453,7 +480,7 @@ mod tests {
 
     /// Creates the people of the author tests: ada and bob are authors, carol
     /// may edit what ada owns, dan is a plain user.
-    fn create_people() {
+    pub(crate) fn create_people() {
         Spi::run(
             "CREATE ROLE ada LOGIN IN ROLE xila_author;
              CREATE ROLE bob LOGIN IN ROLE xila_author;
@@ -464,16 +491,16 @@ mod tests {
     }
 
     /// Continues the test as another role, as if it had logged in.
-    fn become_role(role: &str) {
+    pub(crate) fn become_role(role: &str) {
         Spi::run(&format!("SET LOCAL SESSION AUTHORIZATION {role}")).unwrap();
     }
 
-    fn become_admin() {
+    pub(crate) fn become_admin() {
         Spi::run("RESET SESSION AUTHORIZATION").unwrap();
     }
 
     /// As ada: a stack of books with a title and a year, and two cards.
-    fn create_books_as_ada() {
+    pub(crate) fn create_books_as_ada() {
         create_people();
         become_role("ada");
         Spi::run(
@@ -1241,7 +1268,7 @@ mod tests {
     }
 
     /// One widget of a screen definition.
-    fn widget_of(screen: &serde_json::Value, name: &str) -> serde_json::Value {
+    pub(crate) fn widget_of(screen: &serde_json::Value, name: &str) -> serde_json::Value {
         screen["widgets"]
             .as_array()
             .unwrap()

@@ -75,7 +75,7 @@ fn wait_for(server: &mut Server, wanted: impl Fn(&Notification) -> bool) -> bool
 fn the_server_introduces_itself() {
     let mut server = server();
     let hello = server.hello().unwrap();
-    assert_eq!(hello.api, 2);
+    assert_eq!(hello.api, 3);
     assert_eq!(hello.role, var("PGXILA_TEST_USER"));
     assert_eq!(hello.home, "desktop");
     assert!(!hello.author);

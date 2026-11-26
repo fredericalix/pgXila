@@ -468,3 +468,129 @@ fn pictures_are_added_and_never_overwritten() {
 
     forget_the_test_stack();
 }
+
+#[test]
+#[ignore = "needs running pgXila servers: use scripts/test-integration.sh"]
+fn scripts_run_for_whoever_uses_the_stack() {
+    forget_the_test_stack();
+    execute_as_author(&format!(
+        "SELECT xila.create_stack('Test books');
+         SELECT xila.add_field('{STACK}', 'Title');
+         SELECT xila.add_field('{STACK}', 'Year', 'number');
+         SELECT xila.save_card('{STACK}', NULL, '{{\"title\": \"Emma\", \"year\": \"1815\"}}');
+         SELECT xila.save_card('{STACK}', NULL, '{{\"title\": \"Dune\", \"year\": \"1965\"}}');
+         GRANT USAGE ON SCHEMA {STACK} TO xila_user;
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {STACK}.cards TO xila_user;"
+    ));
+
+    // The author adds a button and writes its script, as the editors of the
+    // window do: with actions.
+    let mut author = session_as("PGXILA_TEST_AUTHOR");
+    open_the_test_stack(&mut author);
+    author.run_with("add_widget", serde_json::json!({ "kind": "button", "props": {} }));
+    assert_eq!(author.view().focus.as_deref(), Some("button1"), "{:?}", author.message());
+    author.run_with(
+        "set_widget",
+        serde_json::json!({ "widget": "button1", "changes": { "label": "Sequel" } }),
+    );
+    let source = r#"keys = { F9 = "Sequel" }
+
+function on_click()
+  local sequel = stack.new_card()
+  sequel.title = card.title .. " II"
+  sequel.year = card.year + 1
+  save(sequel)
+  go_to(sequel)
+  message("Written by " .. user .. ".")
+end
+
+function on_key(key)
+  on_click()
+end
+"#;
+    assert!(author
+        .run_with("save_script", serde_json::json!({ "widget": "button1", "source": source })));
+    assert_eq!(author.message(), Some("Script saved."));
+    // The screen says so at once: the button runs its script, and so does F9.
+    let button = |session: &Session<Server>| {
+        session.view().widgets().find(|w| w.name == "button1").and_then(|w| w.action.clone())
+    };
+    assert_eq!(button(&author).as_deref(), Some("script"));
+    assert!(keys(&author).contains(&"F9=Sequel".to_owned()), "{:?}", keys(&author));
+
+    // A test keeps nothing, and tells what the script would do.
+    author.be_graphic();
+    author.run_with("edit_script", serde_json::json!({ "widget": "button1" }));
+    let scripting = author.view().scripting.clone().expect("the script editor is open");
+    assert_eq!(scripting.title, "Script: button “Sequel”");
+    assert_eq!(scripting.source, source);
+    author.run_with(
+        "test_script",
+        serde_json::json!({ "widget": "button1", "source": source, "event": { "on": "click" } }),
+    );
+    let report = author.view().scripting.as_ref().unwrap().report.clone().expect("a report");
+    assert!(report.ok, "{report:?}");
+    assert!(report.lines.contains(&"In the database: 1 card saved.".to_owned()), "{report:?}");
+    assert!(report.lines.contains(&"This was a test: nothing was kept.".to_owned()));
+    author.stop_scripting();
+    assert_eq!(author.view().card.count, 2, "the test wrote nothing");
+
+    // A plain user presses the button: the script acts with their rights, on
+    // the card they have on screen, and its changes are theirs.
+    let mut user = session_as("PGXILA_TEST_USER");
+    open_the_test_stack(&mut user);
+    assert_eq!(user.view().value("title"), "Emma");
+    user.activate("button1");
+    assert_eq!(user.message(), Some(format!("Written by {}.", user.hello().role).as_str()));
+    assert_eq!(user.view().value("title"), "Emma II");
+    assert_eq!(user.view().value("year"), "1816");
+    assert_eq!(user.view().card.count, 3);
+    // The key does the same, from the card it is pressed on.
+    assert!(user.press("F9"));
+    assert_eq!(user.view().value("title"), "Emma II II");
+    user.press("F10");
+    let changes = column(&user, "changes", "summary");
+    assert_eq!(changes[..2], ["Card “Emma II II” added", "Card “Emma II” added"]);
+    user.press("F12");
+
+    // A user may not change the script, and may read it.
+    assert!(!user.run_with("save_script", serde_json::json!({ "widget": "button1", "source": "" })));
+    let refusal = user.message().expect("a refusal").to_owned();
+    assert!(refusal.starts_with("The stack “Test books” belongs to "), "{refusal}");
+
+    // A script that fails says where, and leaves nothing behind.
+    let broken = "function on_click()\n  save(stack.new_card())\n  error(\"no more paper\")\nend";
+    assert!(author
+        .run_with("save_script", serde_json::json!({ "widget": "button1", "source": broken })));
+    user.activate("button1");
+    assert_eq!(user.message(), Some("The script of “Sequel” failed at line 3: no more paper"));
+    assert_eq!(user.view().card.count, 4);
+
+    // The script of the screen greets each card that comes on screen.
+    let greeting = "function on_open()\n  message(\"This is \" .. card.title .. \".\")\nend";
+    assert!(author.run_with("save_script", serde_json::json!({ "source": greeting })));
+    let mut user = session_as("PGXILA_TEST_USER");
+    open_the_test_stack(&mut user);
+    assert_eq!(user.message(), Some("This is Emma."));
+    user.press("F8");
+    assert_eq!(user.message(), Some("This is Dune."));
+
+    // The history of the stack has a line for each script, and undo takes the
+    // last one back.
+    author.run("author_form");
+    assert_eq!(author.view().stack(), "author", "{:?}", author.message());
+    author.press("F10");
+    let lines = column(&author, "changes", "summary");
+    let scripts: Vec<&str> =
+        lines.iter().map(String::as_str).filter(|line| line.starts_with("Script")).collect();
+    assert_eq!(
+        scripts,
+        [
+            "Script of the screen written",
+            "Script of “button1” changed",
+            "Script of “button1” written"
+        ]
+    );
+
+    forget_the_test_stack();
+}

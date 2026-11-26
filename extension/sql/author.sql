@@ -940,7 +940,7 @@ BEGIN
         END IF;
 
     ELSIF entry.object_kind IN ('stack', 'background', 'action', 'widget', 'layout',
-                                'key_binding', 'stack_colour') THEN
+                                'key_binding', 'stack_colour', 'script') THEN
         target := format('xila.%I', entry.object_kind);
         pk := CASE entry.object_kind
             WHEN 'layout' THEN 'widget_id = ($1->>''widget_id'')::uuid AND renderer = $1->>''renderer'''
@@ -1518,8 +1518,8 @@ CREATE VIEW xila.own_table WITH (security_invoker = true) AS
 CREATE FUNCTION xila.change_rank(kind text) RETURNS integer
 LANGUAGE sql IMMUTABLE AS $$
     SELECT CASE kind WHEN 'rewind' THEN 0 WHEN 'stack' THEN 1 WHEN 'column' THEN 2
-                     WHEN 'widget' THEN 3 WHEN 'card' THEN 4 WHEN 'stack_colour' THEN 5
-                     WHEN 'layout' THEN 6 ELSE 7 END
+                     WHEN 'widget' THEN 3 WHEN 'script' THEN 4 WHEN 'card' THEN 5
+                     WHEN 'stack_colour' THEN 6 WHEN 'layout' THEN 7 ELSE 8 END
 $$;
 
 -- One recorded change, in words.
@@ -1588,6 +1588,13 @@ BEGIN
         -- card_title is here the name of the widget, when a single one moved.
         RETURN CASE WHEN coalesce(card_title, '') = '' THEN 'Layout changed'
                     ELSE format('“%s” moved', card_title) END;
+    WHEN 'script' THEN
+        -- card_title is here the name of the button the script belongs to.
+        RETURN format('Script of %s %s',
+            CASE WHEN coalesce(card_title, '') = '' THEN 'the screen'
+                 ELSE '“' || card_title || '”' END,
+            CASE op WHEN 'insert' THEN 'written' WHEN 'delete' THEN 'removed'
+                    ELSE 'changed' END);
     ELSE
         RETURN 'Screen changed';
     END CASE;
@@ -1612,7 +1619,8 @@ CREATE VIEW xila.history_line WITH (security_invoker = true) AS
                 ELSE xila.describe_change(m.object_kind, m.op, m.before, m.after,
                          CASE WHEN m.object_kind = 'card'
                               THEN xila.card_title_of(m.stack_id, coalesce(m.after, m.before))
-                              WHEN m.object_kind = 'layout' AND l.changes = 1
+                              WHEN m.object_kind = 'script'
+                                OR (m.object_kind = 'layout' AND l.changes = 1)
                               THEN (SELECT w.name FROM xila.widget w
                                     WHERE w.id = (coalesce(m.after, m.before)->>'widget_id')::uuid)
                          END)

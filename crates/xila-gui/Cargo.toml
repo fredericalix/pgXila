@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The clipboard of the system, for the script editor.
+arboard = { version = "3", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.10", features = ["derive", "env"] }
 serde_json = "1.0.154"

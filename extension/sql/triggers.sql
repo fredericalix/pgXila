@@ -23,3 +23,5 @@ CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.layout
     FOR EACH ROW WHEN (NOT xila.restoring()) EXECUTE FUNCTION xila.record_definition_change();
 CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.key_binding
     FOR EACH ROW WHEN (NOT xila.restoring()) EXECUTE FUNCTION xila.record_definition_change();
+CREATE TRIGGER history AFTER INSERT OR UPDATE OR DELETE ON xila.script
+    FOR EACH ROW WHEN (NOT xila.restoring()) EXECUTE FUNCTION xila.record_definition_change();
