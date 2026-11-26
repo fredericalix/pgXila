@@ -380,6 +380,8 @@ fn is_in_class(c: u8, class: u8) -> bool {
         b'u' => c.is_ascii_uppercase(),
         b'w' => c.is_ascii_alphanumeric(),
         b'x' => c.is_ascii_hexdigit(),
+        // Kept by Lua 5.4 from older versions: the character zero.
+        b'z' => c == 0,
         _ => return class == c,
     };
     inside == class.is_ascii_lowercase()
@@ -403,6 +405,13 @@ fn plain(text: &[u8], wanted: &[u8], from: usize, steps: &mut i64) -> Outcome<Op
     Ok(None)
 }
 
+/// True when a pattern has a character that means something. `string.find`
+/// looks for a pattern that has none as it is written; that is why
+/// `("a)"):find(")")` finds, where `("a)"):match(")")` is an error.
+pub fn has_specials(pattern: &[u8]) -> bool {
+    pattern.iter().any(|c| b"^$*+?.([%-".contains(c))
+}
+
 /// Looks for a pattern in a text, from the place `from`, counted from zero.
 /// Each step of the search takes one from `steps`; the search stops when none
 /// are left.
@@ -421,8 +430,7 @@ pub fn search(
     }
     let anchored = mode == Mode::Find && pattern.first() == Some(&b'^');
     let pattern = if anchored { &pattern[1..] } else { pattern };
-    let mut matcher =
-        Matcher { text, pattern, captures: Vec::new(), depth: MAX_DEPTH, steps };
+    let mut matcher = Matcher { text, pattern, captures: Vec::new(), depth: MAX_DEPTH, steps };
     let mut start = from;
     loop {
         let found = matcher.attempt(start)?;
@@ -463,7 +471,8 @@ mod tests {
     /// The same answer from this matcher, written the same way.
     fn ours(text: &str, pattern: &str, from: usize) -> String {
         let mut steps = 10_000_000;
-        match search(text.as_bytes(), pattern.as_bytes(), from, Mode::Find, &mut steps) {
+        let mode = if has_specials(pattern.as_bytes()) { Mode::Find } else { Mode::Plain };
+        match search(text.as_bytes(), pattern.as_bytes(), from, mode, &mut steps) {
             Err(_) => "error".to_owned(),
             Ok(None) => "nil".to_owned(),
             Ok(Some(found)) => {
@@ -581,6 +590,50 @@ mod tests {
             }
         }
         assert!(compared > 2000);
+    }
+
+    #[test]
+    fn a_match_gives_what_lua_gives() {
+        let lua = mlua::Lua::new();
+        let reference: mlua::Function = lua
+            .load(
+                r#"return function(text, pattern)
+                    local found = table.pack(pcall(string.match, text, pattern))
+                    if not found[1] then return "error" end
+                    if found[2] == nil then return "nil" end
+                    local parts = {}
+                    for i = 2, found.n do parts[#parts + 1] = tostring(found[i]) end
+                    return table.concat(parts, "|")
+                end"#,
+            )
+            .eval()
+            .unwrap();
+        for text in TEXTS {
+            for pattern in PATTERNS {
+                let mut steps = 10_000_000;
+                let found = search(text.as_bytes(), pattern.as_bytes(), 0, Mode::Find, &mut steps);
+                let ours = match found {
+                    Err(_) => "error".to_owned(),
+                    Ok(None) => "nil".to_owned(),
+                    Ok(Some(found)) if found.captures.is_empty() => {
+                        text[found.start..found.end].to_owned()
+                    }
+                    Ok(Some(found)) => {
+                        let parts: Vec<String> = found
+                            .captures
+                            .into_iter()
+                            .map(|capture| match capture {
+                                Capture::Position(at) => (at + 1).to_string(),
+                                Capture::Span(start, end) => text[start..end].to_owned(),
+                            })
+                            .collect();
+                        parts.join("|")
+                    }
+                };
+                let theirs: String = reference.call((text, pattern)).unwrap();
+                assert_eq!(ours, theirs, "text {text:?}, pattern {pattern:?}");
+            }
+        }
     }
 
     #[test]

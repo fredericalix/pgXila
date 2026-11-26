@@ -4,8 +4,8 @@
 -- module and no loading of code in it.
 local host = ...
 
-local pcall, error, type, tostring, pairs, ipairs, next, rawequal, setmetatable =
-    pcall, error, type, tostring, pairs, ipairs, next, rawequal, setmetatable
+local pcall, error, type, tostring, tonumber, pairs, ipairs, next, select, rawequal, setmetatable =
+    pcall, error, type, tostring, tonumber, pairs, ipairs, next, select, rawequal, setmetatable
 local math_type, to_integer = math.type, math.tointeger
 local pack, unpack, concat, insert = table.pack, table.unpack, table.concat, table.insert
 
@@ -13,8 +13,223 @@ local NULL = host.null
 local stack_name = host.stack
 local context = host.context
 
--- Bytecode cannot be loaded, so there is no use in dumping it.
-string.dump = nil
+-- ---------------------------------------------------------------------------
+-- The library of Lua, where it could not be stopped
+-- ---------------------------------------------------------------------------
+-- The functions of the library are written in C: the count of instructions
+-- that stops a script does not see inside them. Those that can run for very
+-- long are replaced here by ones that are counted, and give the same answers.
+-- They are changed in the tables of the library themselves, so that
+-- ("text"):find(…) is the counted one too.
+local sub, raw_rep, raw_find = string.sub, string.rep, string.find
+
+-- Bytecode cannot be loaded, so there is no use in dumping it; nothing here
+-- reads or writes binary data; and table.move can be asked to move nothing,
+-- forever.
+string.dump, string.pack, string.unpack, string.packsize = nil, nil, nil, nil
+table.move = nil
+
+local function text_argument(value, position, name)
+    local kind = type(value)
+    if kind == "string" then
+        return value
+    elseif kind == "number" then
+        return tostring(value)
+    end
+    error("bad argument #" .. position .. " to '" .. name .. "' (string expected, got "
+        .. (value == nil and "no value" or kind) .. ")", 3)
+end
+
+-- Where a search starts: counted from the end when negative, as in Lua.
+local function start_of(text, init)
+    if init == nil then
+        return 1
+    end
+    init = to_integer(init)
+    if init == nil then
+        error("bad argument #3 (number has no integer representation)", 3)
+    elseif init < 0 then
+        init = #text + init + 1
+        if init < 1 then init = 1 end
+    elseif init == 0 then
+        init = 1
+    end
+    return init
+end
+
+function string.find(text, pattern, init, plain)
+    text, pattern = text_argument(text, 1, "find"), text_argument(pattern, 2, "find")
+    init = start_of(text, init)
+    if init > #text + 1 then return nil end
+    local found = pack(host.match(text, pattern, init, plain and "plain" or "find"))
+    if found[1] == false then error(found[2], 2) end
+    if found[1] == nil then return nil end
+    return unpack(found, 1, found.n)
+end
+
+-- What a match gives: its captures, or all of it when it has none.
+local function given(text, found)
+    if found.n == 2 then
+        return sub(text, found[1], found[2])
+    end
+    return unpack(found, 3, found.n)
+end
+
+function string.match(text, pattern, init)
+    text, pattern = text_argument(text, 1, "match"), text_argument(pattern, 2, "match")
+    init = start_of(text, init)
+    if init > #text + 1 then return nil end
+    local found = pack(host.match(text, pattern, init, "match"))
+    if found[1] == false then error(found[2], 2) end
+    if found[1] == nil then return nil end
+    return given(text, found)
+end
+
+function string.gmatch(text, pattern, init)
+    text, pattern = text_argument(text, 1, "gmatch"), text_argument(pattern, 2, "gmatch")
+    local at, previous = start_of(text, init), nil
+    return function()
+        if at > #text + 1 then return nil end
+        local found = pack(host.match(text, pattern, at, "next", previous))
+        if found[1] == false then error(found[2], 2) end
+        if found[1] == nil then
+            at = #text + 2
+            return nil
+        end
+        at = found[2] + 1
+        previous = at
+        return given(text, found)
+    end
+end
+
+-- What takes the place of a match: a text with %1 for a capture, the entry
+-- of a table, or what a function answers.
+local function replacement_for(text, found, replacement, kind)
+    local whole = sub(text, found[1], found[2])
+    local value
+    if kind == "string" then
+        local parts, from = {}, 1
+        while true do
+            local percent = raw_find(replacement, "%", from, true)
+            if not percent then break end
+            parts[#parts + 1] = sub(replacement, from, percent - 1)
+            local what = sub(replacement, percent + 1, percent + 1)
+            if what == "%" then
+                parts[#parts + 1] = "%"
+            elseif what >= "0" and what <= "9" and what ~= "" then
+                local index = tonumber(what)
+                if index == 0 or (index == 1 and found.n == 2) then
+                    parts[#parts + 1] = whole
+                elseif found[index + 2] == nil then
+                    error("invalid capture index %" .. index .. " in replacement string", 3)
+                else
+                    parts[#parts + 1] = tostring(found[index + 2])
+                end
+            else
+                error("invalid use of '%' in replacement string", 3)
+            end
+            from = percent + 2
+        end
+        parts[#parts + 1] = sub(replacement, from)
+        return concat(parts)
+    elseif kind == "table" then
+        value = replacement[found.n == 2 and whole or found[3]]
+    else
+        value = replacement(given(text, found))
+    end
+    if not value then
+        return whole
+    elseif type(value) == "string" or type(value) == "number" then
+        return tostring(value)
+    end
+    error("invalid replacement value (a " .. type(value) .. ")", 3)
+end
+
+function string.gsub(text, pattern, replacement, most)
+    text, pattern = text_argument(text, 1, "gsub"), text_argument(pattern, 2, "gsub")
+    local kind = type(replacement)
+    if kind == "number" then
+        replacement, kind = tostring(replacement), "string"
+    elseif kind ~= "string" and kind ~= "table" and kind ~= "function" then
+        error("bad argument #3 to 'gsub' (string/function/table expected, got "
+            .. (replacement == nil and "no value" or kind) .. ")", 2)
+    end
+    if most == nil then most = #text + 1 end
+    -- A pattern that starts with ^ is tried once, where the text starts.
+    local anchored = sub(pattern, 1, 1) == "^"
+    if anchored then pattern = sub(pattern, 2) end
+
+    local parts, count, at, previous = {}, 0, 1, nil
+    while count < most do
+        local found = pack(host.match(text, pattern, at, anchored and "at" or "next", previous))
+        if found[1] == false then error(found[2], 2) end
+        if found[1] == nil then break end
+        count = count + 1
+        parts[#parts + 1] = sub(text, at, found[1] - 1)
+        parts[#parts + 1] = replacement_for(text, found, replacement, kind)
+        at = found[2] + 1
+        previous = at
+        if anchored then break end
+    end
+    parts[#parts + 1] = sub(text, at)
+    return concat(parts), count
+end
+
+function string.rep(text, count, separator)
+    text = text_argument(text, 1, "rep")
+    if separator ~= nil then separator = text_argument(separator, 3, "rep") end
+    -- Nothing, repeated, is nothing: the library would count to the end.
+    if #text == 0 and (separator == nil or #separator == 0) then
+        return ""
+    end
+    return raw_rep(text, count, separator)
+end
+
+-- A list can be made to look immensely long. Shifting its items is done
+-- here, where each step is counted.
+function table.insert(list, ...)
+    if type(list) ~= "table" then
+        error("bad argument #1 to 'insert' (table expected, got " .. type(list) .. ")", 2)
+    end
+    local given_count, size = select("#", ...), #list
+    if given_count == 1 then
+        list[size + 1] = (...)
+    elseif given_count == 2 then
+        local position, value = ...
+        position = to_integer(position)
+        if position == nil or position < 1 or position > size + 1 then
+            error("bad argument #2 to 'insert' (position out of bounds)", 2)
+        end
+        for i = size, position, -1 do
+            list[i + 1] = list[i]
+        end
+        list[position] = value
+    else
+        error("wrong number of arguments to 'insert'", 2)
+    end
+end
+
+function table.remove(list, position)
+    if type(list) ~= "table" then
+        error("bad argument #1 to 'remove' (table expected, got " .. type(list) .. ")", 2)
+    end
+    local size = #list
+    if position == nil then
+        position = size
+    else
+        position = to_integer(position)
+        if position == nil or (position ~= size and (position < 1 or position > size + 1)) then
+            error("bad argument #2 to 'remove' (position out of bounds)", 2)
+        end
+    end
+    local value = list[position]
+    while position < size do
+        list[position] = list[position + 1]
+        position = position + 1
+    end
+    list[position] = nil
+    return value
+end
 
 local env = {
     string = string, table = table, math = math, utf8 = utf8,

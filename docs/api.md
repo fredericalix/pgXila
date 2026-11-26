@@ -496,6 +496,13 @@ From Lua itself: `string`, `table`, `math`, `utf8`, `pairs`, `ipairs`, `next`,
 `select`, `type`, `tostring`, `tonumber`, `pcall`, `error`, `assert`. Nothing
 else: no file, no operating system, no module, no loading of code.
 
+The library of Lua is written in C, where the count that stops a script does
+not see. The functions that could run for very long are therefore pgXila's
+own, counted like the rest, and answering as Lua's do: `string.find`,
+`string.match`, `string.gmatch`, `string.gsub`, `string.rep`, `table.insert`
+and `table.remove`. `table.move`, `string.pack`, `string.unpack`,
+`string.packsize` and `string.dump` are not there.
+
 ### 9.3 Rights and limits
 
 - **Rights.** A script runs with the rights of the role that triggers it, like
@@ -511,7 +518,11 @@ else: no file, no operating system, no module, no loading of code.
   that statement is undone.
 - **It cannot block a backend.** A script is stopped after 50 million Lua
   instructions or 5 seconds, whichever comes first, and it holds 16 MB at
-  most. `pcall` cannot catch these limits, nor a cancelled query.
+  most. The search of a pattern counts as instructions. `pcall` cannot catch
+  these limits, nor a cancelled query.
+- **Within reason.** A query gives a script 1000 rows and 4 MB at most. A
+  value handed to the database may be nested 32 tables deep. One script runs
+  at a time in a session: a script cannot run another one through SQL.
 
 ### 9.4 How the clients trigger it
 

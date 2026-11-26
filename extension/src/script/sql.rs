@@ -15,8 +15,9 @@ use pgrx::prelude::*;
 use pgrx::{FromDatum, JsonB, PgList};
 use serde_json::Value as Json;
 
-/// The most rows a query gives to a script.
+/// The most rows a query gives to a script, and the most they may weigh.
 pub const MOST_ROWS: usize = 1000;
+const MOST_BYTES: usize = 4 * 1024 * 1024;
 
 /// A value handed to a statement, in its text form; `None` is NULL.
 pub type Arg = Option<String>;
@@ -197,10 +198,22 @@ unsafe fn run(text: &CStr, args: &[Option<CString>], wanted: Kind) -> Result<Don
         }
         let table = pg_sys::SPI_tuptable;
         rows.reserve(found);
+        let mut weight = 0;
         for index in 0..found {
             let tuple = *(*table).vals.add(index);
             let mut is_null = false;
             let datum = pg_sys::SPI_getbinval(tuple, (*table).tupdesc, 1, &raw mut is_null);
+            // Weighed before it is read: a script holds little memory, and
+            // what it asks for must not take much more.
+            if !is_null {
+                weight += pg_sys::toast_raw_datum_size(datum);
+            }
+            if weight > MOST_BYTES {
+                return Err(format!(
+                    "A query gives {} MB at most. This one gives more.",
+                    MOST_BYTES / (1024 * 1024)
+                ));
+            }
             rows.push(JsonB::from_datum(datum, is_null).map_or(Json::Null, |row| row.0));
         }
     }

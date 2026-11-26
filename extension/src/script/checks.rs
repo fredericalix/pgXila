@@ -680,4 +680,178 @@ end"#;
         let told = json("SELECT xila.act('books', 'edit_script', '{\"renderer\": \"text\"}')");
         assert_eq!(told[0]["do"], json!("message"));
     }
+
+    #[pg_test]
+    fn the_texts_and_lists_of_lua_work_as_in_lua() {
+        create_books_as_ada();
+        // These functions are not those of the library of Lua: they are
+        // counted. They answer the same.
+        let source = r#"
+function on_click()
+  local out = {}
+  local function say(...) out[#out + 1] = table.concat({...}, ",") end
+  say(("hello world"):find("o w"))
+  say(("hello world"):find("(o)(%s)"))
+  say(string.find("a.b", ".", 1, true))
+  say(("key = value"):match("^(%w+)%s*=%s*(%w+)$"))
+  say(("  padded  "):match("^%s*(.-)%s*$"))
+  say(("2026-11-26"):match("()-"))
+  local words = {}
+  for word in ("one two  three"):gmatch("%a+") do words[#words + 1] = word end
+  say(#words, words[3])
+  local found = {}
+  for name, value in ("a=1, b=2"):gmatch("(%w+)=(%w+)") do found[#found + 1] = name .. value end
+  say(table.concat(found, "/"))
+  say(("hello world"):gsub("o", "0"))
+  say(("hello world"):gsub("(%w+)", "<%1>"))
+  say(("hello"):gsub("", "-"))
+  say(("abc"):gsub("%w", "%0%0", 2))
+  say(("$name is $age"):gsub("%$(%w+)", {name = "Ada", age = 36}))
+  say(("abc"):gsub("%w", function(c) if c ~= "b" then return c:upper() end end))
+  say(("hello"):gsub("^h", "J"))
+  say(("x"):rep(3, "-"), ("ab"):rep(2), #(""):rep(math.maxinteger))
+  local list = {1, 2, 3}
+  table.insert(list, 4)
+  table.insert(list, 1, 0)
+  say(table.concat(list, ""))
+  say(table.remove(list), table.remove(list, 1), table.concat(list, ""))
+  say(tostring(("abc"):find("z")), tostring(("abc"):match("z")))
+  say(select(2, pcall(string.find, "a", "[a")))
+  say(tostring(string.pack), tostring(table.move), tostring(string.dump))
+  message(table.concat(out, " | "))
+end"#;
+        let expected = [
+            "5,7",
+            "5,6,o, ",
+            "2,2",
+            "key,value",
+            "padded",
+            "5",
+            "3,three",
+            "a1/b2",
+            "hell0 w0rld,2",
+            "<hello> <world>,2",
+            "-h-e-l-l-o-,6",
+            "aabbc,2",
+            "Ada is 36,2",
+            "AbC,3",
+            "Jello,1",
+            "x-x-x,abab,0",
+            "01234",
+            "4,0,123",
+            "nil,nil",
+            "malformed pattern (missing ']')",
+            "nil,nil,nil",
+        ];
+        assert_eq!(
+            click(source, json!({})),
+            json!([{"do": "message", "text": expected.join(" | ")}])
+        );
+    }
+
+    #[pg_test]
+    fn a_script_cannot_wait_inside_the_library() {
+        create_books_as_ada();
+        // A pattern that tries every way to cut a long text is counted like
+        // anything else a script does.
+        let problem =
+            failure(r#"function on_click() return (("a"):rep(5000)):find(".-.-.-.-.-b") end"#);
+        assert_eq!(problem["message"], json!("The script ran for too long and was stopped."));
+        let problem =
+            failure(r#"function on_click() return (("a"):rep(5000)):gsub(".-.-.-.-.-b", "") end"#);
+        assert_eq!(problem["message"], json!("The script ran for too long and was stopped."));
+
+        // A list made to look immensely long: shifting its items ends, one
+        // way or the other.
+        let played = play(
+            r#"
+function on_click()
+  local list = {}
+  for i = 1, 9 do list[i] = true end
+  local i = 16
+  while i > 0 do list[i] = true i = i * 2 end
+  table.insert(list, 1, 0)
+  table.remove(list, 1)
+  message("done")
+end"#,
+            json!({"on": "click"}),
+            json!({}),
+        );
+        match played.get("error") {
+            Some(problem) => assert_eq!(
+                problem["message"],
+                json!("The script ran for too long and was stopped.")
+            ),
+            None => assert_eq!(played["effects"], json!([{"do": "message", "text": "done"}])),
+        }
+    }
+
+    #[pg_test]
+    fn a_value_nested_too_deeply_is_refused() {
+        create_books_as_ada();
+        for source in [
+            // A hundred thousand tables, one inside the other.
+            r#"function on_click()
+                 local deep = {}
+                 for i = 1, 100000 do deep = {deep} end
+                 query("SELECT $1::jsonb AS x", deep)
+               end"#,
+            // A table that holds itself.
+            r#"function on_click()
+                 local loop = {}
+                 loop.again = loop
+                 query("SELECT $1::jsonb AS x", loop)
+               end"#,
+        ] {
+            let problem = failure(source);
+            assert_eq!(
+                problem["message"],
+                json!("This value is nested too deeply, or holds too much, to be stored."),
+                "{problem}"
+            );
+        }
+        // What is nested within reason is JSON.
+        let stored = click(
+            r#"function on_click()
+                 local rows = query("SELECT $1::jsonb -> 'a' -> 1 AS x", {a = {10, 20}})
+                 message(rows[1].x)
+               end"#,
+            json!({}),
+        );
+        assert_eq!(stored, json!([{"do": "message", "text": "20"}]));
+    }
+
+    #[pg_test]
+    fn a_script_cannot_run_another_script() {
+        create_books_as_ada();
+        let source = r#"
+function on_click()
+  local rows = query([[
+    SELECT xila.run_script('books', 'function on_click() message("inner") end',
+                           '{"on": "click"}', '{}') AS played]])
+  message(rows[1].played.error.message)
+end"#;
+        let expected = json!([{"do": "message", "text": "A script cannot run another script."}]);
+        assert_eq!(click(source, json!({})), expected);
+        // Its turn is handed back when it ends, whether it ends well or not.
+        assert_eq!(click(source, json!({})), expected);
+        failure("function on_click() error('no') end");
+        assert_eq!(click(source, json!({})), expected);
+    }
+
+    #[pg_test]
+    fn a_query_cannot_bring_back_more_than_a_script_may_hold() {
+        create_books_as_ada();
+        let source = r#"
+function on_click()
+  local ok, problem = pcall(query, "SELECT repeat('x', 5000000) AS big")
+  local rows = query("SELECT repeat('x', 1000) AS small")
+  message(tostring(ok) .. ": " .. problem .. " " .. #rows[1].small)
+end"#;
+        assert_eq!(
+            click(source, json!({})),
+            json!([{"do": "message",
+                    "text": "false: A query gives 4 MB at most. This one gives more. 1000"}])
+        );
+    }
 }

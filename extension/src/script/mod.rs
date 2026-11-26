@@ -10,6 +10,7 @@
 //! What a script sees is written in Lua, in `prelude.lua`, on top of the few
 //! functions defined here.
 
+mod pattern;
 mod sql;
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -21,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use mlua::chunk::ChunkMode;
 use mlua::serde::ser::Options as SerializeOptions;
-use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
+use mlua::{
+    Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, Variadic, VmState,
+};
 use serde_json::{json, Value as Json};
 
 /// The most Lua instructions one event may run.
@@ -35,6 +38,10 @@ const MEMORY: usize = 16 * 1024 * 1024;
 const TICK: u32 = 1000;
 /// The most lines `print` keeps for the test report.
 const PRINTED: usize = 200;
+/// How deep a value of a script may be nested, and how many values it may
+/// hold in all, to be turned into JSON: a card, the values of a statement.
+const NESTING: usize = 32;
+const VALUES: usize = 200_000;
 
 const PRELUDE: &str = include_str!("prelude.lua");
 
@@ -42,6 +49,51 @@ const TOO_LONG: &str = "The script ran for too long and was stopped.";
 const TOO_BIG: &str = "The script used too much memory and was stopped.";
 const NOT_HERE: &str =
     "The database and the screen can only be used inside a function such as on_click.";
+const TOO_DEEP: &str = "This value is nested too deeply, or holds too much, to be stored.";
+const NOT_TWICE: &str = "A script cannot run another script.";
+
+thread_local! {
+    /// True while a script runs in this backend. A script reaches SQL, and
+    /// SQL could run a script: each would have limits of its own, and the
+    /// time of one event would no longer be bounded.
+    static RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The right to run a script, given to one at a time and handed back when it
+/// ends, however it ends.
+struct Turn;
+
+impl Turn {
+    fn take() -> Option<Self> {
+        RUNNING.with(|running| (!running.replace(true)).then_some(Turn))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        RUNNING.with(|running| running.set(false));
+    }
+}
+
+/// Refuses a value of a script that is nested too deeply or holds too much
+/// to be turned into JSON: a table that holds itself, for one.
+fn check_shape(value: &Value) -> mlua::Result<()> {
+    fn visit(value: &Value, depth: usize, seen: &mut usize) -> mlua::Result<()> {
+        *seen += 1;
+        if depth > NESTING || *seen > VALUES {
+            return Err(mlua::Error::runtime(TOO_DEEP));
+        }
+        if let Value::Table(table) = value {
+            for pair in table.pairs::<Value, Value>() {
+                let (key, item) = pair?;
+                visit(&key, depth + 1, seen)?;
+                visit(&item, depth + 1, seen)?;
+            }
+        }
+        Ok(())
+    }
+    visit(value, 0, &mut 0)
+}
 
 /// Why a script was stopped for good, in a way it cannot catch.
 enum Stop {
@@ -187,7 +239,10 @@ impl Machine {
             self.parts.get::<Function>(name)?.call(args)?;
         match problem {
             Some(message) => Err(Problem::new(message)),
-            None => Ok(self.lua.from_value(answer)?),
+            None => {
+                check_shape(&answer)?;
+                Ok(self.lua.from_value(answer)?)
+            }
         }
     }
 }
@@ -239,9 +294,70 @@ fn host_table(lua: &Lua, host: &Rc<Host>, stack: &str, context: &Json) -> mlua::
     table.set(
         "json",
         lua.create_function(|lua, value: Value| {
+            check_shape(&value)?;
             let value: Json = lua.from_value(value)?;
             Ok(value.to_string())
         })?,
+    )?;
+
+    // The search of a pattern in a text, within the budget of the script.
+    // Places are counted from one, as Lua counts them.
+    let shared = Rc::clone(host);
+    table.set(
+        "match",
+        lua.create_function(
+            move |lua,
+                  (text, wanted, from, mode, previous): (
+                mlua::String,
+                mlua::String,
+                usize,
+                String,
+                Option<usize>,
+            )| {
+                let mode = match mode.as_str() {
+                    // A pattern in which nothing is special is looked for as
+                    // it is written, as string.find does.
+                    "find" if pattern::has_specials(&wanted.as_bytes()) => pattern::Mode::Find,
+                    "find" | "plain" => pattern::Mode::Plain,
+                    "match" => pattern::Mode::Find,
+                    "at" => pattern::Mode::At,
+                    _ => pattern::Mode::Next { previous_end: previous.map(|end| end - 1) },
+                };
+                let text = text.as_bytes();
+                let mut steps = shared.left.get();
+                let found = pattern::search(
+                    &text,
+                    &wanted.as_bytes(),
+                    from.saturating_sub(1),
+                    mode,
+                    &mut steps,
+                );
+                shared.left.set(steps);
+                shared.watch_the_clock()?;
+                let mut answer = Vec::new();
+                match found {
+                    Err(pattern::Halt::OutOfSteps) => unreachable!("the clock stops the script"),
+                    Err(pattern::Halt::Malformed(message)) => {
+                        answer.push(Value::Boolean(false));
+                        answer.push(Value::String(lua.create_string(message)?));
+                    }
+                    Ok(None) => answer.push(Value::Nil),
+                    Ok(Some(found)) => {
+                        answer.push(Value::Integer(found.start as i64 + 1));
+                        answer.push(Value::Integer(found.end as i64));
+                        for capture in found.captures {
+                            answer.push(match capture {
+                                pattern::Capture::Position(at) => Value::Integer(at as i64 + 1),
+                                pattern::Capture::Span(start, end) => {
+                                    Value::String(lua.create_string(&text[start..end])?)
+                                }
+                            });
+                        }
+                    }
+                }
+                Ok(Variadic::from_iter(answer))
+            },
+        )?,
     )?;
 
     let shared = Rc::clone(host);
@@ -345,6 +461,9 @@ pub fn run(stack: &str, source: &str, event: &Json, context: &Json, keep: bool) 
         Some("key") => ("on_key", event["key"].as_str()),
         Some("open") => ("on_open", None),
         _ => return json!({ "error": Problem::new("This is not an event of a script.").json() }),
+    };
+    let Some(_turn) = Turn::take() else {
+        return json!({ "error": Problem::new(NOT_TWICE).json() });
     };
 
     let host = Host::new();
