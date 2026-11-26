@@ -140,8 +140,20 @@ history, and the conversations with the agent, and `pg_restore` brings them
 back. The system stacks are not part
 of a dump; the extension creates them.
 
-The extension has no upgrade script yet: after pulling a new version, rebuild
-the image and start again from an empty database.
+The extension has no upgrade script yet: a new version of pgXila is a new
+extension. After pulling one, rebuild the image, then either start again from
+an empty database or keep what you have:
+
+```sh
+docker compose up --build --detach --wait
+scripts/upgrade-database.sh
+```
+
+The script does what a backup and a restore do, in place: it saves the
+database, restores it into a new one where the extension is at its new
+version, and swaps the two. Stacks, cards, history, scripts and conversations
+come along; roles and passwords are not touched. The database as it was is
+kept as `pgxila_before_upgrade` until you remove it.
 
 ## The clients
 
