@@ -1183,6 +1183,87 @@ model and check what the worker sends to it.
 - More than the latest 100 lines of a conversation on screen; the older ones
   are still sent to the model.
 
+### 11.10 Proposals
+
+> **Proposal for step 3b. Nothing in this subsection is implemented yet.**
+
+The agent still writes nothing. It gets tools that *propose* a change; the
+person applies the proposal or refuses it, and what is applied is done by the
+session of that person, with their rights.
+
+| Decision | Choice |
+|----------|--------|
+| Who writes | The session of the person who applies a proposal. The role `xila_agent` gets no new right: it still cannot write to a stack |
+| What the agent may propose | Fields of a stack, cards, and a new stack |
+| What it may not | Layout, pictures, scripts, deleting a stack, rights, and anything on a stack that is closed to it |
+| How a proposal is applied | One key or one button. A proposal that removes something asks for a confirmation that says what is lost |
+| What an applied proposal leaves | An ordinary change in the history, with the origin `agent`: it is undone and rewound like any other |
+
+**What happens.**
+
+1. The model asks for a writing tool, for example `add_field` with `{"stack":
+   "addressbook", "label": "Birthday", "type": "date"}`.
+2. The worker runs the function of that tool, which changes nothing: it checks
+   that the change makes sense and that the person could make it (the stack
+   exists, the person may edit it, the field is not already there…), and
+   describes it. The worker stores the description as a proposal, and tells
+   the model that the change is proposed and waits for the person.
+3. The model says in words what it proposed. The conversation shows the
+   proposal in a box: what it does, in a sentence and a few lines, and the
+   call that applying it runs.
+4. The person applies it or refuses it. Applying runs the author function or
+   `xila.save_card` in the session of the person, in one transaction. The
+   conversation gets a line that says so, which the model reads with the next
+   question.
+
+A proposal that was checked may still fail when it is applied, because things
+changed in between: the message says why, and the proposal stays. A proposal
+to change a card is refused when the fields it changes are no longer what the
+agent read: nobody's edit is silently overwritten.
+
+**Tools.** Each has a second function, which applies it; `xila.agent_tool`
+gets a column `applies` for it.
+
+| Tool | Arguments | Proposes |
+|------|-----------|----------|
+| `add_field` | `stack`, `label`, `type` (`text`, `number`, `date`, `boolean`) | A new field at the end of the cards |
+| `change_field` | `stack`, `field`, and `label`, `name` or `required` | Another label, another name, required or not |
+| `remove_field` | `stack`, `field` | Removing a field; applying asks for a confirmation that says how many cards have a value |
+| `create_stack` | `title`, `fields` (label and type of each) | A new stack with its fields, for an author |
+| `save_card` | `stack`, `values`, and `key` to change a card rather than add one | A new card, or other values on a card |
+| `delete_card` | `stack`, `key` | Deleting a card; applying asks for a confirmation |
+
+**Data model.** `xila.agent_proposal`: `id`, `conversation_id`, `at`, `tool`,
+`arguments`, `title` ("Add the field “Birthday” to Address book"), `detail`
+(lines such as "city: London → Paris"), `stack`, `card`, `state` (`pending`,
+`applied`, `refused`), `resolved_at`. Written by the worker; its owner reads
+it and changes its state.
+
+`xila.agent_message.kind` gets `note`: something that happened, said to the
+person and to the model alike ("Applied: Field “Birthday” added."). Giving up
+a question becomes such a line.
+
+**For the clients.** API version 5.
+
+- A conversation gets two more kinds of rows: `proposal`, drawn as a box, and
+  `note`. The grid names a column `state` for the state of a proposal. In the
+  window a pending proposal has the buttons Apply, Refuse and View; the
+  terminal says which keys do the same.
+- Handlers: `apply_proposal` and `refuse_proposal`, for the proposal named in
+  `input`, or else the oldest pending one of the conversation; `view_proposal`
+  shows the stack or the card a proposal is about.
+- Keys of the Agent screen: `F2` Apply, `F4` Refuse, `F5` Stop, `F6` New,
+  `F10` List, `Enter` Send. To make room, `F9` is no longer listed on the
+  screens of the agent itself, where it did nothing.
+- The side of the screen says what the agent did today as "5 actions, 2
+  applied, 1 refused": tools run, proposals applied, proposals refused.
+- In the history of a stack, a change that came from the agent says so next
+  to who applied it: "ada (agent)".
+
+**Not in step 3b.** Changing the layout, a picture or a script; several
+changes applied as one; proposals that expire; the agent acting without
+validation, even for small things.
+
 ## 12. Not covered yet
 
 - Scripts on a field, on one card or on a stack; timers, and scripts that
