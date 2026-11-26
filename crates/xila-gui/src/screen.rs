@@ -43,6 +43,9 @@ pub struct Ui {
     pressed: Option<String>,
     /// How far back the user went in a conversation, in pixels from its end.
     talk_back: i32,
+    /// The button of a proposal the pointer is held on, with the key of that
+    /// proposal.
+    held: Option<(String, talk::Button)>,
     /// What the visual editor remembers, while a stack is open in it.
     pub designer: Designer,
     /// What the drawing editor remembers, while a picture is open in it.
@@ -231,9 +234,7 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         Key::PageUp | Key::PageDown => {
             let view = session.view();
             let talk = layout.items.iter().find(|item| item.part == Part::Talk).and_then(|item| {
-                let definition = widget(view, &item.widget)?;
-                let state = view.grids.get(&item.widget)?;
-                let blocks = talk::blocks(fonts, definition, state, item.area.w);
+                let (blocks, _) = said(view, fonts, item)?;
                 Some((talk::overflow(&blocks, item.area), talk::page(item.area)))
             });
             if let Some((most, page)) = talk {
@@ -441,6 +442,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
                 );
             }
         }
+        // A conversation: only the buttons of a proposal answer to a click.
+        Part::Talk => {
+            ui.held = said(session.view(), fonts, &item)
+                .and_then(|(blocks, _)| talk::button_at(&blocks, area, ui.talk_back, x, y));
+        }
         Part::Grid => {
             session.set_focus(Some(item.widget.clone()));
             let Some(state) = session.view().grids.get(&item.widget) else { return };
@@ -474,6 +480,29 @@ pub fn pointer_up<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
     if session.view().designing && session.question().is_none() {
         design::pointer_up(session, &mut ui.designer, fonts, x, y);
         settle(session, ui, fonts);
+        return;
+    }
+    // A button of a proposal acts like any button: when the pointer is
+    // released on it. The server is told which proposal it belongs to.
+    if let Some(held) = ui.held.take() {
+        let geometry = Geometry::of(session.view(), fonts);
+        let chosen =
+            geometry.item_at(x, y).filter(|item| item.part == Part::Talk).and_then(|item| {
+                let (blocks, offers) = said(session.view(), fonts, item)?;
+                let area = geometry.on_screen(item.area);
+                let released_on_it =
+                    talk::button_at(&blocks, area, ui.talk_back, x, y).as_ref() == Some(&held);
+                let offer = match held.1 {
+                    talk::Button::Apply => offers.apply,
+                    talk::Button::Refuse => offers.refuse,
+                    talk::Button::Show => offers.show,
+                };
+                offer.filter(|_| released_on_it)
+            });
+        if let Some(offer) = chosen {
+            session.run_with(&offer.action, serde_json::json!({ "proposal": held.0 }));
+            settle(session, ui, fonts);
+        }
         return;
     }
     let Some(pressed) = ui.pressed.take() else { return };
@@ -773,10 +802,8 @@ fn draw_stack<A: Api>(
                 }
             }
             Part::Talk => {
-                if let (Some(definition), Some(state)) =
-                    (widget(view, &item.widget), view.grids.get(&item.widget))
-                {
-                    talk::draw(frame, fonts, area, definition, state, ui.talk_back);
+                if let Some((blocks, _)) = said(view, fonts, item) {
+                    talk::draw(frame, fonts, area, &blocks, ui.talk_back, ui.held.as_ref());
                 }
             }
             Part::Button { label, look } => {
@@ -790,6 +817,19 @@ fn draw_stack<A: Api>(
         }
     }
     frame.set_clip(previous);
+}
+
+/// The blocks of a conversation on screen, and what the screen offers to do
+/// with a proposal.
+fn said(
+    view: &View,
+    fonts: &Fonts,
+    item: &Item,
+) -> Option<(Vec<talk::Block>, xila_core::talk::Offers)> {
+    let definition = widget(view, &item.widget)?;
+    let state = view.grids.get(&item.widget)?;
+    let offers = xila_core::talk::offers(definition, &view.screen);
+    Some((talk::blocks(fonts, definition, state, &offers, item.area.w), offers))
 }
 
 /// A text cut into lines no wider than `width` pixels. A word wider than a
@@ -1217,6 +1257,97 @@ mod tests {
         let send = area_of(&session, "send");
         click(&mut session, &mut ui, send.x + 5, send.y + 5);
         assert_eq!(session.api().count("send"), 2);
+    }
+
+    const PROPOSAL: [(&str, &str); 3] = [
+        ("user", "Add a birthday to this stack."),
+        (
+            "proposal:pending",
+            "Add the field “Birthday” to Address book\nA field of type date, at the end of the cards. It adds the column birthday to the table addressbook.contacts.",
+        ),
+        ("agent", "I propose a date field named Birthday. Nothing changes until you apply it."),
+    ];
+
+    /// The place on the screen of a button of the proposal that waits.
+    fn proposal_button(session: &Session<Fake>, ui: &Ui, wanted: talk::Button) -> Rect {
+        let geometry = Geometry::of(session.view(), &fonts());
+        let item = geometry.layout.item("talk").unwrap();
+        let area = geometry.on_screen(item.area);
+        let (blocks, _) = said(session.view(), &fonts(), item).unwrap();
+        // Looked for where it is drawn: a button answers under the pointer.
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .find(|(x, y)| {
+                talk::button_at(&blocks, area, ui.talk_back, *x, *y)
+                    .is_some_and(|(_, button)| button == wanted)
+            })
+            .map(|(x, y)| Rect::new(x, y, 8, 8))
+            .expect("the button is on screen")
+    }
+
+    #[test]
+    fn a_proposal_is_a_box_with_what_it_does_and_its_buttons() {
+        let (mut session, mut ui) = agent_session(&PROPOSAL);
+        let frame = render(&session, &ui);
+        snapshot(&frame, "agent-proposal");
+        let talk = area_of(&session, "talk");
+        // The dark box, the call in yellow, and the main button.
+        assert!(count_slot(&frame, talk, slot::NIGHT) > 2000);
+        assert!(has_slot(&frame, talk, slot::YELLOW));
+        assert!(has_slot(&frame, talk, slot::PLUM));
+
+        // The pointer on Refuse, released on it: the server is told which
+        // proposal, and nothing else was asked.
+        let refuse = proposal_button(&session, &ui, talk::Button::Refuse);
+        click(&mut session, &mut ui, refuse.x + 2, refuse.y + 2);
+        let (action, context) = session.api().actions.last().unwrap();
+        assert_eq!(action, "refuse");
+        assert_eq!(context.input, Some(serde_json::json!({ "proposal": "1" })));
+        assert_eq!(session.message(), Some("Refused: Add the field “Birthday”."));
+
+        // Refused, it is only its title: there is nothing left to click.
+        let frame = render(&session, &ui);
+        snapshot(&frame, "agent-refused");
+        let geometry = Geometry::of(session.view(), &fonts());
+        let item = geometry.layout.item("talk").unwrap();
+        let (blocks, _) = said(session.view(), &fonts(), item).unwrap();
+        assert!(blocks.iter().all(|block| block.buttons.is_empty()));
+        press(&mut session, &mut ui, &[Key::F(2)]);
+        assert_eq!(session.message(), Some("The agent has proposed nothing that waits."));
+    }
+
+    #[test]
+    fn f2_applies_the_proposal_that_waits_and_view_goes_to_what_it_is_about() {
+        let (mut session, mut ui) = agent_session(&PROPOSAL);
+        // Pressed on a button and released elsewhere: nothing happens.
+        let apply = proposal_button(&session, &ui, talk::Button::Apply);
+        pointer_down(&mut session, &mut ui, &fonts(), apply.x + 2, apply.y + 2);
+        assert!(ui.held.is_some());
+        pointer_up(&mut session, &mut ui, &fonts(), apply.x + 2, apply.y - 60);
+        assert_eq!(session.api().count("apply"), 0);
+
+        press(&mut session, &mut ui, &[Key::F(2)]);
+        let (action, context) = session.api().actions.last().unwrap();
+        assert_eq!(action, "apply");
+        assert_eq!(context.input, None);
+        assert_eq!(session.message(), Some("Applied: Field “Birthday” added."));
+        let frame = render(&session, &ui);
+        snapshot(&frame, "agent-applied");
+        // The band of the box says so, in green.
+        assert!(has_slot(&frame, area_of(&session, "talk"), slot::GREEN));
+
+        // A new proposal: View leads to the stack it is about.
+        session
+            .api_mut()
+            .talk
+            .push(("proposal:pending".into(), "Add a card to Address book".into()));
+        session.run("agent");
+        press(&mut session, &mut ui, &[Key::F(12)]);
+        session.run("agent");
+        settle(&mut session, &mut ui, &fonts());
+        let view = proposal_button(&session, &ui, talk::Button::Show);
+        click(&mut session, &mut ui, view.x + 2, view.y + 2);
+        assert_eq!(session.view().stack(), "addressbook");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use xila_core::api::{Api, Widget};
 use xila_core::session::{GridState, Question, Session, View};
-use xila_core::talk::{self, Speaker};
+use xila_core::talk::{self, Offers, Speaker, State};
 use xila_core::text_layout::{
     self, leader, Item, TextLayout, COLUMNS, KEYS_ROW, LABEL_WIDTH, MESSAGE_ROW, PROMPT, ROWS,
 };
@@ -204,7 +204,9 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
             let talk = layout.items.iter().find_map(|item| match item {
                 Item::Grid { widget: name, w, h, .. } => {
                     let definition = widget(view, name).filter(|d| d.talk().is_some())?;
-                    Some((talk_rows(definition, view.grids.get(name)?, *w).len(), usize::from(*h)))
+                    let offers = talk::offers(definition, &view.screen);
+                    let rows = talk_rows(definition, view.grids.get(name)?, &offers, *w);
+                    Some((rows.len(), usize::from(*h)))
                 }
                 _ => None,
             });
@@ -381,7 +383,17 @@ pub fn draw<A: Api>(
                 {
                     if definition.talk().is_some() {
                         let place = (*x, *y, *w, *h);
-                        draw_talk(buffer, area, &theme, definition, state, place, ui.talk_back);
+                        let offers = talk::offers(definition, &view.screen);
+                        draw_talk(
+                            buffer,
+                            area,
+                            &theme,
+                            definition,
+                            state,
+                            &offers,
+                            place,
+                            ui.talk_back,
+                        );
                     } else {
                         draw_grid(buffer, area, &theme, definition, state, (*x, *y, *w, *h));
                     }
@@ -491,27 +503,91 @@ pub fn draw_keys<'a>(
     }
 }
 
+/// How a row of a conversation is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    /// What the person said.
+    Mine,
+    /// What the agent said.
+    Theirs,
+    /// What happened in between: small print.
+    Small,
+    /// What went wrong.
+    Wrong,
+    /// What a proposal does.
+    Title,
+    /// The calls a proposal runs.
+    Code,
+    /// The keys that apply or refuse a proposal.
+    Keys,
+}
+
 /// The rows of a conversation as the terminal writes them, oldest first:
-/// who speaks, then what is said, wrapped under itself.
-fn talk_rows(definition: &Widget, state: &GridState, width: u16) -> Vec<(Speaker, String)> {
+/// who speaks, then what is said, wrapped under itself. A proposal is a
+/// small block: what it does, what there is to know, the calls it runs, and
+/// the keys that apply it or refuse it while it waits.
+fn talk_rows(
+    definition: &Widget,
+    state: &GridState,
+    offers: &Offers,
+    width: u16,
+) -> Vec<(Ink, String)> {
     let mut rows = Vec::new();
+    let room = |lead: &str| usize::from(width).saturating_sub(lead.chars().count()).max(1);
+    let chars = |text: &str| text.chars().count();
     for line in talk::lines(definition, &state.page) {
-        let lead = match line.speaker {
-            Speaker::User => "You: ",
-            Speaker::Agent => "Agent: ",
-            Speaker::Tool => "  - ",
-            Speaker::Error => "  ! ",
-            Speaker::Wait => "  ",
+        if let Speaker::Proposal(became) = line.speaker {
+            let mut said = line.text.split('\n');
+            let title = said.next().unwrap_or_default();
+            let waits = became == State::Pending;
+            let head = match became {
+                State::Pending => format!("Proposed: {title}"),
+                State::Applied => format!("Applied: {title}"),
+                State::Refused => format!("Refused: {title}"),
+            };
+            for (index, piece) in talk::wrap(&head, room("  + "), chars).into_iter().enumerate() {
+                let lead = if index == 0 { "  + " } else { "  | " };
+                rows.push((Ink::Title, format!("{lead}{piece}")));
+            }
+            // Once applied or refused, a proposal is only its title.
+            if !waits {
+                continue;
+            }
+            for detail in said {
+                for piece in talk::wrap(detail, room("  |   "), chars) {
+                    rows.push((Ink::Small, format!("  |   {piece}")));
+                }
+            }
+            for call in line.code.split('\n').filter(|call| !call.is_empty()) {
+                for piece in talk::wrap(call, room("  |   "), chars) {
+                    rows.push((Ink::Code, format!("  |   {piece}")));
+                }
+            }
+            let keys: Vec<String> = [&offers.apply, &offers.refuse]
+                .into_iter()
+                .flatten()
+                .filter_map(|offer| Some(format!("{}={}", offer.key.as_ref()?, offer.label)))
+                .collect();
+            if !keys.is_empty() {
+                rows.push((Ink::Keys, format!("  |   {}", keys.join("  "))));
+            }
+            continue;
+        }
+
+        let (lead, ink) = match line.speaker {
+            Speaker::User => ("You: ", Ink::Mine),
+            Speaker::Agent => ("Agent: ", Ink::Theirs),
+            Speaker::Error => ("  ! ", Ink::Wrong),
+            Speaker::Wait => ("  ", Ink::Small),
+            Speaker::Tool | Speaker::Note | Speaker::Proposal(_) => ("  - ", Ink::Small),
         };
         // A blank row before each question sets the exchanges apart.
         if line.speaker == Speaker::User && !rows.is_empty() {
-            rows.push((Speaker::User, String::new()));
+            rows.push((Ink::Mine, String::new()));
         }
-        let room = usize::from(width).saturating_sub(lead.len()).max(1);
-        let cut = talk::wrap(line.text, room, |text| text.chars().count());
-        for (index, piece) in cut.into_iter().enumerate() {
+        for (index, piece) in talk::wrap(line.text, room(lead), chars).into_iter().enumerate() {
             let margin = if index == 0 { lead.to_owned() } else { " ".repeat(lead.len()) };
-            rows.push((line.speaker, format!("{margin}{piece}")));
+            rows.push((ink, format!("{margin}{piece}")));
         }
     }
     rows
@@ -519,16 +595,18 @@ fn talk_rows(definition: &Widget, state: &GridState, width: u16) -> Vec<(Speaker
 
 /// A list shown as a conversation: the latest rows, at the bottom of its
 /// area. `back` is how many rows the user went back.
+#[allow(clippy::too_many_arguments)]
 fn draw_talk(
     buffer: &mut Buffer,
     area: Rect,
     theme: &Theme,
     definition: &Widget,
     state: &GridState,
+    offers: &Offers,
     (x, y, w, h): (u16, u16, u16, u16),
     back: usize,
 ) {
-    let rows = talk_rows(definition, state, w);
+    let rows = talk_rows(definition, state, offers, w);
     if rows.is_empty() {
         let empty = "Ask the agent something, then press Enter.";
         put(buffer, area, x, y + h.saturating_sub(1), empty, w, theme.of(theme.label));
@@ -540,12 +618,15 @@ fn draw_talk(
     let start = end.saturating_sub(height);
     // The conversation sits on the bottom of its area, like a chat.
     let top = y + (height - (end - start)) as u16;
-    for (index, (speaker, text)) in rows[start..end].iter().enumerate() {
-        let style = match speaker {
-            Speaker::User => theme.of(theme.value),
-            Speaker::Agent => theme.base(),
-            Speaker::Tool | Speaker::Wait => theme.of(theme.label),
-            Speaker::Error => theme.of(theme.message),
+    for (index, (ink, text)) in rows[start..end].iter().enumerate() {
+        let style = match ink {
+            Ink::Mine => theme.of(theme.value),
+            Ink::Theirs => theme.base(),
+            Ink::Small => theme.of(theme.label),
+            Ink::Wrong => theme.of(theme.message),
+            Ink::Title => theme.of(theme.title),
+            Ink::Code => theme.of(theme.value),
+            Ink::Keys => theme.of(theme.key),
         };
         put(buffer, area, x, top + index as u16, text, w, style);
     }
@@ -557,9 +638,10 @@ fn talk_overflows(view: &View, layout: &TextLayout) -> bool {
         Item::Grid { widget: name, w, h, .. } => widget(view, name)
             .filter(|definition| definition.talk().is_some())
             .is_some_and(|definition| {
-                view.grids
-                    .get(name)
-                    .is_some_and(|state| talk_rows(definition, state, *w).len() > usize::from(*h))
+                view.grids.get(name).is_some_and(|state| {
+                    let offers = talk::offers(definition, &view.screen);
+                    talk_rows(definition, state, &offers, *w).len() > usize::from(*h)
+                })
             }),
         _ => false,
     })
@@ -669,6 +751,8 @@ mod tests {
         long_talk: usize,
         /// True once a question was sent to the agent.
         waiting: bool,
+        /// A change the agent proposed, and what became of it.
+        proposal: Option<&'static str>,
     }
 
     fn addressbook() -> Screen {
@@ -757,8 +841,10 @@ mod tests {
             "source": { "has_cards": true, "count": 1 },
             "widgets": [
                 { "name": "talk", "kind": "grid", "ord": 30,
-                  "props": { "view": "talk", "who": "kind",
-                             "columns": [ { "column": "kind" }, { "column": "text" } ] },
+                  "props": { "view": "talk", "who": "kind", "state": "state", "code": "code",
+                             "apply": "apply", "refuse": "refuse", "show": "view",
+                             "columns": [ { "column": "kind" }, { "column": "text" },
+                                          { "column": "state" }, { "column": "code" } ] },
                   "layout": { "text": { "x": 1, "y": 3, "w": 78, "h": 14 } } },
                 { "name": "ask", "kind": "field", "ord": 40, "label": "Ask", "column": "ask",
                   "type": "text", "props": { "max_length": 2000 },
@@ -770,8 +856,14 @@ mod tests {
                   "props": { "template": "Model: {model}  -  Today: {today}" },
                   "layout": { "text": { "x": 1, "y": 20, "w": 78, "h": 1 } } }
             ],
-            "actions": [],
+            "actions": [
+                { "name": "apply", "label": "Apply" },
+                { "name": "refuse", "label": "Refuse" },
+                { "name": "view", "label": "View" }
+            ],
             "keys": [
+                { "key": "F2", "label": "Apply", "action": "apply" },
+                { "key": "F4", "label": "Refuse", "action": "refuse" },
                 { "key": "F5", "label": "Stop", "action": "stop" },
                 { "key": "F12", "label": "Back", "action": "back" },
                 { "key": "Enter", "label": "Send", "action": "send" }
@@ -881,6 +973,23 @@ mod tests {
                     rows.push(said(10 + 2 * turn, "user", format!("Question {turn}")));
                     rows.push(said(11 + 2 * turn, "agent", format!("Answer {turn}")));
                 }
+                if let Some(became) = self.proposal {
+                    let mut row = said(
+                        500,
+                        "proposal",
+                        "Add the field “Birthday” to Address book\nA field of type date, at the \
+                         end of the cards."
+                            .into(),
+                    );
+                    row.cells.insert("state".into(), Some(became.into()));
+                    let call = "xila.add_field('addressbook', 'Birthday', 'date')";
+                    row.cells.insert("code".into(), Some(call.into()));
+                    rows.push(row);
+                    if became == "applied" {
+                        let note = "Applied: Field “Birthday” added to Address book.";
+                        rows.push(said(501, "note", note.into()));
+                    }
+                }
                 if self.waiting {
                     rows.push(said(999, "wait", "The agent is working…".into()));
                 }
@@ -922,6 +1031,13 @@ mod tests {
                 "send" => {
                     self.waiting = true;
                     vec![Effect::Show { stack: "agent".into(), card: Some("talk-1".into()) }]
+                }
+                "apply" => {
+                    self.proposal = Some("applied");
+                    vec![
+                        Effect::Show { stack: "agent".into(), card: Some("talk-1".into()) },
+                        Effect::Message { text: "Applied: Field “Birthday” added.".into() },
+                    ]
                 }
                 "delete_stack" if !context.confirmed => vec![Effect::Confirm {
                     text: "Delete the stack “Address book”? Its cards are kept, and the stack \
@@ -1227,7 +1343,31 @@ mod tests {
         assert_eq!(lines[18], " Ask . . . . . . :");
         assert_eq!(cursor, Some((20, 18)));
         assert_eq!(lines[20], " Model: test-model  -  Today: 2 actions, 0 refused");
-        assert_eq!(lines[23], " F5=Stop  F12=Back  Enter=Send");
+        assert_eq!(lines[23], " F2=Apply  F4=Refuse  F5=Stop  F12=Back  Enter=Send");
+    }
+
+    #[test]
+    fn a_proposal_says_what_it_does_and_which_keys_decide() {
+        let server = Fake { proposal: Some("pending"), ..Fake::default() };
+        let mut session = Session::start(server).unwrap();
+        let mut ui = Ui::default();
+        session.run("agent");
+        handle(&mut session, &mut ui, Key::Home);
+        let (lines, _) = render(&session, &ui);
+
+        // What it does, what there is to know, the call it runs, the keys.
+        assert_eq!(lines[13], "   + Proposed: Add the field “Birthday” to Address book");
+        assert_eq!(lines[14], "   |   A field of type date, at the end of the cards.");
+        assert_eq!(lines[15], "   |   xila.add_field('addressbook', 'Birthday', 'date')");
+        assert_eq!(lines[16], "   |   F2=Apply  F4=Refuse");
+
+        // F2 applies it: the server is asked, and says what was done.
+        press(&mut session, &mut ui, &[Key::F(2)]);
+        assert_eq!(session_actions(&session).last().unwrap().0, "apply");
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[15], "   + Applied: Add the field “Birthday” to Address book");
+        assert_eq!(lines[16], "   - Applied: Field “Birthday” added to Address book.");
+        assert_eq!(lines[22], " Applied: Field “Birthday” added.");
     }
 
     #[test]

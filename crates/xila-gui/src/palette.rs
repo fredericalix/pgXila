@@ -30,6 +30,7 @@ pub mod slot {
     pub const RED: u8 = 25;
     pub const VIOLET: u8 = 29;
     pub const LAVENDER: u8 = 30;
+    pub const PLUM: u8 = 31;
 }
 
 /// The default system palette, for the connection screen only. It is a copy

@@ -34,7 +34,8 @@ pub struct Fake {
     pub scripts: BTreeMap<Option<String>, String>,
     /// True when the server refuses to save a script.
     pub refuses_scripts: bool,
-    /// The conversation with the agent, oldest line first: who, and what.
+    /// The conversation with the agent, oldest line first: who, and what. A
+    /// proposal says what became of it after a colon: "proposal:pending".
     pub talk: Vec<(String, String)>,
 }
 
@@ -51,8 +52,10 @@ fn agent() -> Screen {
             { "name": "about", "kind": "text", "ord": 20,
               "props": { "template": "{about}", "style": "subtitle" }, "layout": at(322, 204, 127, 23) },
             { "name": "talk", "kind": "grid", "ord": 30,
-              "props": { "view": "talk", "who": "kind",
-                         "columns": [ { "column": "kind" }, { "column": "text" } ] },
+              "props": { "view": "talk", "who": "kind", "state": "state", "code": "code",
+                         "apply": "apply", "refuse": "refuse", "show": "view",
+                         "columns": [ { "column": "kind" }, { "column": "text" },
+                                      { "column": "state" }, { "column": "code" } ] },
               "layout": at(7, 7, 304, 196) },
             { "name": "ask", "kind": "field", "ord": 40, "label": "Ask", "column": "ask",
               "type": "text", "props": { "max_length": 2000 }, "layout": at(34, 211, 222, 14) },
@@ -71,13 +74,18 @@ fn agent() -> Screen {
               "props": { "template": "{today}" }, "layout": at(322, 171, 127, 23) },
             { "name": "status", "kind": "text", "ord": 110, "props": {}, "layout": hidden }
         ],
-        "actions": [],
+        "actions": [
+            { "name": "apply", "label": "Apply" },
+            { "name": "refuse", "label": "Refuse" },
+            { "name": "view", "label": "View" }
+        ],
         "keys": [
+            { "key": "F2", "label": "Apply", "action": "apply" },
             { "key": "F3", "label": "Quit", "action": "quit" },
+            { "key": "F4", "label": "Refuse", "action": "refuse" },
             { "key": "F5", "label": "Stop", "action": "stop" },
             { "key": "F6", "label": "New", "action": "new" },
-            { "key": "F9", "label": "Agent", "action": "agent" },
-            { "key": "F10", "label": "Conversations", "action": "list" },
+            { "key": "F10", "label": "List", "action": "list" },
             { "key": "F12", "label": "Back", "action": "back" },
             { "key": "Enter", "label": "Send", "action": "send" }
         ]
@@ -442,12 +450,21 @@ impl Api for Fake {
                 .iter()
                 .enumerate()
                 .rev()
-                .map(|(index, (kind, said))| GridRow {
-                    key: index.to_string(),
-                    cells: BTreeMap::from([
-                        ("kind".to_owned(), Some(kind.clone())),
-                        ("text".to_owned(), Some(said.clone())),
-                    ]),
+                .map(|(index, (kind, said))| {
+                    let (kind, became) = kind.split_once(':').unwrap_or((kind, ""));
+                    let call = "xila.add_field('addressbook', 'Birthday', 'date')";
+                    GridRow {
+                        key: index.to_string(),
+                        cells: BTreeMap::from([
+                            ("kind".to_owned(), Some(kind.to_owned())),
+                            ("text".to_owned(), Some(said.clone())),
+                            ("state".to_owned(), Some(became.to_owned())),
+                            (
+                                "code".to_owned(),
+                                Some(if kind == "proposal" { call } else { "" }.to_owned()),
+                            ),
+                        ]),
+                    }
                 })
                 .collect();
             return Ok(GridPage { total: rows.len() as u64, rows });
@@ -511,6 +528,33 @@ impl Api for Fake {
                 self.talk.push(("wait".into(), "The agent is working…".into()));
                 vec![show("agent", Some("talk-1"))]
             }
+            // The proposal the window names, or else the first that waits.
+            "apply" | "refuse" => {
+                let named = context
+                    .input
+                    .as_ref()
+                    .and_then(|input| input.get("proposal")?.as_str()?.parse::<usize>().ok());
+                let waiting = self.talk.iter().position(|(kind, _)| kind == "proposal:pending");
+                match named.or(waiting) {
+                    Some(at) => {
+                        let (became, said) = if action == "apply" {
+                            ("proposal:applied", "Applied: Field “Birthday” added.")
+                        } else {
+                            ("proposal:refused", "Refused: Add the field “Birthday”.")
+                        };
+                        self.talk[at].0 = became.to_owned();
+                        self.talk.push(("note".into(), said.into()));
+                        vec![
+                            show("agent", Some("talk-1")),
+                            Effect::Message { text: said.to_owned() },
+                        ]
+                    }
+                    None => vec![Effect::Message {
+                        text: "The agent has proposed nothing that waits.".into(),
+                    }],
+                }
+            }
+            "view" => vec![show("addressbook", Some("1"))],
             "open_stacks" => vec![show("stacks", None)],
             "open" => vec![show(context.row.as_deref().unwrap_or("addressbook"), None)],
             "next_card" => vec![show(stack, Some("2"))],

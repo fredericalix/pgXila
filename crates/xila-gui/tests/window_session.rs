@@ -606,6 +606,7 @@ fn the_agent_answers_in_its_window() {
     app.key(Key::Enter);
     app.key(Key::Enter);
     assert_eq!(stack(&app), "addressbook");
+    let card = app.session().unwrap().view().card.key.clone().expect("a card");
     app.key(Key::F(9));
     assert_eq!(stack(&app), "agent");
     app.key(Key::F(6));
@@ -644,7 +645,66 @@ fn the_agent_answers_in_its_window() {
     assert_eq!(view.text("model"), "fake");
     assert_eq!(view.text("host"), "host.docker.internal");
 
+    // The agent proposes to change the card it was called from: a dark box,
+    // with its buttons.
+    model.will_call(
+        "save_card",
+        serde_json::json!({"stack": "addressbook", "key": card, "values": {"city": "Atlantis"}}),
+    );
+    model.will_say("I propose to move this person to Atlantis.");
+    type_text(&mut app, "Move this person to Atlantis.");
+    app.key(Key::Enter);
+    wait_for_the_agent(&mut app, talk);
+    let frame = render(&app, "agent-proposal");
+    assert!(count(&frame, talk, slot::NIGHT) > 1000, "the box of the proposal");
+
+    // The pointer on Refuse: nothing is written, and the box says so.
+    let refuse = proposal_button(&app, xila_gui::talk::Button::Refuse).expect("a Refuse button");
+    click(&mut app, refuse);
+    assert_eq!(app.session().unwrap().message(), Some("Proposal refused."));
+    assert!(proposal_button(&app, xila_gui::talk::Button::Refuse).is_none());
+    render(&app, "agent-refused");
+
     // F12 goes back to the card the agent was called from.
     app.key(Key::F(12));
     assert_eq!(stack(&app), "addressbook");
+    assert_ne!(value(&app, "city"), "Atlantis");
+}
+
+/// Lets the agent work until its latest line is an answer.
+fn wait_for_the_agent(app: &mut App<Server>, talk: Rect) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.tick();
+        let frame = render(app, "agent-waiting");
+        if count(&frame, talk, slot::AMBER) == 0
+            && app.session().unwrap().view().value("ask").is_empty()
+        {
+            let view = app.session().unwrap().view();
+            let widget = view.screen.widgets.iter().find(|w| w.name == "talk").unwrap();
+            let lines = xila_core::talk::lines(widget, &view.grids["talk"].page);
+            if lines.last().is_some_and(|line| line.speaker == xila_core::talk::Speaker::Agent) {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "the agent did not answer");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Where a button of the proposal that waits is on the screen, if there is one.
+fn proposal_button(app: &App<Server>, wanted: xila_gui::talk::Button) -> Option<Rect> {
+    let fonts = Fonts::builtin();
+    let view = app.session().unwrap().view();
+    let area = area_of(app, "talk");
+    let widget = view.screen.widgets.iter().find(|w| w.name == "talk")?;
+    let offers = xila_core::talk::offers(widget, &view.screen);
+    let blocks = xila_gui::talk::blocks(&fonts, widget, &view.grids["talk"], &offers, area.w);
+    (area.y..area.bottom())
+        .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+        .find(|(x, y)| {
+            xila_gui::talk::button_at(&blocks, area, 0, *x, *y)
+                .is_some_and(|(_, button)| button == wanted)
+        })
+        .map(|(x, y)| Rect::new(x, y, 6, 6))
 }

@@ -20,8 +20,9 @@ pgXila is made of two parts:
 Early development. Phase 1 is done: one vertical slice, from the database to
 two clients. Phase 2, author mode, is done too: a stack is built from the
 client, without SQL, laid out with a visual editor, illustrated with a drawing
-editor, and given scripts. Phase 3, the agent, has its first step: one talks
-with the agent from a screen, and it reads the stacks to answer.
+editor, and given scripts. Phase 3, the agent, has two of its three steps:
+one talks with the agent from a screen, it reads the stacks to answer, and it
+proposes changes that one applies or refuses.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -52,10 +53,11 @@ with the agent from a screen, and it reads the stacks to answer.
 - **the agent**, in both clients: `F9` on any screen opens a conversation with
   a language model, which reads the stacks to answer. It runs in a background
   worker of PostgreSQL, under a role of its own, and never reads more than the
-  person it talks with may read.
+  person it talks with may read. It writes nothing: it proposes a change (a
+  field, a card, a new stack), and the person applies it or refuses it.
 
-Not there yet: an agent that changes things, its memory, and multiple
-instances. A stack can also be
+Not there yet: the memory of the agent, and multiple instances. A stack can
+also be
 built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
 The interface is in English.
 
@@ -348,8 +350,32 @@ it looked at.
 conversations; from that list, `F7` shows the journal of what the agent did.
 Called from a card, the agent knows which stack and which card "this" is.
 
-In this first step the agent reads and answers. It changes nothing: it has no
-tool to. Its three tools list the stacks, find cards and read a card.
+Three of its tools read: they list the stacks, find cards and read a card.
+
+### Proposals
+
+The agent changes nothing itself. Asked to add a field, to correct a card or
+to make a stack for your films, it *proposes*: the conversation shows what the
+change does and the call that applying it runs.
+
+```text
+   + Proposed: Add the field “Birthday” to Address book
+   |   A field of type date, at the end of the cards. It adds the column
+   |   birthday to the table addressbook.contacts.
+   |   xila.add_field('addressbook', 'Birthday', 'date')
+   |   F2=Apply  F4=Refuse
+```
+
+`F2` applies the proposal that waits and `F4` refuses it; the window also has
+the buttons Apply, Refuse and View in the box. Applying is done by your own
+session, with your rights: the agent proposes no more than you could do, and
+what is applied is in the history, marked as coming from the agent, to be
+undone like anything else. A proposal to change a card is not applied when the
+card was changed in the meantime.
+
+The agent may propose fields (add, change, remove), cards (add, change,
+delete) and a new stack with its fields. Layout, pictures and scripts stay in
+author mode.
 
 ### Setting it up
 
@@ -392,8 +418,8 @@ What the agent reads is sent to the model, so it matters what it may read:
 - **Never more than the person.** The agent reads for the person who asks,
   and refuses what this person could not open.
 - **Everything is written down.** The journal has a line for every call to
-  the model and every tool the agent ran, for whom. It does not copy the
-  cards.
+  the model, every tool the agent ran and every proposal, with what became of
+  it, for whom. It does not copy the cards.
 
 ## Security model
 
@@ -425,7 +451,9 @@ What the agent reads is sent to the model, so it matters what it may read:
   its own conversations and journal. It reads the cards of a stack through a
   privilege that the owner of the stack can take away, and never for someone
   who could not read them. The model does not write SQL: it can only ask for
-  one of the tools, which are fixed SQL functions. The token of the model
+  one of the tools, which are fixed SQL functions. Those that change something
+  only describe the change: it is made by the session of the person who
+  applies it, with that person's rights. The token of the model
   stays in the environment of the server, is sent to the configured address
   only, over HTTPS, and is never stored or logged; only an administrator can
   change that address.
@@ -451,7 +479,8 @@ host name. They also drive both clients from the desktop to a card, with its
 picture, and check what is written; an author builds a stack from the client,
 rewinds it, deletes it and brings it back; an author writes a script in the
 window, tests it, and a user runs it; and a user asks the agent, whose worker
-calls a fake model run by the tests, which check what is sent to it. No test
+calls a fake model run by the tests, which check what is sent to it, then
+applies or refuses what it proposes. No test
 calls a real model. They run against a throwaway server and do not touch the
 data of the development server.
 
