@@ -21,6 +21,7 @@ use crate::layout::{
     self, is_icon_view, FieldKind, GraphicLayout, Item, Part, GRID_HEADER, GRID_ROW, TILE,
 };
 use crate::palette::slot;
+use crate::script::{self, Scripter};
 
 /// Longest text a field accepts when its widget sets no limit.
 const DEFAULT_MAX_LENGTH: usize = 200;
@@ -41,6 +42,8 @@ pub struct Ui {
     pub designer: Designer,
     /// What the drawing editor remembers, while a picture is open in it.
     pub painter: Painter,
+    /// What the script editor remembers, while a script is open in it.
+    pub scripter: Scripter,
 }
 
 /// Where everything is on the screen, for one view.
@@ -168,6 +171,13 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
         return;
     }
 
+    // A script open in the script editor: the keys are those of the editor.
+    if session.view().scripting.is_some() {
+        script::handle_key(session, &mut ui.scripter, fonts, key);
+        settle(session, ui, fonts);
+        return;
+    }
+
     // A picture open in the drawing editor: the keys are those of the editor.
     if session.view().drawing.is_some() {
         draw::handle_key(session, &mut ui.painter, key);
@@ -257,9 +267,11 @@ pub fn handle_key<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, 
 /// After anything that may have changed the card, the stack or the focus:
 /// makes the focus and the cursor agree with what is on screen.
 pub fn settle<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) {
-    // The drawing editor follows what the session says is being drawn.
+    // The script editor follows what the session says is being written, and
+    // the drawing editor what it says is being drawn.
+    script::settle(session, &mut ui.scripter);
     draw::settle(session, &mut ui.painter);
-    if session.view().drawing.is_some() {
+    if session.view().scripting.is_some() || session.view().drawing.is_some() {
         return;
     }
     // In the visual editor nothing is typed on the card: there is no field
@@ -335,6 +347,11 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
         return;
     }
 
+    if session.view().scripting.is_some() {
+        script::pointer_down(session, &mut ui.scripter, fonts, x, y);
+        settle(session, ui, fonts);
+        return;
+    }
     if session.view().drawing.is_some() {
         draw::pointer_down(session, &mut ui.painter, fonts, x, y);
         settle(session, ui, fonts);
@@ -424,6 +441,10 @@ pub fn pointer_down<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts
 /// The pointer was released. A button acts when the pointer is released on
 /// it, so that one can change one's mind by moving away.
 pub fn pointer_up<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, x: i32, y: i32) {
+    if session.view().scripting.is_some() {
+        script::pointer_up(&mut ui.scripter);
+        return;
+    }
     if session.view().drawing.is_some() && session.question().is_none() {
         draw::pointer_up(session, &mut ui.painter, x, y);
         settle(session, ui, fonts);
@@ -455,15 +476,49 @@ pub fn pointer_move<A: Api>(
     if session.question().is_some() {
         return false;
     }
+    if session.view().scripting.is_some() {
+        return script::pointer_move(session, &mut ui.scripter, fonts, x, y);
+    }
     if session.view().drawing.is_some() {
         return draw::pointer_move(session, &mut ui.painter, x, y);
     }
     session.view().designing && design::pointer_move(session, &mut ui.designer, fonts, x, y)
 }
 
+/// What the clipboard should hold: the text selected in the script editor,
+/// which loses it when `cut`. Nothing is selected anywhere else.
+pub fn copy<A: Api>(
+    session: &mut Session<A>,
+    ui: &mut Ui,
+    fonts: &Fonts,
+    cut: bool,
+) -> Option<String> {
+    if session.question().is_some() || session.view().scripting.is_none() {
+        return None;
+    }
+    script::copy(session, &mut ui.scripter, fonts, cut)
+}
+
+/// Writes the text of the clipboard where the cursor is: in the script
+/// editor, or else in the field that has the focus.
+pub fn paste<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts, text: &str) {
+    if session.question().is_some() {
+        return;
+    }
+    if session.view().scripting.is_some() {
+        script::paste(session, &mut ui.scripter, fonts, text);
+        return;
+    }
+    // Elsewhere a pasted text is typed, on one line.
+    for character in text.chars().filter(|c| !c.is_control()) {
+        handle_key(session, ui, fonts, Key::Char(character));
+    }
+}
+
 /// Time passes. Returns true when the screen must be drawn again.
 pub fn tick<A: Api>(session: &mut Session<A>, ui: &mut Ui, fonts: &Fonts) -> bool {
     session.view().drawing.is_none()
+        && session.view().scripting.is_none()
         && session.view().designing
         && design::tick(session, &mut ui.designer, fonts)
 }
@@ -495,6 +550,11 @@ pub fn draw<A: Api>(
     blink: bool,
 ) {
     let view = session.view();
+    if view.scripting.is_some() && ui.scripter.is_open() {
+        script::draw(session, &ui.scripter, fonts, frame, clock, blink);
+        draw_over(session, fonts, frame, None, script::KEYS.into_iter());
+        return;
+    }
     if view.drawing.is_some() && ui.painter.canvas.is_some() {
         draw::draw(session, &ui.painter, fonts, frame, clock, blink);
         let hint = draw::hint(&ui.painter);

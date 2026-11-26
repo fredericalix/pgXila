@@ -18,9 +18,9 @@ pgXila is made of two parts:
 ## Status
 
 Early development. Phase 1 is done: one vertical slice, from the database to
-two clients. Phase 2, author mode, has its first three steps: a stack is built
-from the client, without SQL, laid out with a visual editor, and illustrated
-with a drawing editor.
+two clients. Phase 2, author mode, is done too: a stack is built from the
+client, without SQL, laid out with a visual editor, illustrated with a drawing
+editor, and given scripts.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -42,11 +42,14 @@ with a drawing editor.
 - **the drawing editor**, in the graphical client: draw the icon of a stack,
   the picture of a card or a picture of the background, pixel by pixel, with
   the 32 colours of pgXila and those a stack adds;
+- **scripts**, in Lua: a button or a screen does what its author wrote, with
+  the rights of whoever uses it and within limits it cannot escape. They are
+  written and tested in a script editor, in the graphical client, and run in
+  both clients;
 - **rewinding**: a card, the screen of a stack or a whole stack goes back to
   before any recorded change, a deleted stack or a removed field included.
 
-Not there yet: scripts (the next step of author mode), the agent and multiple
-instances. A stack can also be
+Not there yet: the agent and multiple instances. A stack can also be
 built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
 The interface is in English.
 
@@ -223,8 +226,8 @@ as things to arrange. Fields show the name of their column instead of a value.
   screen only; then the grid and the guides, on or off. `F6` adds a widget
   without the pointer.
 - **Properties**, in a small window that can be moved and hidden (`F7`): the
-  label of a field or a button, the words of a text, what a button does, the
-  position and the size as numbers.
+  label of a field or a button, the words of a text, what a button does, its
+  script, the position and the size as numbers.
 - `F2`, Control-Z or Command-Z **undoes** the last change, then the one before.
   `Delete` removes the selected widget, after a confirmation.
 - `F11` goes back to browsing, `F10` opens the history of the stack.
@@ -254,6 +257,61 @@ back to the picture as it was.
 Leaving the editor (`F12`) saves the drawing. An image is never changed: each
 drawing is kept as a new image, so the history of a card can bring back the
 picture it had before, and nobody can overwrite the picture of someone else.
+
+### Scripts
+
+A button does one of the things pgXila knows: next card, save, delete. For
+anything else its author writes a script, in [Lua 5.4](https://www.lua.org/).
+The screen of a stack has a script too, for its keys and for what happens when
+a card comes on screen.
+
+```lua
+-- script of the button "New card"
+keys = { F9 = "New in London" }
+
+function on_click()
+  local new = stack.new_card()
+  new.city = "London"
+  go_to(new)
+  focus("last_name")
+end
+
+function on_key(key)
+  on_click()
+end
+```
+
+In the visual editor, select a button and press `F8`, or use the Script button
+of Properties; with nothing selected, it is the script of the screen. The
+script editor colours the source and indents it, selects with `Shift` and the
+arrows or with the pointer, copies and pastes through the clipboard of the
+system, and undoes with Control-Z or Command-Z.
+
+- **Test** (`F5`) tries the event chosen in the list on the right, on the card
+  that was on screen. Everything the script writes is undone: the editor only
+  says what it would have done, or which line is wrong.
+- **Leaving** (`F12`) saves the script. A script with a mistake is kept too,
+  and does nothing until it is fixed.
+
+A script reads and writes the card on screen (`card.city`), finds, saves and
+deletes cards (`stack.cards{city = "London"}`, `save`, `delete`), moves
+(`go_to`, `open`, `focus`), talks to the user (`message`, `confirm`) and
+reaches the database with `query` and `execute`. The whole list is in
+[docs/api.md](docs/api.md), section 9.
+
+What a script cannot do matters as much:
+
+- it runs **with the rights of whoever presses the button**, never more:
+  privileges and row-level security apply to everything it does, and it only
+  reads and writes rows. So open the stacks of authors you trust; and no script
+  ever runs for a superuser;
+- it has **no file, no network, no operating system**, and keeps nothing in
+  memory between two events;
+- it **cannot block the server**: it is stopped after five seconds or too much
+  work, cannot hold more than 16 MB, and cannot catch these limits;
+- it is **all or nothing**: a script that fails leaves no trace in the
+  database, and the user is told which line failed;
+- `F3`, `F11` and `F12` can never be taken by a script: one can always leave.
 
 ### Who may change a stack
 
@@ -291,6 +349,11 @@ it; its columns are added and removed in SQL.
   the privileges of the caller, so `GRANT`, `REVOKE` and row-level security on
   the tables of the stacks apply unchanged. History follows the same rule: it
   shows the old versions of a card only to those who may read the card.
+- **Scripts are confined.** A script written by the author of a stack runs
+  inside the extension, in a Lua state that has no file, network or system
+  access, only loads source text, and is stopped when it exceeds its time or
+  its memory. It acts with the privileges of the role that triggers it, through
+  statements that read and write rows only, and never for a superuser.
 
 ## Tests
 
@@ -310,9 +373,10 @@ The integration tests prove, among other things, that an unencrypted connection
 is refused, both by the configuration and by the extension alone, that TLS 1.2
 is refused, and that the client rejects an untrusted certificate or a wrong
 host name. They also drive both clients from the desktop to a card, with its
-picture, and check what is written; and an author builds a stack from the
-client, rewinds it, deletes it and brings it back. They run against a throwaway
-server and do not touch the data of the development server.
+picture, and check what is written; an author builds a stack from the client,
+rewinds it, deletes it and brings it back; and an author writes a script in
+the window, tests it, and a user runs it. They run against a throwaway server
+and do not touch the data of the development server.
 
 The same three suites run in GitHub Actions on every push, with the clients
 built and tested on Linux, macOS and Windows.
@@ -321,7 +385,7 @@ built and tested on Linux, macOS and Windows.
 
 | Path | Content |
 |------|---------|
-| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, and SQL: schema, client API, author functions, actions, system stacks) |
+| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, Lua for the scripts, and SQL: schema, client API, author functions, scripts, actions, system stacks) |
 | `crates/xila-core/` | Code shared by the clients: connection, API, session, connection form |
 | `crates/xila-gui/` | The graphical client, with its fonts |
 | `crates/xila-term/` | The text client |

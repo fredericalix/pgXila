@@ -30,6 +30,10 @@ pub struct Fake {
     pub drawings: Vec<(String, Image)>,
     /// True when the server refuses to save a drawing.
     pub refuses_drawings: bool,
+    /// The scripts that were saved, by button; None is the screen.
+    pub scripts: BTreeMap<Option<String>, String>,
+    /// True when the server refuses to save a script.
+    pub refuses_scripts: bool,
 }
 
 fn desktop() -> Screen {
@@ -249,7 +253,7 @@ pub fn keys_of_a_built_stack() -> Vec<(&'static str, &'static str)> {
 impl Api for Fake {
     fn hello(&mut self) -> Result<Hello, ApiError> {
         Ok(Hello {
-            api: 2,
+            api: xila_core::session::API_VERSION,
             version: "0".into(),
             instance: "normandie-01".into(),
             role: "ada".into(),
@@ -524,6 +528,54 @@ impl Api for Fake {
                 vec![Effect::Reload]
             }
             // The server answered with the screen as it now is.
+            // Scripts: the editor opens on what is saved, a test says what
+            // the script would do, and leaving saves.
+            "edit_script" => {
+                let input = context.input.clone().unwrap_or_default();
+                let widget = input["widget"].as_str().map(str::to_owned);
+                vec![Effect::Script {
+                    title: match &widget {
+                        Some(name) => format!("Script: button “{name}”"),
+                        None => "Script: screen of “Address book”".to_owned(),
+                    },
+                    source: self.scripts.get(&widget).cloned().unwrap_or_default(),
+                    widget,
+                }]
+            }
+            "test_script" => {
+                let input = context.input.clone().unwrap_or_default();
+                let source = input["source"].as_str().unwrap_or_default();
+                let wrong = source.lines().position(|line| line.contains("boom"));
+                vec![match wrong {
+                    Some(line) => Effect::Tested {
+                        ok: false,
+                        line: Some(line as u32 + 1),
+                        lines: vec![format!("Line {}: boom is not defined.", line + 1)],
+                    },
+                    None => Effect::Tested {
+                        ok: true,
+                        line: None,
+                        lines: vec![
+                            format!("Tested: {}.", input["event"]["on"].as_str().unwrap_or("?")),
+                            "It says: Hello.".to_owned(),
+                        ],
+                    },
+                }]
+            }
+            "save_script" if self.refuses_scripts => {
+                return Err(ApiError::User {
+                    code: "XL004".into(),
+                    message: "The stack “Address book” belongs to bob: you cannot change it."
+                        .into(),
+                })
+            }
+            "save_script" => {
+                let input = context.input.clone().unwrap_or_default();
+                let widget = input["widget"].as_str().map(str::to_owned);
+                self.scripts
+                    .insert(widget, input["source"].as_str().unwrap_or_default().to_owned());
+                vec![Effect::Reload, Effect::Message { text: "Script saved.".into() }]
+            }
             "refresh" => vec![Effect::Reload],
             "edit_field" => vec![show("field", context.row.as_deref())],
             "new_field" => vec![

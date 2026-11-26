@@ -644,7 +644,7 @@ mod tests {
     impl Api for Fake {
         fn hello(&mut self) -> Result<Hello, ApiError> {
             Ok(Hello {
-                api: 2,
+                api: xila_core::session::API_VERSION,
                 version: "0.1.0".into(),
                 instance: "normandie-01".into(),
                 role: "fax".into(),

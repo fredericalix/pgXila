@@ -24,6 +24,7 @@ return and sends back what the user does.
 | Where the author screens live | In the database, as system stacks; the clients have no author code |
 | Tables pgXila alters | Only those it created (`managed`); never a table that existed before |
 | Pictures | An image never changes: a drawing is saved as a new image, and what showed the old one points to the new one |
+| Scripts | Lua 5.4 inside the extension, one script per button or per screen, run with the rights of whoever triggers it |
 | Identifiers | `uuid` (UUIDv7), ready for several instances |
 | Text grid | 80 columns by 24 rows |
 | Graphic screen | 480 by 300 pixels, one byte per pixel, each a palette slot |
@@ -65,6 +66,7 @@ its own, usually in a schema of its own, for example `addressbook.contacts`.
 | `xila.widget` | a widget | `id`, `background_id`, `layer`, `card_key`, `name`, `kind`, `ord`, `grp`, `label`, `bound_column`, `action_id`, `props` |
 | `xila.layout` | the placement of a widget for one renderer | `widget_id`, `renderer` (`text` or `graphic`), `x`, `y`, `w`, `h`, `style` |
 | `xila.key_binding` | a key bound to an action | `background_id`, `key`, `action_id` |
+| `xila.script` | the script of a button, or of a screen | `background_id`, `widget_id`, `language`, `source`, `events`, `keys`; see section 9 |
 | `xila.history` | one recorded change | see section 7 |
 
 Building a stack means inserting rows in these tables. `examples/addressbook.sql`
@@ -168,9 +170,15 @@ it calls `xila.open_stack` and receives one JSON document.
     { "key": "F12", "label": "Back", "action": "back" },
     { "key": "Enter", "label": "Save", "action": "save_card" }
   ],
-  "colours": []
+  "colours": [],
+  "events": []
 }
 ```
+
+A button whose script handles the click has `script` as its action, and the
+keys a script asks for are listed with the others, bound to `script` too.
+`events` holds `open` when the script of the screen wants to be told that a
+card came on screen (section 9.4).
 
 Coordinates: `text` layouts are in character cells on an 80 by 24 grid. The
 client keeps rows 0 to 2 for the header and rows 21 to 23 for messages and
@@ -237,6 +245,7 @@ All functions live in the `xila` schema.
 | `xila.grid_rows(stack text, widget text, first int, count int, card text)` | `jsonb`: `{"total": n, "rows": [{"key": …, "cells": {column: text}}]}`. `card` is the key of the card on screen, for a grid with a `where` property |
 | `xila.image(image_id uuid)` | `(width, height, pixels bytea)` |
 | `xila.act(stack text, action text, context jsonb)` | `jsonb`: a list of effects (section 5) |
+| `xila.delete_card(stack text, key text)` | `jsonb`: `{"next": key}`, the card to show in its place, if there is one left |
 
 `xila.visible_stack` is a view of the user stacks the current role may open,
 with their number of cards. The stack list is a grid over it.
@@ -277,6 +286,7 @@ the user, in English, and the client shows it as it is.
 | `XL002` | Unknown stack, card, widget or action |
 | `XL003` | A value was rejected. The message names the field |
 | `XL004` | Not allowed for this role |
+| `XL005` | A script failed. The message names the button and the line |
 
 ## 5. Actions
 
@@ -293,7 +303,10 @@ SELECT xila.act('addressbook', 'next_card',
 saved, `row` is the key of the selected grid row, and `confirmed` is true once
 the user has accepted the question the action asked. `renderer` says which
 client this is, `text` or `graphic`, and `input` holds what a tool of the
-client, such as the visual editor or the drawing editor, has to say. The server looks up the
+client, such as the visual editor or the drawing editor, has to say. `event`
+says what triggered the action: `{"on": "click", "widget": "new"}` for a button
+or a list, `{"on": "key", "key": "F6"}` for a key, `{"on": "open"}` when a card
+came on screen; the scripts of a screen answer to it. The server looks up the
 action, runs its handler, and answers with effects that the client applies in
 order:
 
@@ -313,6 +326,9 @@ order:
 | `select` | Select the row of the grid whose key is `row` |
 | `design` | Open the visual editor on the stack named by `stack`. Only sent to a graphical client |
 | `draw` | Open the drawing editor on a picture: `target` is `icon`, `card` or `widget`, `widget` names the widget that shows it, `image` is the image it shows now, if any, and `width` and `height` the size of the drawing. Only sent to a graphical client |
+| `set` | Put `values` in the fields of the card on screen, as if the user had typed them; a null value empties the field. Nothing is saved |
+| `script` | Open the script editor on the script of the button named by `widget`, or of the screen without one: `title` and `source`. Only sent to a graphical client |
+| `tested` | What the test of a script did, for the script editor: `ok`, the `line` of the error if there is one, and `lines` to read |
 | `quit` | Leave the client |
 
 The handlers:
@@ -332,14 +348,16 @@ The handlers:
 | `new_field`, `edit_field`, `save_field`, `remove_field`, `move_field` | The dialogs of a field in author mode |
 | `place_widgets`, `reset_layout`, `add_widget`, `set_widget`, `remove_widget`, `undo` | What the visual editor asks for, with its request in `input`; see section 10.7 |
 | `draw`, `save_drawing`, `set_colour`, `remove_colour` | What the drawing editor asks for; see section 10.8 |
+| `script` | Runs the script of what triggered the action; see section 9.4 |
+| `edit_script`, `test_script`, `save_script` | What the script editor asks for; see section 9.6 |
 
 The author handlers read the context and call the functions of section 10.3.
 On the author screens the key of the card is the subject of the dialog: the
 name of a stack, the identifier of a field.
 
-Handlers written by stack authors, in SQL or in a script, arrive with scripting
-(step 2d). They will be additional kinds of handler behind the same `xila.act`
-call, so the clients do not change.
+What a stack author wants a button or a key to do beyond these is written as
+a script (section 9). A script is one more handler behind the same `xila.act`
+call.
 
 ## 6. Notifications
 
@@ -396,7 +414,7 @@ The connection screen is the only screen built into the clients, because it is
 shown before any connection exists. The window in which a `confirm` effect asks
 its question is drawn by the clients as well.
 
-## 9. Scripts (proposal for step 2d, not approved yet)
+## 9. Scripts
 
 A script is written in **Lua 5.4** and runs inside the extension. The language
 was chosen after building Lua and Rhai into the extension on PostgreSQL 19 and
@@ -520,28 +538,38 @@ answers `api: 3`.
 |----------|------|
 | `xila.set_script(stack, widget, source)` | Checks and saves the script of a button, or of the screen when `widget` is null. An empty source removes it. Returns the events and keys found |
 | `xila.check_script(source)` | Checks only: `{"ok": true, "events": ["click", "key"], "keys": {"F6": "New card"}}`, or `{"ok": false, "line": 4, "message": "…"}` |
-| `xila.run_script(source, event, context, keep)` | The engine: runs one event of a script and returns its effects. With `keep` false, everything it wrote is undone and the answer also carries what it printed. Used by `xila.act` |
+| `xila.test_script(stack, source, event, context)` | Runs one event of a source, saved or not, undoes everything it wrote, and answers with what it would have done, in words |
+| `xila.run_script(stack, source, event, context, keep)` | The engine: runs one event of a script with the rights of the current role and answers with `{"effects": […], "printed": […], "wrote": {…}}` or `{"error": {"line": 4, "message": "…"}}`. With `keep` false, everything it wrote is undone. Used by `xila.act` and by the test |
 
 ### 9.6 The script editor
 
 A tool of the graphical client, as the visual editor and the drawing editor
 are. The text client runs scripts but does not edit them.
 
-- **Entering it.** In the visual editor, `F8` Script opens the script of the
-  selected button, or of the screen when nothing is selected. The server
-  answers the action `edit_script` with the effect `{"do": "script", "widget":
-  "new", "title": "Script: button New card", "source": "…"}`.
+- **Entering it.** In the visual editor, `F8` opens the script of the selected
+  button, or of the screen when nothing is selected; so does the Script button
+  of the Properties window, next to what the button does. The server answers
+  the action `edit_script` with the effect `{"do": "script", "widget": "new",
+  "title": "Script: button “New card”", "source": "…"}`.
 - **The window.** The source with line numbers and colours for comments,
-  strings, keywords and the functions of 9.2; the line and column of the
-  cursor; whether the script is correct, checked when typing pauses, with the
-  line of the first error otherwise.
-- **Events.** A list on the right: click, key, open card, ticked when the
-  script handles them. Choosing one that is missing adds its empty function.
-  Timer, database change and received message are shown as "later".
+  texts, numbers, keywords and the names of 9.2; the line and column of the
+  cursor; whether the script was changed, and what its last test said.
+- **Typing.** A new line is indented like the one before, one step further
+  after a line that opens a block, and `end` lines up with what it closes.
+  `Tab` and `Shift-Tab` move the selected lines. `Shift` with the arrows, or
+  the pointer, selects; Control or Command with `C`, `X`, `V`, `A` copies,
+  cuts, pastes and selects everything, through the clipboard of the system;
+  with `Z` it undoes, a word at a time, and with `Shift-Z` or `Y` it does again.
+- **Events.** A list on the right: click and key for a button, key and open
+  card for the screen, ticked when the script handles them. Choosing one that
+  is missing adds its empty function. Timer, database change and received
+  message are listed under "Later".
 - **Test** (`F5`). Runs the event chosen in the list on the card that was on
-  screen, with the source as typed, saved or not. Everything it writes is
-  undone. The editor then shows what it would have done: the effects in
-  words, the printed lines, or the error and its line.
+  screen, with the source as typed, saved or not; a key event is tried with
+  the first key the script asks for. Everything it writes is undone. The
+  editor then shows what it would have done: what it asked, what it printed,
+  what it wrote in the database and its effects, in words; or the error, with
+  its line marked in the margin.
 - **Leaving** (`F12`, or Close) saves the script through the action
   `save_script`. A script with an error is saved too, with a warning, so that
   no work is lost; it handles no event until it is fixed.
@@ -714,8 +742,8 @@ the dialog, and what is typed on it goes to an action, never to the view:
 
 `Escape` leaves a screen like `F12`, and gives up a question.
 
-Left for later steps: scripts and handlers written by authors (2d); creating a stack from a description with the agent (phase 3);
-sharing the cards of a stack from the client.
+Left for later steps: creating a stack from a description with the agent
+(phase 3); sharing the cards of a stack from the client.
 
 ### 10.7 The visual editor
 
@@ -790,9 +818,11 @@ and can be rewound from the History screen.
   (the drawing editor, on the icon of the stack), `F6` New widget, `F7`
   Properties, `F10` History, `F11` Browse, `F12` Back.
 
-Left for later: the script of a widget (2d),
-the Agent button (phase 3), the slider, grid and chart tools, renaming a widget
-from the editor (a field is renamed in its dialog).
+The script of a button, and of the screen, is written in the script editor
+(section 9.6): `F8`, or the Script button of the Properties window.
+
+Left for later: the Agent button (phase 3), the slider, grid and chart tools,
+renaming a widget from the editor (a field is renamed in its dialog).
 
 ### 10.8 Drawing
 
@@ -879,7 +909,8 @@ Agent button.
 
 ## 11. Not covered yet
 
-- Author mode beyond section 10 (scripts): step 2d.
+- Scripts on a field, on one card or on a stack; timers, and scripts that
+  answer to a change in the database or to a message: later steps.
 - Agent API, audit log, validation of proposed actions: phase 3.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.

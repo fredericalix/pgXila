@@ -618,6 +618,19 @@ end"#;
         assert_eq!(tested[0]["ok"], json!(false));
         assert_eq!(tested[0]["line"], json!(2));
         assert!(tested[0]["lines"][0].as_str().unwrap().starts_with("Line 2: "), "{tested}");
+
+        // A key event is tried with the first key the script asks for.
+        let keyed = json!({
+            "input": {
+                "source": "keys = { F9 = 'Nine', F10 = 'Ten' }\nfunction on_key(key) message(key) end",
+                "event": {"on": "key"},
+            },
+        });
+        let tested = json(&format!(
+            "SELECT xila.act('books', 'test_script', {})",
+            quoted(&keyed.to_string())
+        ));
+        assert_eq!(tested[0]["lines"], json!(["It says: F9"]), "{tested}");
     }
 
     #[pg_test]

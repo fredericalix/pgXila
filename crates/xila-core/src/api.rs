@@ -67,6 +67,10 @@ pub struct Screen {
     pub keys: Vec<KeyBinding>,
     #[serde(default)]
     pub colours: Vec<Colour>,
+    /// What the script of the screen wants to be told about: `open`, when a
+    /// card comes on screen.
+    #[serde(default)]
+    pub events: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -324,6 +328,34 @@ pub struct Context {
     /// What a tool of the client, such as the visual editor, has to say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
+    /// What triggered the action. The scripts of a screen answer to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<Event>,
+}
+
+/// What triggered an action: a button that was pressed, a key, or a card
+/// that came on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Event {
+    pub on: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widget: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl Event {
+    pub fn click(widget: &str) -> Self {
+        Event { on: "click", widget: Some(widget.to_owned()), key: None }
+    }
+
+    pub fn key(key: &str) -> Self {
+        Event { on: "key", widget: None, key: Some(key.to_owned()) }
+    }
+
+    pub fn open() -> Self {
+        Event { on: "open", widget: None, key: None }
+    }
 }
 
 /// What the server asks the client to do after an action.
@@ -368,6 +400,25 @@ pub enum Effect {
         image: Option<String>,
         width: u16,
         height: u16,
+    },
+    /// Put values in the fields of the card on screen, as if the user had
+    /// typed them. A missing value empties the field.
+    Set { values: BTreeMap<String, Option<String>> },
+    /// Open the script editor on the script of a button, or of the screen
+    /// when no widget is named. Only the graphical client has one.
+    Script {
+        #[serde(default)]
+        widget: Option<String>,
+        title: String,
+        source: String,
+    },
+    /// What the test of a script did, for the script editor: in words, with
+    /// the line of the error if there is one.
+    Tested {
+        ok: bool,
+        #[serde(default)]
+        line: Option<u32>,
+        lines: Vec<String>,
     },
     /// Leave the client.
     Quit,

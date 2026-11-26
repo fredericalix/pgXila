@@ -306,6 +306,14 @@ DECLARE
     played  jsonb;
     wrote   text;
 BEGIN
+    -- A key event is tried with the first key the script asks for.
+    IF event->>'on' = 'key' AND event->>'key' IS NULL THEN
+        event := event || jsonb_build_object('key', (
+            SELECT k FROM jsonb_object_keys(xila.check_script(test_script.source)->'keys') k
+            ORDER BY length(k), k
+            LIMIT 1));
+    END IF;
+
     played := xila.run_script(stack, test_script.source, event,
                               context || '{"confirmed": false}'::jsonb, false);
     IF coalesce((played->>'asked')::boolean, false) THEN

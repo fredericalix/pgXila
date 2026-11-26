@@ -129,6 +129,9 @@ pub enum Prop {
     Reset,
     /// The button that opens the drawing editor on a picture.
     Draw,
+    /// The button that opens the script editor: on the script of a button,
+    /// or on the script of the screen.
+    Script,
 }
 
 impl Prop {
@@ -766,6 +769,7 @@ impl Properties {
                             .find(|(name, _)| *name == action)
                             .map_or_else(|| "Nothing".to_owned(), |(_, label)| label);
                         rows.push((Prop::Action, "Does", Control::Choice, shown));
+                        rows.push((Prop::Script, "Script (F8)", Control::Button, String::new()));
                         rows.push((
                             Prop::Main,
                             "Main button",
@@ -818,15 +822,20 @@ impl Properties {
                 heading = view.screen.stack.title.clone();
                 detail = "Nothing is selected".to_owned();
                 let widgets = editor.layout.items.len();
-                notes.push(format!("{widgets} widget{}", if widgets == 1 { "" } else { "s" }));
                 let cards = view.screen.source.count;
-                notes.push(format!("{cards} card{}", if cards == 1 { "" } else { "s" }));
+                notes.push(format!(
+                    "{widgets} widget{}, {cards} card{}",
+                    if widgets == 1 { "" } else { "s" },
+                    if cards == 1 { "" } else { "s" }
+                ));
                 if editor.layout.by_hand {
                     notes.push("Layout made by hand".to_owned());
                     rows.push((Prop::Reset, "Reset layout", Control::Button, String::new()));
                 } else {
                     notes.push("Automatic layout".to_owned());
                 }
+                // The screen has a script of its own.
+                rows.push((Prop::Script, "Script (F8)", Control::Button, String::new()));
             }
         }
 
@@ -1036,6 +1045,9 @@ fn press_property<A: Api>(session: &mut Session<A>, designer: &Designer, fonts: 
             change(session, json!({ "action": name }));
         }
         (Prop::Reset, _) => session.run("reset_layout"),
+        (Prop::Script, _) => {
+            session.run_with("edit_script", json!({ "widget": designer.selected }));
+        }
         (Prop::Draw, _) => {
             if let Some(name) = &selected {
                 session.run_with("draw", json!({ "target": "widget", "widget": name }));
@@ -1240,6 +1252,12 @@ pub fn handle_key<A: Api>(
         }
         Key::F(6) => designer.menu = Some(0),
         Key::F(7) => designer.properties_hidden = !designer.properties_hidden,
+        // The script of the selected button, or of the screen when nothing is
+        // selected, is written in its own editor.
+        Key::F(8) => {
+            flush(session, designer, fonts);
+            session.run_with("edit_script", json!({ "widget": designer.selected }));
+        }
         Key::F(10) => {
             flush(session, designer, fonts);
             session.run("stack_history");
