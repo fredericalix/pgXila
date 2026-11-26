@@ -575,7 +575,7 @@ local key_names = { Enter = true }
 for n = 1, 24 do
     key_names["F" .. n] = true
 end
-local kept_keys = { F3 = true, F11 = true, F12 = true }
+local kept_keys = { F3 = true, F9 = true, F11 = true, F12 = true }
 
 -- What the script handles, read from what it defined.
 local function describe()
@@ -595,7 +595,7 @@ local function describe()
             if type(key) ~= "string" or not key_names[key] then
                 return nil, "“" .. tostring(key) .. "” is not a key. Keys are F1 to F24 and Enter."
             elseif kept_keys[key] then
-                return nil, "F3, F11 and F12 cannot be taken by a script."
+                return nil, "F3, F9, F11 and F12 cannot be taken by a script."
             elseif type(label) ~= "string" or label == "" then
                 return nil, "The key " .. key .. ' needs a label, as in keys = { F6 = "New card" }.'
             end

@@ -102,13 +102,15 @@ END
 $$;
 
 -- Whether an action is offered to the current role on a stack. An action may
--- be kept for authors ({"for": "author"}) or for those who may change the
--- stack on screen ({"for": "editor"}).
+-- be kept for authors ({"for": "author"}), for those who may change the
+-- stack on screen ({"for": "editor"}) or for administrators ({"for":
+-- "admin"}).
 CREATE FUNCTION xila.offered(args jsonb, stack uuid) RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT CASE args->>'for'
         WHEN 'author' THEN pg_has_role('xila_author', 'USAGE')
         WHEN 'editor' THEN xila.may_edit(stack)
+        WHEN 'admin' THEN pg_has_role('xila_admin', 'USAGE')
         ELSE true
     END
 $$;
@@ -190,7 +192,7 @@ $$;
 CREATE FUNCTION xila.hello() RETURNS jsonb
 LANGUAGE sql STABLE AS $$
     SELECT jsonb_build_object(
-        'api', 3,
+        'api', 4,
         'version', xila.version(),
         'instance', coalesce(nullif(current_setting('cluster_name'), ''), 'pgxila'),
         'role', session_user,

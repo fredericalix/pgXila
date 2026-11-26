@@ -18,6 +18,14 @@ cd "$(dirname "$0")/.."
 
 PORT="${PGXILA_PORT:-5419}"
 SCRATCH_PORT="${PGXILA_SCRATCH_PORT:-5420}"
+# Where the tests run their fake language model, for the agent worker of the
+# scratch server to call. Docker Desktop reaches the loopback of the host; on
+# Linux the container comes in through the Docker bridge.
+MODEL_PORT="${PGXILA_TEST_MODEL_PORT:-5421}"
+case "$(uname -s)" in
+    Linux) MODEL_BIND="${PGXILA_TEST_MODEL_BIND:-0.0.0.0}" ;;
+    *)     MODEL_BIND="${PGXILA_TEST_MODEL_BIND:-127.0.0.1}" ;;
+esac
 ROLE="xila_integration_test"
 OUTSIDER="xila_integration_outsider"
 AUTHOR="xila_integration_author"
@@ -60,6 +68,12 @@ CREATE ROLE :"outsider" LOGIN PASSWORD :'password';
 SQL
 PGXILA_SERVICE=db-scratch scripts/load-example.sh addressbook
 
+# The agent of the scratch server talks to the fake model of the tests.
+psql_in db-scratch -v address="http://host.docker.internal:$MODEL_PORT/v1" <<'SQL'
+SELECT xila.set_agent(jsonb_build_object(
+    'address', :'address', 'model', 'fake', 'token_variable', 'PGXILA_TEST_MODEL_TOKEN'));
+SQL
+
 export PGXILA_TEST_HOST=localhost
 export PGXILA_TEST_PORT="$PORT"
 export PGXILA_TEST_DATABASE=pgxila
@@ -71,6 +85,8 @@ export PGXILA_TEST_PASSWORD="$PASSWORD"
 export PGXILA_TEST_CA="$PWD/docker/certs/ca.crt"
 export PGXILA_TEST_SCRATCH_PORT="$SCRATCH_PORT"
 export PGXILA_TEST_SCRATCH_CA="$SCRATCH_CERTS/ca.crt"
+export PGXILA_TEST_MODEL_PORT="$MODEL_PORT"
+export PGXILA_TEST_MODEL_BIND="$MODEL_BIND"
 
 # The API tests share one stack: run them one at a time.
 cargo test --workspace -- --ignored --test-threads=1 "$@"
@@ -98,11 +114,11 @@ after="$(history_count)"
 echo "ok"
 
 echo
-echo "A backup is restored with its stacks, its cards and its history"
+echo "A backup is restored with its stacks, its cards, its history and its conversations"
 # A script, so that the backup has one to carry.
 psql_in db-scratch <<'SQL'
 SELECT xila.set_script('addressbook', 'new', $lua$
-keys = { F9 = "New card" }
+keys = { F2 = "New card" }
 
 function on_click()
   go_to(stack.new_card())
@@ -124,8 +140,12 @@ summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.ba
                 (SELECT count(*) FROM pg_trigger WHERE tgname = 'xila_card'),
                 (SELECT count(*) || ':' || md5(string_agg(source || events::text || keys::text, ''))
                    FROM xila.script),
-                xila.open_stack('addressbook')->'keys' @> '[{\"key\": \"F9\", \"action\": \"script\"}]',
-                xila.card('addressbook')->'texts'"
+                xila.open_stack('addressbook')->'keys' @> '[{\"key\": \"F2\", \"action\": \"script\"}]',
+                xila.card('addressbook')->'texts',
+                (SELECT md5(address || model || token_variable) FROM xila.agent_setting),
+                (SELECT count(*) FROM xila.conversation), (SELECT count(*) FROM xila.agent_message),
+                (SELECT count(*) FROM xila.agent_log),
+                has_table_privilege('xila_agent', 'addressbook.contacts', 'SELECT')"
 scratch db-scratch sh -c '
     set -e
     pg_dump -d pgxila -Fc -f /tmp/pgxila.dump

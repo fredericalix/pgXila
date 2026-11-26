@@ -24,6 +24,10 @@ use xila_gui::layout::layout;
 use xila_gui::palette::{slot, Palette};
 use xila_gui::screen::tile_area;
 
+#[path = "../../xila-core/tests/support/fake_model.rs"]
+mod fake_model;
+use fake_model::FakeModel;
+
 /// Palette slot of the skin of the portraits of the example.
 const SKIN: u8 = 28;
 /// Palette slot of the cover of the notebook that is the icon of the example.
@@ -588,4 +592,59 @@ fn an_author_writes_the_script_of_a_button_in_the_window() {
     click(&mut app, target);
     app.key(Key::Enter);
     assert_eq!(stack(&app), "stacks", "{:?}", app.session().unwrap().message());
+}
+
+#[test]
+#[ignore = "needs the scratch pgXila server and the fake model"]
+fn the_agent_answers_in_its_window() {
+    let model = FakeModel::start();
+    model.will_call("find_cards", serde_json::json!({"stack": "addressbook", "text": "paris"}));
+    model.will_say("Nobody lives in Paris in your address book.");
+
+    let mut app = connected();
+    // From a card of the address book, F9 calls the agent.
+    app.key(Key::Enter);
+    app.key(Key::Enter);
+    assert_eq!(stack(&app), "addressbook");
+    app.key(Key::F(9));
+    assert_eq!(stack(&app), "agent");
+    app.key(Key::F(6));
+
+    let talk = area_of(&app, "talk");
+    let empty = render(&app, "agent-empty");
+    assert_eq!(count(&empty, talk, slot::ICE), 0);
+
+    type_text(&mut app, "Who lives in Paris?");
+    assert_eq!(value(&app, "ask"), "Who lives in Paris?");
+    app.key(Key::Enter);
+    assert_eq!(app.session().unwrap().message(), None);
+    assert_eq!(value(&app, "ask"), "");
+    // The question is in the conversation at once.
+    let asked = render(&app, "agent-asked");
+    assert!(count(&asked, talk, slot::ICE) > 0);
+
+    // The answer arrives by itself: the window is told, and draws it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.tick();
+        let frame = render(&app, "agent-answered");
+        // The bubble of the agent is white, and nothing is being waited for.
+        if count(&frame, talk, slot::WHITE) > 0 && count(&frame, talk, slot::AMBER) == 0 {
+            // Its face is next to what it says, and what it did is above.
+            assert!(count(&frame, talk, slot::LAVENDER) > 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent did not answer");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(model.requests().len(), 2);
+
+    // Beside the conversation: which model, and where the questions go.
+    let view = app.session().unwrap().view();
+    assert_eq!(view.text("model"), "fake");
+    assert_eq!(view.text("host"), "host.docker.internal");
+
+    // F12 goes back to the card the agent was called from.
+    app.key(Key::F(12));
+    assert_eq!(stack(&app), "addressbook");
 }

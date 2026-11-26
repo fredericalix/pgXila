@@ -109,7 +109,7 @@ fn an_author_builds_a_stack_from_the_client() {
     session.activate("stacks");
     assert_eq!(
         keys(&session),
-        ["F3=Quit", "F6=New stack", "F10=Deleted", "F11=Author", "F12=Back"]
+        ["F3=Quit", "F6=New stack", "F9=Agent", "F10=Deleted", "F11=Author", "F12=Back"]
     );
     session.press("F6");
     assert_eq!(session.view().stack(), "new_stack");
@@ -147,6 +147,7 @@ fn an_author_builds_a_stack_from_the_client() {
             "F6=New",
             "F7=Prev.",
             "F8=Next",
+            "F9=Agent",
             "F10=History",
             "F11=Author",
             "F12=Back",
@@ -268,7 +269,7 @@ fn author_mode_is_kept_from_those_who_may_not_use_it() {
     let mut session = session_as("PGXILA_TEST_USER");
     assert!(!session.hello().author);
     session.activate("stacks");
-    assert_eq!(keys(&session), ["F3=Quit", "F12=Back"]);
+    assert_eq!(keys(&session), ["F3=Quit", "F9=Agent", "F12=Back"]);
     select(&mut session, "list", "title", "Test books");
     session.activate("list");
     assert_eq!(session.view().stack(), STACK);
@@ -493,7 +494,7 @@ fn scripts_run_for_whoever_uses_the_stack() {
         "set_widget",
         serde_json::json!({ "widget": "button1", "changes": { "label": "Sequel" } }),
     );
-    let source = r#"keys = { F9 = "Sequel" }
+    let source = r#"keys = { F2 = "Sequel" }
 
 function on_click()
   local sequel = stack.new_card()
@@ -511,12 +512,12 @@ end
     assert!(author
         .run_with("save_script", serde_json::json!({ "widget": "button1", "source": source })));
     assert_eq!(author.message(), Some("Script saved."));
-    // The screen says so at once: the button runs its script, and so does F9.
+    // The screen says so at once: the button runs its script, and so does F2.
     let button = |session: &Session<Server>| {
         session.view().widgets().find(|w| w.name == "button1").and_then(|w| w.action.clone())
     };
     assert_eq!(button(&author).as_deref(), Some("script"));
-    assert!(keys(&author).contains(&"F9=Sequel".to_owned()), "{:?}", keys(&author));
+    assert!(keys(&author).contains(&"F2=Sequel".to_owned()), "{:?}", keys(&author));
 
     // A test keeps nothing, and tells what the script would do.
     author.be_graphic();
@@ -546,7 +547,7 @@ end
     assert_eq!(user.view().value("year"), "1816");
     assert_eq!(user.view().card.count, 3);
     // The key does the same, from the card it is pressed on.
-    assert!(user.press("F9"));
+    assert!(user.press("F2"));
     assert_eq!(user.view().value("title"), "Emma II II");
     user.press("F10");
     let changes = column(&user, "changes", "summary");

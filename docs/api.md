@@ -1,8 +1,8 @@
 # pgXila SQL API
 
 This document describes the contract between the pgXila extension and its
-clients, as implemented for phase 1 and for steps 2a, 2b and 2c of author
-mode. API version: 2.
+clients, as implemented for phase 1, for phase 2 (author mode) and for step 3a
+of the agent. API version: 4.
 
 A pgXila client is an ordinary PostgreSQL client. It connects over TLS 1.3 with
 SCRAM-SHA-256, calls SQL functions of the `xila` schema, and listens on
@@ -25,6 +25,7 @@ return and sends back what the user does.
 | Tables pgXila alters | Only those it created (`managed`); never a table that existed before |
 | Pictures | An image never changes: a drawing is saved as a new image, and what showed the old one points to the new one |
 | Scripts | Lua 5.4 inside the extension, one script per button or per screen, run with the rights of whoever triggers it |
+| The agent | In a background worker, under a role of its own. It reads for the person it talks with, and never more than that person may read |
 | Identifiers | `uuid` (UUIDv7), ready for several instances |
 | Text grid | 80 columns by 24 rows |
 | Graphic screen | 480 by 300 pixels, one byte per pixel, each a palette slot |
@@ -36,6 +37,8 @@ return and sends back what the user does.
 |------|-------|---------|
 | `xila_user` | no | Group role. May call the API. Every person is a member |
 | `xila_author` | no | Group role, member of `xila_user`. May write stack definitions |
+| `xila_admin` | no | Group role, member of `xila_author`. May set up the agent and read its whole journal |
+| `xila_agent` | no | The role of the agent worker; see section 11.2. Nobody is a member of it |
 | one role per person | yes | Created by an administrator, member of `xila_user` |
 
 A role that is not a member of `xila_user` cannot use the `xila` schema at all.
@@ -48,8 +51,6 @@ a user when that user may `SELECT` from its table.
 The definition of a stack may only be changed by the role that owns the stack
 and by the members of that role; see section 10.1.
 
-The role the agent tools run under (`xila_agent`) comes with phase 3.
-
 ## 2. Data model
 
 System objects live in the `xila` schema. A stack keeps its data in a table of
@@ -60,7 +61,7 @@ its own, usually in a schema of its own, for example `addressbook.contacts`.
 | `xila.palette` | a system colour | `slot` (0 to 31), `name`, `rgb` (`#rrggbb`) |
 | `xila.stack_colour` | an extra colour of a stack | `stack_id`, `slot` (32 to 254), `name`, `rgb` |
 | `xila.image` | an indexed image, written once | `id`, `width`, `height`, `pixels` (one byte per pixel; 255 is transparent) |
-| `xila.stack` | a stack | `id`, `name` (identifier), `title`, `kind` (`system` or `user`), `icon_id`, `owner` |
+| `xila.stack` | a stack | `id`, `name` (identifier), `title`, `kind` (`system` or `user`), `icon_id`, `owner`, `agent_reads` (section 11.2) |
 | `xila.background` | the screen shared by the cards of a stack | `id`, `stack_id`, `source_schema`, `source_table`, `key_column`, `order_columns`, `managed` |
 | `xila.action` | something a button or a key triggers | `id`, `background_id`, `name`, `label`, `handler`, `args` |
 | `xila.widget` | a widget | `id`, `background_id`, `layer`, `card_key`, `name`, `kind`, `ord`, `grp`, `label`, `bound_column`, `action_id`, `props` |
@@ -68,6 +69,7 @@ its own, usually in a schema of its own, for example `addressbook.contacts`.
 | `xila.key_binding` | a key bound to an action | `background_id`, `key`, `action_id` |
 | `xila.script` | the script of a button, or of a screen | `background_id`, `widget_id`, `language`, `source`, `events`, `keys`; see section 9 |
 | `xila.history` | one recorded change | see section 7 |
+| `xila.agent_setting`, `xila.agent_tool`, `xila.conversation`, `xila.agent_message`, `xila.agent_log` | the agent | see section 11.4 |
 
 Building a stack means inserting rows in these tables. `examples/addressbook.sql`
 builds a complete one in SQL; author mode (section 10) does the same from the
@@ -133,12 +135,16 @@ client.
   the column that holds the image of each row; the graphical client then draws
   each row as its icon, twice its size, over the text of the first column and
   that of the second ("12 cards"). The text client shows the rows.
+  `{"view": "talk", "who": "kind"}` asks for the rows to be shown as a
+  conversation; see section 11.7.
 - **Actions and keys.** An action or a key binding without a background is
   available on every screen. A key bound on a screen wins over the same key
-  bound everywhere. Keys are `F1` to `F24` and `Enter`. `{"for": "author"}` in
-  the `args` of an action keeps it, and its keys, for the members of
-  `xila_author`; `{"for": "editor"}` for those who may change the stack on
-  screen.
+  bound everywhere. Keys are `F1` to `F24` and `Enter`. `F3`, `F9`, `F11` and
+  `F12` mean the same on every screen: leave pgXila, call the agent, author
+  mode, go back. A stack cannot bind them. `{"for": "author"}` in the `args`
+  of an action keeps it, and its keys, for the members of `xila_author`;
+  `{"for": "editor"}` for those who may change the stack on screen; `{"for":
+  "admin"}` for the members of `xila_admin`.
 
 ## 3. Screen definition
 
@@ -350,6 +356,7 @@ The handlers:
 | `draw`, `save_drawing`, `set_colour`, `remove_colour` | What the drawing editor asks for; see section 10.8 |
 | `script` | Runs the script of what triggered the action; see section 9.4 |
 | `edit_script`, `test_script`, `save_script` | What the script editor asks for; see section 9.6 |
+| `agent`, `ask_agent`, `stop_agent`, `new_conversation`, `conversations`, `open_conversation`, `agent_journal`, `agent_settings`, `save_agent_settings` | The agent and its screens; see section 11.7 |
 
 The author handlers read the context and call the functions of section 10.3.
 On the author screens the key of the card is the subject of the dialog: the
@@ -368,6 +375,10 @@ call.
 
 Payloads carry identifiers only, never card contents, because any connected role
 may listen. A client that shows the affected card or stack reads it again.
+
+A conversation with the agent is the card of the stack `agent`: each new line
+of it is announced on `xila_card` like a change to any other card, with the
+identifier of the conversation as the key.
 
 ## 7. History
 
@@ -408,7 +419,9 @@ The desktop and the stack list are stacks shipped by the extension, with
   Choosing a row runs `open_stack`.
 
 The author screens are system stacks too: `new_stack`, `author`, `field`,
-`history`, `card_history` and `deleted_stacks`; see section 10.6.
+`history`, `card_history` and `deleted_stacks`; see section 10.6. So are the
+screens of the agent: `agent`, `conversations`, `agent_journal` and
+`agent_settings`; see section 11.7.
 
 The connection screen is the only screen built into the clients, because it is
 shown before any connection exists. The window in which a `confirm` effect asks
@@ -450,8 +463,9 @@ end
 
 - **Keys.** A script asks for keys with the table `keys`: the key, and the
   label shown in the key bar. On one screen a key belongs to one script only.
-  A key of a script wins over the same key bound to an action. `F3`, `F11` and
-  `F12` can never be taken: a script cannot keep anyone inside a stack.
+  A key of a script wins over the same key bound to an action. `F3`, `F9`,
+  `F11` and `F12` can never be taken: a script cannot keep anyone inside a
+  stack, nor away from the agent.
 - **Top level.** Outside a function, a script only defines things. Calling the
   database or the screen there is an error, so that checking a script never
   does anything.
@@ -589,10 +603,10 @@ are. The text client runs scripts but does not edit them.
 
 ## 10. Author mode
 
-Phase 2 is delivered in four steps: 2a, building a stack with forms, ownership
-and rewinding, in both clients; 2b, the visual editor of a background; 2c, the
-drawing editor; 2d, scripts. This section describes steps 2a, 2b and 2c, which
-are implemented.
+Phase 2 was delivered in four steps: 2a, building a stack with forms,
+ownership and rewinding, in both clients; 2b, the visual editor of a
+background; 2c, the drawing editor; 2d, scripts. This section describes steps
+2a, 2b and 2c; scripts are in section 9.
 
 ### 10.1 Ownership
 
@@ -652,7 +666,7 @@ tools in phase 3.
 | Function | What it does |
 |----------|--------------|
 | `xila.create_stack(title text, name text DEFAULT NULL, source regclass DEFAULT NULL)` | Creates a stack and returns its name, made from the title when not given. Without `source`: the schema, the table, an empty screen with its browsing buttons and keys. With `source`: a screen with one field per column of that table, which the caller must own |
-| `xila.set_stack(stack text, changes jsonb)` | Changes `title`, `card_title`, the template written at the top of each card, such as `{last_name}, {first_name}`, or `icon`, the identifier of an image drawn with the system colours |
+| `xila.set_stack(stack text, changes jsonb)` | Changes `title`, `card_title`, the template written at the top of each card, such as `{last_name}, {first_name}`, `icon`, the identifier of an image drawn with the system colours, or `agent`, whether the agent may read the cards (section 11.2) |
 | `xila.delete_stack(stack text)` | Removes the stack and its screens. The table and the cards are left in place; rewinding brings the stack back |
 | `xila.add_field(stack text, label text, type text DEFAULT 'text', name text DEFAULT NULL)` | Adds a field at the end and returns its name. `type` is `text`, `number`, `date`, `boolean` or `picture` (a column that refers to an image, shown by an `image` widget). Without `name`, an identifier is made from the label. On a stack that is not managed, the name is an existing column to show. The first field of a stack becomes the title of its cards |
 | `xila.set_field(stack text, field text, changes jsonb)` | Changes `label`, `name` (renames the column too) or `required` (`NOT NULL`; refused, with the number of cards concerned, while some cards have no value) |
@@ -679,7 +693,7 @@ Views, for the author screens and for anyone:
 
 | View | One row is |
 |------|-----------|
-| `xila.stack_info` | a user stack: `name`, `title`, `owner`, `managed`, `card_title` |
+| `xila.stack_info` | a user stack: `name`, `title`, `owner`, `managed`, `card_title`, `agent` |
 | `xila.field` | a field of a user stack: `id`, `stack`, `name`, `label`, `ord`, `type`, `required` |
 | `xila.own_table` | a table of the current role that a stack could be made from |
 | `xila.history_line` | a line of the history of a stack: `id`, `stack`, `at`, `actor`, `summary` |
@@ -745,7 +759,7 @@ the dialog, and what is typed on it goes to an action, never to the view:
 |--------|-----------|------------------|
 | My stacks | | For authors: `F6` New stack, `F10` Deleted stacks, `F11` Author mode on the selected stack |
 | New stack | `F6` on My stacks | Title, name (made from the title when left empty), start from an empty stack or from one of the caller's tables. `Enter` creates it and opens author mode: the visual editor in the window, the author dialog in the terminal |
-| Author mode | `F11` on a stack one may change, or on My stacks, in the text client; `F4` in the visual editor | Title, card title, the list of fields with label, name, type and required. `Enter` saves, or opens the selected field. `F6` New field, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
+| Author mode | `F11` on a stack one may change, or on My stacks, in the text client; `F4` in the visual editor | Title, card title, whether the agent may read the cards, the list of fields with label, name, type and required. `Enter` saves, or opens the selected field. `F6` New field, `F7` Move up, `F8` Move down, `F10` History, `F11` Browse the stack, button Delete stack |
 | Field | `F6` or `Enter` in author mode | Label, name, type (text, number, date, yes or no, picture), required. `Enter` saves. Button Remove, with a confirmation that says how many cards have a value |
 | History | `F10` in author mode | The changes of the stack, newest first: when, who, what. `F6` Rewind the screen from the selected line on, `F7` or `Enter` Rewind the whole stack |
 | History of the cards | `F10` on a stack | The changes made to its cards. `F6` or `Enter` rewinds the card of the selected line, from that change on |
@@ -754,7 +768,7 @@ the dialog, and what is typed on it goes to an action, never to the view:
 `Escape` leaves a screen like `F12`, and gives up a question.
 
 Left for later steps: creating a stack from a description with the agent
-(phase 3); sharing the cards of a stack from the client.
+(step 3b); sharing the cards of a stack from the client.
 
 ### 10.7 The visual editor
 
@@ -918,10 +932,262 @@ An image is at most 480 by 300 pixels.
 Left for later: importing an image from a file, purging unused images, the
 Agent button.
 
-## 11. Not covered yet
+## 11. The agent
+
+Phase 3 is delivered in three steps: 3a, talking with the agent from a screen
+and letting it read; 3b, the agent proposes changes that the user applies or
+refuses; 3c, memory, with pgvector. This section describes step 3a, which is
+implemented.
+
+| Decision | Choice |
+|----------|--------|
+| Where the agent runs | In a background worker, never in the backend of a user |
+| What it can do in 3a | Read, and answer. It changes nothing: writing comes in 3b, as proposals |
+| What it may read | The cards of the stacks left open to it, and never more than the person it talks with may read |
+| A stack and the agent | Open by default; whoever may edit the stack closes it. Being open is a `GRANT` to the role `xila_agent` |
+| Its tools | SQL functions, listed in a table, run under the role `xila_agent` |
+| The model | Any endpoint that speaks the OpenAI chat API (OpenRouter, LM Studio…) |
+| Its settings | Address and model in a table, changed by an administrator. The token is never in the database |
+| Its key | `F9`, on every screen. A stack cannot take `F9` for itself |
+
+### 11.1 What happens when someone asks
+
+1. The user writes on the agent screen and presses `Enter`. The server stores
+   the line in the conversation and marks the conversation as waiting. This is
+   all the backend of the user does: it returns at once.
+2. The worker is woken when that transaction is committed. It sends the
+   conversation to the model, with the list of tools. The call is made on a
+   thread of the worker, so that the worker stays able to stop at any moment;
+   a call may last 120 seconds.
+3. When the model asks for a tool, the worker runs the SQL function of that
+   tool, adds the result to the conversation, and calls the model again. A
+   question gets at most 8 calls to the model.
+4. When the model answers in words, the worker stores the answer, marks the
+   conversation as idle and notifies the clients, which read the screen again.
+
+Each step is stored as soon as it is done: the user sees "Looked for “ada” in
+Address book: 2 cards." appear while the agent works. The conversation is the
+whole state of the work: a conversation that was waiting when the server
+stopped is taken up again when it starts.
+
+The worker answers up to 4 conversations at a time; the others wait their
+turn. A conversation takes one question at a time, and `F5` gives up the one
+being answered: whatever comes back for it afterwards is dropped. What the
+worker does in the database for one step is limited to 15 seconds, so that a
+tool that reads a huge table does not keep every conversation waiting.
+
+When the model cannot be reached, refuses the token, or answers nonsense, the
+conversation gets a line that says so ("The model refused the token (HTTP
+401). An administrator can check the agent settings."), and nothing else
+happens. The token is never written in a message, in the journal or in the log
+of the server.
+
+### 11.2 Roles and rights
+
+| Role | Login | Purpose |
+|------|-------|---------|
+| `xila_agent` | no | The role of the worker. It owns nothing, cannot create anything, and is not a member of `xila_user` |
+| `xila_admin` | no | Group role, member of `xila_author`. May change the agent settings and read the whole journal |
+
+`xila_agent` may read the definitions of the stacks, read and write the tables
+of this section, run the tool functions, and read the cards of the stacks that
+are open to it. It can write nowhere else.
+
+**A stack is open or closed to the agent.** `xila.stack.agent_reads` is true
+by default. Setting it grants or revokes `SELECT` on the table of the stack to
+`xila_agent` (and `USAGE` on its schema): the setting is a real privilege, not
+a flag that a function is trusted to check. It is changed by whoever may edit
+the stack, with `xila.set_stack(stack, '{"agent": false}')` or the check box
+"The agent may read the cards" of the author dialog, and it is recorded in the
+history like the title. Deleting a stack takes the privilege away from the
+table it leaves behind.
+
+**Never more than the person.** The worker reads for someone. Every tool
+receives the role of the person who asked, and refuses a stack that this
+person could not open: for the agent, such a stack does not exist. When the
+table of a stack uses row-level security, the agent reads it only for those
+who may edit the stack, as for history (section 10.5), so that it never shows
+a row that the table hides.
+
+**What leaves the server.** What the agent reads is sent to the model: the
+question, the titles and the fields of the stacks the person may open, and the
+cards the tools returned. Of a closed stack, only the name and the title are
+sent, so that the agent can say that it is closed. The address must be
+`https://`; plain `http://` is accepted for the machine itself only
+(`localhost`, `127.0.0.1`, `[::1]`, `host.docker.internal`), which is what a
+local LM Studio needs. The worker follows no redirection.
+
+**What a card can make it do.** The model reads cards as text, and a card may
+hold text written to steer it. In 3a the worst such a card can do is to make
+the answer wrong: the agent has no tool that writes, sends or fetches
+anything.
+
+### 11.3 Settings
+
+`xila.agent_setting` has one row:
+
+| Column | Content |
+|--------|---------|
+| `address` | Base address of the API, such as `https://openrouter.ai/api/v1`; an address that ends with `/chat/completions` is used as it is |
+| `model` | Name of the model, as the endpoint knows it |
+| `token_variable` | **Name** of the environment variable of the server that holds the token, such as `OPENROUTER_API_KEY`; empty for an endpoint that needs none. Upper-case letters, digits and `_`; a variable of PostgreSQL itself (`PGPASSWORD`, `PG_COLOR`, `POSTGRES_PASSWORD`…) is refused |
+| `options` | JSON object merged into each request, for what an endpoint or a model needs (`{"temperature": 0.2}`). It cannot replace the model, the conversation or the tools |
+| `instructions` | Text added to what the agent is told about itself: the house rules of this instance |
+
+`xila.set_agent(changes jsonb)` changes them; only a member of `xila_admin`
+may call it. Whoever chooses the address chooses where the token is sent:
+this is why the settings are not open to every author.
+
+The token itself is read by the worker from its environment when it calls the
+model. With Docker Compose it comes from `.env.local`. It is in no table, so
+in no backup, and no SQL function returns it.
+
+`xila.agent_info` is a view for everyone: `model`, `host` (the host of the
+address, so that people know where their questions go), `ready`.
+
+`scripts/set-agent.sh <address> <model> [token-variable]` sets the three on
+the development server, and `scripts/create-user.sh ada --admin` creates an
+administrator.
+
+### 11.4 Data model
+
+| Table | One row is | Main columns |
+|-------|-----------|--------------|
+| `xila.agent_setting` | the settings | see 11.3 |
+| `xila.agent_tool` | a tool | `name`, `label` (what people read), `description` and `parameters` (what the model reads: a text and a JSON schema), `function`, `ord` |
+| `xila.conversation` | a conversation | `id`, `owner`, `title` (the first question), `state` (`idle` or `waiting`), `stack`, `card` (what the owner was looking at when calling the agent), `started_at`, `changed_at` |
+| `xila.agent_message` | a line of a conversation | `id`, `conversation_id`, `at`, `kind` (`user`, `agent`, `tool`, `error`), `text` (what people read), `payload` (what the model is sent back: its own message, or the result of the tool) |
+| `xila.agent_log` | a journal entry | `id`, `at`, `conversation_id`, `role` (for whom), `event` (`model`, `tool`, `refused`, `failed`), `tool`, `summary`, `detail`, `ms`, `tokens_in`, `tokens_out` |
+
+Row-level security: a conversation and its lines are read by its owner alone
+(and by the worker). A user adds lines of kind `user` to their own
+conversations, and nothing else. The journal is written by the worker only;
+people read their own entries, administrators all of them. Nobody can change
+or delete a journal entry.
+
+The journal has one entry for each call to the model (how long, how many
+tokens) and one for each tool run (which, its arguments, what it found in a
+sentence, or why it was refused). It does not copy the cards.
+
+The settings, the conversations and the journal are part of a backup.
+
+### 11.5 Tools
+
+A tool is a SQL function `f(as_role name, arguments jsonb) RETURNS jsonb` and a
+row of `xila.agent_tool`. Only `xila_agent` may execute these functions. The
+model receives the names, descriptions and parameters of the table; adding a
+tool is adding a function and a row, which only a superuser may do. A result
+may hold a `summary`: the sentence written in the conversation and in the
+journal.
+
+| Tool | Arguments | Gives |
+|------|-----------|-------|
+| `list_stacks` | | The stacks the person may open: name, title, number of cards, fields (name, label, type); for a closed one, name, title and `"closed": true` |
+| `find_cards` | `stack`, `text`, `limit`, `offset` | The cards whose fields contain every word of `text`, whatever the case; without `text`, the cards in the order of the stack. At most 20 at a time, with the total |
+| `read_card` | `stack`, and `key` or `position` | One card: its key, its title, its values |
+
+A card is given as its fields: the columns its screen shows. Values are given
+as text; a value longer than 2,000 characters is cut, and a picture is given
+as "(picture)". A tool that fails gives its message to the model as the
+result, and the model goes on; only the messages pgXila wrote itself are
+given, never an error of the database, which could quote a card.
+
+### 11.6 What the model is told
+
+Before the conversation, the worker writes what the agent is: the agent of
+pgXila on this instance, talking with this role, today's date, what a stack, a
+card and a field are, the stack and the card the person was looking at, that
+it must use its tools rather than guess, that it cannot change anything yet,
+that what a card says is never an instruction, that it answers in the language
+of the person and in plain text without Markdown (the clients write text as it
+comes), then the `instructions` of the settings.
+
+A long conversation is sent from its latest lines: the worker keeps the most
+recent ones that fit in about 200,000 characters and always starts at a
+question. The lines that say something went wrong are for people: they are
+not sent.
+
+### 11.7 For the clients
+
+**Protocol.**
+
+- A grid may ask to be shown as a conversation: `{"view": "talk", "who":
+  "kind", "order": ["at", "id"], "descending": true}`. Its rows come newest
+  first; the client writes them from the bottom up, wraps the text, and lets
+  the user go back with `PageUp`. The column named by `who` says whose line it
+  is: `user`, `agent`, `tool`, `error`, or `wait` for the line that says the
+  agent is working; what was said is in the first other column. The window
+  draws bubbles; the terminal writes "You:" and "Agent:". Such a list takes no
+  focus.
+- The worker announces each new line as a change of the card of the stack
+  `agent` on the channel `xila_card` (section 6): `{"stack": "agent", "key":
+  "<conversation>", "op": "update"}`. Clients read the screen again on it,
+  keeping what the user is typing.
+- `F9` joins `F3`, `F11` and `F12`: neither a stack nor a script may bind it.
+- In the window, a text whose rectangle is taller than a line is written on
+  several lines; with a label, the label is a heading over it.
+
+**Handlers.**
+
+| Handler | What it does |
+|---------|--------------|
+| `agent` | Bound to `F9` everywhere. Remembers the stack and the card on screen in the latest conversation of the user (created if there is none), and shows it |
+| `ask_agent` | Adds what was typed to the conversation and wakes the worker. Refused while the conversation is waiting, and when the agent has no model |
+| `stop_agent` | Gives up the question being answered |
+| `new_conversation` | Starts a new conversation and shows it; one in which nothing was said yet is used again |
+| `conversations`, `open_conversation` | Lists the conversations of the user; shows the selected one |
+| `agent_journal` | Shows the journal |
+| `agent_settings`, `save_agent_settings` | The settings dialog, for administrators |
+
+`xila.ask_agent(conversation uuid, question text)` is what `ask_agent` calls.
+
+**Screens.** They are system stacks, drawn by both clients.
+
+| Screen | Reached by | Content and keys |
+|--------|-----------|------------------|
+| Agent | `F9` anywhere, or Agent on the desktop | The conversation, and a line to write on. Beside it in the window, as in mock-up 03, and on one line in the terminal: the model and where it is, the tools, the guard rails, and what the agent did today for this user. `Enter` Send, `F5` Stop, `F6` New conversation, `F10` Conversations, `PageUp` and `PageDown` |
+| Conversations | `F10` on Agent | The conversations of the user, newest first: title, date, number of lines. `Enter` opens one. `F6` New, `F7` Journal, and `F4` Settings for an administrator |
+| Journal | `F7` on Conversations | When, for whom, what: "Looked for “ada” in Address book: 2 cards.", "Model: 1.1 s, 354 tokens" |
+| Agent settings | `F4` on Conversations | Address, model, token variable, instructions. `Enter` saves |
+
+### 11.8 Where the code is
+
+Everything the agent decides is decided in SQL, in `extension/sql/agent.sql`:
+what to send (`xila.agent_request`), what an answer means and which tool to
+run for whom (`xila.agent_answer`). The worker only carries a request to the
+model and its answer back; `extension/src/workers/` holds it.
+
+A small launcher is the only worker registered when the server starts: it
+waits until the database and the role `xila_agent` exist, starts the agent
+worker, and starts it again if it dies. The `link` worker of phase 4 will be
+one more worker for the launcher to start. The database is named by the
+server parameter `pgxila.database` (`pgxila` by default).
+
+The extension has one dependency for this, `ureq` with `rustls`, for HTTPS.
+The tests never call a real model: the integration tests run a small fake
+model and check what the worker sends to it.
+
+### 11.9 Not in step 3a
+
+- Changing anything: proposals, with Apply and Refuse, are step 3b. The tools
+  that write will be the author functions of section 10.3 and `xila.save_card`,
+  run by the session of the user who applies them, and recorded in the history
+  with the origin `agent`.
+- Memory across conversations and semantic search, with pgvector: step 3c. It
+  needs an endpoint that computes embeddings.
+- Answers that appear word by word; pictures sent to the model; an Agent line
+  on the screen of a stack, as in the text mock-up; waking the agent on a
+  database event or on a schedule; a limit on how much each person may ask.
+- Opening or closing a stack to the agent from the visual editor: it is done
+  from the author dialog, which the editor reaches with `F4`.
+- More than the latest 100 lines of a conversation on screen; the older ones
+  are still sent to the model.
+
+## 12. Not covered yet
 
 - Scripts on a field, on one card or on a stack; timers, and scripts that
   answer to a change in the database or to a message: later steps.
-- Agent API, audit log, validation of proposed actions: phase 3.
+- Changes proposed by the agent and applied by the user: step 3b. Memory of
+  the agent: step 3c.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.

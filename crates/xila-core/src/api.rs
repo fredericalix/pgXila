@@ -169,6 +169,14 @@ impl Widget {
         self.layer.as_deref() == Some("card")
     }
 
+    /// For a list shown as a conversation: the column that says whose line
+    /// each row is. None for any other widget.
+    pub fn talk(&self) -> Option<&str> {
+        let asked = self.props.get("view").and_then(|view| view.as_str()) == Some("talk");
+        (self.kind == WidgetKind::Grid && asked)
+            .then(|| self.props.get("who").and_then(|who| who.as_str()).unwrap_or("who"))
+    }
+
     /// The values this field is limited to, if it is: those of its
     /// properties, or yes and no for a boolean. Empty for a free field.
     pub fn choices(&self) -> Vec<Choice> {

@@ -731,7 +731,7 @@ fn kind_of(part: &Part, widget: Option<&Widget>) -> String {
         Part::Text | Part::Info { .. } | Part::Banner { .. } => "Text".to_owned(),
         Part::Button { .. } => "Button".to_owned(),
         Part::Picture => "Picture".to_owned(),
-        Part::Grid => "List".to_owned(),
+        Part::Grid | Part::Talk => "List".to_owned(),
     }
 }
 
@@ -1642,7 +1642,7 @@ fn draw_item<A: Api>(
             }
             frame.outline(area, slot::INK);
         }
-        Part::Grid => {
+        Part::Grid | Part::Talk => {
             frame.fill(area, slot::WHITE);
             frame.outline(area, slot::INK);
         }

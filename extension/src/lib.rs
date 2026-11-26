@@ -50,7 +50,8 @@ extension_sql_file!(
     name = "script",
     requires = ["author", xila::check_script, xila::run_script]
 );
-extension_sql_file!("../sql/actions.sql", name = "actions", requires = ["script"]);
+extension_sql_file!("../sql/agent.sql", name = "agent", requires = ["script", xila::wake_agent]);
+extension_sql_file!("../sql/actions.sql", name = "actions", requires = ["agent"]);
 extension_sql_file!("../sql/system_stacks.sql", name = "system_stacks", requires = ["actions"]);
 extension_sql_file!("../sql/triggers.sql", name = "triggers", requires = ["system_stacks"]);
 
@@ -62,6 +63,13 @@ mod xila {
     #[pg_extern(immutable, parallel_safe)]
     pub fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
+    }
+
+    /// Wakes the agent worker once the current transaction is committed.
+    /// The worker would find the question anyway, a few seconds later.
+    #[pg_extern]
+    pub fn wake_agent() {
+        crate::workers::agent::wake_at_commit();
     }
 
     /// Reads a script without running its functions, and says what it
@@ -192,7 +200,7 @@ mod tests {
     #[pg_test]
     fn hello_names_the_home_stack() {
         let hello = json("SELECT xila.hello()");
-        assert_eq!(hello["api"], 3);
+        assert_eq!(hello["api"], 4);
         assert_eq!(hello["home"], "desktop");
     }
 
@@ -256,6 +264,7 @@ mod tests {
             keys,
             serde_json::json!([
                 { "key": "F3", "label": "Quit", "action": "quit" },
+                { "key": "F9", "label": "Agent", "action": "agent" },
                 { "key": "F12", "label": "Back", "action": "back" }
             ])
         );
@@ -608,6 +617,7 @@ mod tests {
                 "F6=New",
                 "F7=Prev.",
                 "F8=Next",
+                "F9=Agent",
                 "F10=History",
                 "F11=Author",
                 "F12=Back",
@@ -1068,10 +1078,13 @@ mod tests {
         // The list of stacks offers authors what it hides from the others.
         assert_eq!(
             keys_of(&json("SELECT xila.open_stack('stacks')")),
-            ["F3=Quit", "F6=New stack", "F10=Deleted", "F11=Author", "F12=Back"]
+            ["F3=Quit", "F6=New stack", "F9=Agent", "F10=Deleted", "F11=Author", "F12=Back"]
         );
         become_role("dan");
-        assert_eq!(keys_of(&json("SELECT xila.open_stack('stacks')")), ["F3=Quit", "F12=Back"]);
+        assert_eq!(
+            keys_of(&json("SELECT xila.open_stack('stacks')")),
+            ["F3=Quit", "F9=Agent", "F12=Back"]
+        );
         let (state, _) = error_of("SELECT xila.act('stacks', 'new_stack')");
         assert_eq!(state, "XL004");
 

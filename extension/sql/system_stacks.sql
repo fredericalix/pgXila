@@ -291,6 +291,167 @@ VALUES
     (xila.background_id('deleted_stacks'), 'restore', 'button', 20, 'Restore', NULL,
      xila.action_id('deleted_stacks', 'restore'), '{}');
 
+-- ---------------------------------------------------------------------------
+-- The agent
+-- ---------------------------------------------------------------------------
+-- See docs/api.md, section 11. F9 calls the agent from any screen; like the
+-- keys to leave a screen, it means the same everywhere.
+INSERT INTO xila.action (name, label, handler) VALUES ('agent', 'Agent', 'agent');
+INSERT INTO xila.key_binding (key, action_id) VALUES ('F9', xila.action_id(NULL, 'agent'));
+
+INSERT INTO xila.widget (background_id, name, kind, ord, label, action_id)
+VALUES (xila.background_id('desktop'), 'agent', 'button', 60, 'Agent',
+        xila.action_id(NULL, 'agent'));
+
+-- The conversation with the agent. The card is one conversation of the
+-- current role; its lines are a list shown as a conversation.
+INSERT INTO xila.stack (name, title, kind) VALUES ('agent', 'Agent', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'agent_talk', 'id' FROM xila.stack WHERE name = 'agent';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('agent'), 'send', 'Send',          'ask_agent',        '{}'),
+    (xila.background_id('agent'), 'stop', 'Stop',          'stop_agent',       '{}'),
+    (xila.background_id('agent'), 'new',  'New',           'new_conversation', '{}'),
+    (xila.background_id('agent'), 'list', 'Conversations', 'conversations',    '{}');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+SELECT xila.background_id('agent'), k.key, xila.action_id('agent', k.action)
+FROM (VALUES ('Enter', 'send'), ('F5', 'stop'), ('F6', 'new'), ('F10', 'list')) AS k(key, action);
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('agent'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "{title}", "style": "title"}'),
+    (xila.background_id('agent'), 'about', 'text', 20, NULL, NULL, NULL,
+     '{"template": "{about}", "style": "subtitle"}'),
+    (xila.background_id('agent'), 'talk', 'grid', 30, NULL, NULL, NULL,
+     '{"schema": "xila", "table": "agent_line", "key": "id",
+       "view": "talk", "who": "kind",
+       "where": {"conversation": "id"}, "order": ["at", "id"], "descending": true,
+       "columns": [
+           {"column": "kind", "label": "Who"},
+           {"column": "text", "label": "Said"}
+       ]}'),
+    (xila.background_id('agent'), 'ask', 'field', 40, 'Ask', 'ask', NULL, '{"max_length": 2000}'),
+    (xila.background_id('agent'), 'send', 'button', 50, 'Send', NULL,
+     xila.action_id('agent', 'send'), '{}'),
+    (xila.background_id('agent'), 'model', 'text', 60, 'Model', NULL, NULL,
+     '{"template": "{model}"}'),
+    (xila.background_id('agent'), 'host', 'text', 70, 'Where', NULL, NULL,
+     '{"template": "{host}"}'),
+    (xila.background_id('agent'), 'tools', 'text', 80, 'Tools', NULL, NULL,
+     '{"template": "{tools}"}'),
+    (xila.background_id('agent'), 'guard', 'text', 90, 'Guard rails', NULL, NULL,
+     '{"template": "Reads only, restricted role, journal"}'),
+    (xila.background_id('agent'), 'today', 'text', 100, 'Today', NULL, NULL,
+     '{"template": "{today}"}'),
+    (xila.background_id('agent'), 'status', 'text', 110, NULL, NULL, NULL,
+     '{"template": "Model: {model}  -  Today: {today}"}');
+
+-- On the text screen: the conversation, the line to write on, and one line
+-- that says which model answers. The window shows the same on its side, one
+-- text per line.
+INSERT INTO xila.layout (widget_id, renderer, x, y, w, h)
+SELECT w.id, 'text', v.x, v.y, v.w, v.h
+FROM (VALUES ('talk', 1, 3, 78, 14), ('ask', 20, 18, 59, 1), ('status', 1, 20, 78, 1))
+     AS v(name, x, y, w, h)
+JOIN xila.widget w ON w.background_id = xila.background_id('agent') AND w.name = v.name;
+INSERT INTO xila.layout (widget_id, renderer, style)
+SELECT w.id, 'text', '{"hidden": true}'::jsonb
+FROM xila.widget w
+WHERE w.background_id = xila.background_id('agent')
+  AND w.name IN ('model', 'host', 'tools', 'guard', 'today')
+UNION ALL
+SELECT w.id, 'graphic', '{"hidden": true}'::jsonb
+FROM xila.widget w
+WHERE w.background_id = xila.background_id('agent') AND w.name IN ('status', 'heading');
+
+-- In the window, as in mock-up 03: the conversation on the left with the line
+-- to write on under it, and what there is to know about the agent on the right.
+INSERT INTO xila.layout (widget_id, renderer, x, y, w, h, style)
+SELECT w.id, 'graphic', v.x, v.y, v.w, v.h,
+       CASE WHEN v.name = 'send' THEN '{"variant": "primary"}'::jsonb ELSE '{}' END
+FROM (VALUES ('talk',    7,   7, 304, 196),
+             ('ask',    34, 211, 222,  14),
+             ('send',  262, 210,  49,  15),
+             ('model', 322,   8, 127,  34),
+             ('host',  322,  46, 127,  23),
+             ('tools', 322,  73, 127,  45),
+             ('guard', 322, 122, 127,  45),
+             ('today', 322, 171, 127,  23),
+             ('about', 322, 204, 127,  23)) AS v(name, x, y, w, h)
+JOIN xila.widget w ON w.background_id = xila.background_id('agent') AND w.name = v.name;
+
+-- The conversations of the current role. The journal and the settings of
+-- the agent are reached from here.
+INSERT INTO xila.stack (name, title, kind) VALUES ('conversations', 'Conversations', 'system');
+INSERT INTO xila.background (stack_id) SELECT id FROM xila.stack WHERE name = 'conversations';
+INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
+    (xila.background_id('conversations'), 'open',     'Open',     'open_conversation', '{}'),
+    (xila.background_id('conversations'), 'new',      'New',      'new_conversation',  '{}'),
+    (xila.background_id('conversations'), 'journal',  'Journal',  'agent_journal',     '{}'),
+    (xila.background_id('conversations'), 'settings', 'Settings', 'agent_settings',
+     '{"for": "admin"}');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+SELECT xila.background_id('conversations'), k.key, xila.action_id('conversations', k.action)
+FROM (VALUES ('F4', 'settings'), ('F6', 'new'), ('F7', 'journal')) AS k(key, action);
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('conversations'), 'list', 'grid', 10, NULL, NULL,
+     xila.action_id('conversations', 'open'),
+     '{"schema": "xila", "table": "conversation_line", "key": "id",
+       "order": ["changed_at", "id"], "descending": true,
+       "columns": [
+           {"column": "title", "label": "Conversation"},
+           {"column": "at", "label": "Last line"},
+           {"column": "lines", "label": "Lines", "align": "right"}
+       ]}'),
+    (xila.background_id('conversations'), 'open', 'button', 20, 'Open', NULL,
+     xila.action_id('conversations', 'open'), '{}');
+
+-- The journal of the agent: one's own entries, or all of them for an
+-- administrator.
+INSERT INTO xila.stack (name, title, kind) VALUES ('agent_journal', 'Journal of the agent', 'system');
+INSERT INTO xila.background (stack_id) SELECT id FROM xila.stack WHERE name = 'agent_journal';
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('agent_journal'), 'list', 'grid', 10, NULL, NULL, NULL,
+     '{"schema": "xila", "table": "agent_journal_line", "key": "id",
+       "order": ["moment", "id"], "descending": true,
+       "columns": [
+           {"column": "at", "label": "When"},
+           {"column": "role", "label": "For"},
+           {"column": "summary", "label": "What"}
+       ]}');
+
+-- The settings of the agent, for administrators.
+INSERT INTO xila.stack (name, title, kind) VALUES ('agent_settings', 'Agent settings', 'system');
+INSERT INTO xila.background (stack_id, source_schema, source_table, key_column)
+SELECT id, 'xila', 'agent_setting_form', 'id' FROM xila.stack WHERE name = 'agent_settings';
+INSERT INTO xila.action (background_id, name, label, handler)
+VALUES (xila.background_id('agent_settings'), 'save', 'Save', 'save_agent_settings');
+INSERT INTO xila.key_binding (background_id, key, action_id)
+VALUES (xila.background_id('agent_settings'), 'Enter', xila.action_id('agent_settings', 'save'));
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, action_id, props)
+VALUES
+    (xila.background_id('agent_settings'), 'heading', 'text', 10, NULL, NULL, NULL,
+     '{"template": "Agent settings", "style": "title"}'),
+    (xila.background_id('agent_settings'), 'hint', 'text', 20, NULL, NULL, NULL,
+     '{"template": "The token stays on the server: only the name of its variable is kept here.", "style": "subtitle"}'),
+    (xila.background_id('agent_settings'), 'address', 'field', 30, 'Address', 'address', NULL, '{}'),
+    (xila.background_id('agent_settings'), 'model', 'field', 40, 'Model', 'model', NULL, '{}'),
+    (xila.background_id('agent_settings'), 'token_variable', 'field', 50, 'Token variable',
+     'token_variable', NULL, '{}'),
+    (xila.background_id('agent_settings'), 'instructions', 'field', 60, 'Instructions',
+     'instructions', NULL, '{}'),
+    (xila.background_id('agent_settings'), 'save', 'button', 70, 'Save', NULL,
+     xila.action_id('agent_settings', 'save'), '{}'),
+    (xila.background_id('agent_settings'), 'cancel', 'button', 80, 'Cancel', NULL,
+     xila.action_id(NULL, 'back'), '{}');
+
+-- In author mode: whether the agent may read the cards of the stack.
+INSERT INTO xila.widget (background_id, name, kind, ord, label, bound_column, props)
+VALUES (xila.background_id('author'), 'agent', 'field', 45, 'The agent may read the cards',
+        'agent', '{}');
+
 -- In text mode the header of the screen already carries its title.
 INSERT INTO xila.layout (widget_id, renderer, style)
 SELECT w.id, 'text', '{"hidden": true}'
@@ -305,4 +466,5 @@ FROM xila.widget w
 JOIN xila.background b ON b.id = w.background_id
 JOIN xila.stack s ON s.id = b.stack_id
 WHERE (s.name, w.name) IN (('new_stack', 'create'), ('author', 'new_field'), ('field', 'save'),
-                           ('card_history', 'rewind'), ('deleted_stacks', 'restore'));
+                           ('card_history', 'rewind'), ('deleted_stacks', 'restore'),
+                           ('conversations', 'open'), ('agent_settings', 'save'));

@@ -18,8 +18,10 @@ services:
       dockerfile: docker/Dockerfile
       target: runtime
     image: pgxila/db:dev
-    # The agent settings (endpoint URL and token) come from .env.local, which
-    # is never committed. The file is optional: the server runs without it.
+    # The token of the model the agent calls comes from .env.local, which is
+    # never committed. The agent is told the name of the variable, not its
+    # value (scripts/set-agent.sh). The file is optional: the server runs
+    # without it.
     env_file:
       - path: .env.local
         required: false
@@ -55,6 +57,12 @@ services:
     environment:
       POSTGRES_DB: pgxila
       POSTGRES_INITDB_ARGS: --auth-local=peer --auth-host=scram-sha-256
+      # Not a secret: the token the tests expect the agent worker to send to
+      # their fake model.
+      PGXILA_TEST_MODEL_TOKEN: test-token-for-the-fake-model
+    # The fake model of the tests runs on the host, next to the tests.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:${PGXILA_SCRATCH_PORT:-5420}:5432"
     volumes:

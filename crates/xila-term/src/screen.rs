@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use xila_core::api::{Api, Widget};
 use xila_core::session::{GridState, Question, Session, View};
+use xila_core::talk::{self, Speaker};
 use xila_core::text_layout::{
     self, leader, Item, TextLayout, COLUMNS, KEYS_ROW, LABEL_WIDTH, MESSAGE_ROW, PROMPT, ROWS,
 };
@@ -30,6 +31,8 @@ pub struct Ui {
     option: String,
     /// What the cursor position refers to: stack, card and widget.
     anchor: Option<(String, Option<String>, String)>,
+    /// How many rows of a conversation the user went back, from its end.
+    talk_back: usize,
 }
 
 /// The 80 by 24 area the screen is drawn in, centred in the terminal, or
@@ -195,6 +198,25 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
                 session.say("This key is not active on this screen.");
             }
         }
+        // A conversation is read a screen at a time.
+        Key::PageUp | Key::PageDown => {
+            let view = session.view();
+            let talk = layout.items.iter().find_map(|item| match item {
+                Item::Grid { widget: name, w, h, .. } => {
+                    let definition = widget(view, name).filter(|d| d.talk().is_some())?;
+                    Some((talk_rows(definition, view.grids.get(name)?, *w).len(), usize::from(*h)))
+                }
+                _ => None,
+            });
+            if let Some((rows, height)) = talk {
+                let step = height.saturating_sub(1).max(1);
+                ui.talk_back = if key == Key::PageUp {
+                    (ui.talk_back + step).min(rows.saturating_sub(height))
+                } else {
+                    ui.talk_back.saturating_sub(step)
+                };
+            }
+        }
         Key::Up if on_grid => session.select_row(focus.as_deref().unwrap_or_default(), -1),
         Key::Down if on_grid => session.select_row(focus.as_deref().unwrap_or_default(), 1),
         Key::Tab | Key::Down => move_focus(session, &layout, &focus, 1),
@@ -212,6 +234,8 @@ pub fn handle<A: Api>(session: &mut Session<A>, ui: &mut Ui, key: Key) {
             // In a field, Enter is a key like any other; when the screen
             // gives it no meaning, it moves on to the next field.
             _ => {
+                // What is sent is answered at the end of the conversation.
+                ui.talk_back = 0;
                 if !session.press("Enter") {
                     move_focus(session, &layout, &focus, 1);
                 }
@@ -355,7 +379,12 @@ pub fn draw<A: Api>(
             Item::Grid { widget: name, x, y, w, h } => {
                 if let (Some(definition), Some(state)) = (widget(view, name), view.grids.get(name))
                 {
-                    draw_grid(buffer, area, &theme, definition, state, (*x, *y, *w, *h));
+                    if definition.talk().is_some() {
+                        let place = (*x, *y, *w, *h);
+                        draw_talk(buffer, area, &theme, definition, state, place, ui.talk_back);
+                    } else {
+                        draw_grid(buffer, area, &theme, definition, state, (*x, *y, *w, *h));
+                    }
                 }
             }
         }
@@ -380,6 +409,7 @@ pub fn draw<A: Api>(
         Some(PROMPT) => "Type the number of an option, then press Enter.",
         Some(name) if is_grid(&layout, name) => "Choose a row with the arrows, then press Enter.",
         Some(name) if is_choice(view, name) => "Press the space bar to change this value.",
+        _ if talk_overflows(view, &layout) => "PgUp and PgDn go through the conversation.",
         _ => "",
     };
     match session.message() {
@@ -459,6 +489,80 @@ pub fn draw_keys<'a>(
         );
         x += width + 2;
     }
+}
+
+/// The rows of a conversation as the terminal writes them, oldest first:
+/// who speaks, then what is said, wrapped under itself.
+fn talk_rows(definition: &Widget, state: &GridState, width: u16) -> Vec<(Speaker, String)> {
+    let mut rows = Vec::new();
+    for line in talk::lines(definition, &state.page) {
+        let lead = match line.speaker {
+            Speaker::User => "You: ",
+            Speaker::Agent => "Agent: ",
+            Speaker::Tool => "  - ",
+            Speaker::Error => "  ! ",
+            Speaker::Wait => "  ",
+        };
+        // A blank row before each question sets the exchanges apart.
+        if line.speaker == Speaker::User && !rows.is_empty() {
+            rows.push((Speaker::User, String::new()));
+        }
+        let room = usize::from(width).saturating_sub(lead.len()).max(1);
+        let cut = talk::wrap(line.text, room, |text| text.chars().count());
+        for (index, piece) in cut.into_iter().enumerate() {
+            let margin = if index == 0 { lead.to_owned() } else { " ".repeat(lead.len()) };
+            rows.push((line.speaker, format!("{margin}{piece}")));
+        }
+    }
+    rows
+}
+
+/// A list shown as a conversation: the latest rows, at the bottom of its
+/// area. `back` is how many rows the user went back.
+fn draw_talk(
+    buffer: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    definition: &Widget,
+    state: &GridState,
+    (x, y, w, h): (u16, u16, u16, u16),
+    back: usize,
+) {
+    let rows = talk_rows(definition, state, w);
+    if rows.is_empty() {
+        let empty = "Ask the agent something, then press Enter.";
+        put(buffer, area, x, y + h.saturating_sub(1), empty, w, theme.of(theme.label));
+        return;
+    }
+    let height = usize::from(h);
+    let back = back.min(rows.len().saturating_sub(height));
+    let end = rows.len() - back;
+    let start = end.saturating_sub(height);
+    // The conversation sits on the bottom of its area, like a chat.
+    let top = y + (height - (end - start)) as u16;
+    for (index, (speaker, text)) in rows[start..end].iter().enumerate() {
+        let style = match speaker {
+            Speaker::User => theme.of(theme.value),
+            Speaker::Agent => theme.base(),
+            Speaker::Tool | Speaker::Wait => theme.of(theme.label),
+            Speaker::Error => theme.of(theme.message),
+        };
+        put(buffer, area, x, top + index as u16, text, w, style);
+    }
+}
+
+/// True when a conversation on screen has more rows than its area shows.
+fn talk_overflows(view: &View, layout: &TextLayout) -> bool {
+    layout.items.iter().any(|item| match item {
+        Item::Grid { widget: name, w, h, .. } => widget(view, name)
+            .filter(|definition| definition.talk().is_some())
+            .is_some_and(|definition| {
+                view.grids
+                    .get(name)
+                    .is_some_and(|state| talk_rows(definition, state, *w).len() > usize::from(*h))
+            }),
+        _ => false,
+    })
 }
 
 /// A list of rows with a header, the selected row highlighted.
@@ -561,6 +665,10 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         actions: Vec<(String, Context)>,
+        /// How many more exchanges the conversation with the agent has.
+        long_talk: usize,
+        /// True once a question was sent to the agent.
+        waiting: bool,
     }
 
     fn addressbook() -> Screen {
@@ -641,6 +749,37 @@ mod tests {
         .unwrap()
     }
 
+    /// The screen of the agent, placed on the text grid as the server does.
+    fn agent() -> Screen {
+        let hidden = serde_json::json!({ "text": { "x": 0, "y": 0, "w": 0, "h": 0, "style": { "hidden": true } } });
+        serde_json::from_value(serde_json::json!({
+            "stack": { "name": "agent", "title": "Agent", "kind": "system" },
+            "source": { "has_cards": true, "count": 1 },
+            "widgets": [
+                { "name": "talk", "kind": "grid", "ord": 30,
+                  "props": { "view": "talk", "who": "kind",
+                             "columns": [ { "column": "kind" }, { "column": "text" } ] },
+                  "layout": { "text": { "x": 1, "y": 3, "w": 78, "h": 14 } } },
+                { "name": "ask", "kind": "field", "ord": 40, "label": "Ask", "column": "ask",
+                  "type": "text", "props": { "max_length": 2000 },
+                  "layout": { "text": { "x": 20, "y": 18, "w": 59, "h": 1 } } },
+                { "name": "send", "kind": "button", "ord": 50, "label": "Send", "action": "send" },
+                { "name": "model", "kind": "text", "ord": 60, "label": "Model",
+                  "props": { "template": "{model}" }, "layout": hidden },
+                { "name": "status", "kind": "text", "ord": 110,
+                  "props": { "template": "Model: {model}  -  Today: {today}" },
+                  "layout": { "text": { "x": 1, "y": 20, "w": 78, "h": 1 } } }
+            ],
+            "actions": [],
+            "keys": [
+                { "key": "F5", "label": "Stop", "action": "stop" },
+                { "key": "F12", "label": "Back", "action": "back" },
+                { "key": "Enter", "label": "Send", "action": "send" }
+            ]
+        }))
+        .unwrap()
+    }
+
     impl Api for Fake {
         fn hello(&mut self) -> Result<Hello, ApiError> {
             Ok(Hello {
@@ -666,6 +805,7 @@ mod tests {
                 "desktop" => desktop(),
                 "stacks" => stacks(),
                 "author" => author(),
+                "agent" => agent(),
                 _ => addressbook(),
             })
         }
@@ -681,6 +821,18 @@ mod tests {
                         ("kind".to_string(), Some("text".to_string())),
                         ("shared".to_string(), Some("false".to_string())),
                     ]),
+                    ..Card::default()
+                });
+            }
+            if stack == "agent" {
+                return Ok(Card {
+                    key: Some("talk-1".into()),
+                    position: 1,
+                    count: 1,
+                    texts: BTreeMap::from([(
+                        "status".to_string(),
+                        "Model: test-model  -  Today: 2 actions, 0 refused".to_string(),
+                    )]),
                     ..Card::default()
                 });
             }
@@ -701,10 +853,40 @@ mod tests {
 
         fn grid_rows(
             &mut self,
-            _stack: &str,
+            stack: &str,
             _widget: &str,
             _card: Option<&str>,
         ) -> Result<GridPage, ApiError> {
+            if stack == "agent" {
+                // Newest first, as the server gives a conversation.
+                let said = |key: usize, kind: &str, text: String| GridRow {
+                    key: key.to_string(),
+                    cells: BTreeMap::from([
+                        ("kind".to_string(), Some(kind.to_string())),
+                        ("text".to_string(), Some(text)),
+                    ]),
+                };
+                let mut rows = vec![
+                    said(1, "user", "Who lives in London?".into()),
+                    said(2, "tool", "Looked for “London” in Address book: 2 cards.".into()),
+                    said(
+                        3,
+                        "agent",
+                        "Two people live in London: Charles Babbage, of Difference Works, and \
+                         Ada Lovelace, of Analytical Engines.\nBoth have a telephone number."
+                            .into(),
+                    ),
+                ];
+                for turn in 0..self.long_talk {
+                    rows.push(said(10 + 2 * turn, "user", format!("Question {turn}")));
+                    rows.push(said(11 + 2 * turn, "agent", format!("Answer {turn}")));
+                }
+                if self.waiting {
+                    rows.push(said(999, "wait", "The agent is working…".into()));
+                }
+                rows.reverse();
+                return Ok(GridPage { total: rows.len() as u64, rows });
+            }
             let row = |key: &str, title: &str, cards: &str| GridRow {
                 key: key.into(),
                 cells: BTreeMap::from([
@@ -734,6 +916,13 @@ mod tests {
                 "back" => vec![Effect::Back],
                 "quit" => vec![Effect::Quit],
                 "author" => vec![Effect::Show { stack: "author".into(), card: None }],
+                "agent" => {
+                    vec![Effect::Show { stack: "agent".into(), card: Some("talk-1".into()) }]
+                }
+                "send" => {
+                    self.waiting = true;
+                    vec![Effect::Show { stack: "agent".into(), card: Some("talk-1".into()) }]
+                }
                 "delete_stack" if !context.confirmed => vec![Effect::Confirm {
                     text: "Delete the stack “Address book”? Its cards are kept, and the stack \
                            can be restored."
@@ -1004,6 +1193,79 @@ mod tests {
     fn a_terminal_smaller_than_the_screen_has_no_area() {
         assert_eq!(screen_area(Rect::new(0, 0, 79, 24)), None);
         assert_eq!(screen_area(Rect::new(0, 0, 100, 30)), Some(Rect::new(10, 3, 80, 24)));
+    }
+
+    /// A session on the screen of the agent, called from the address book.
+    fn with_the_agent(long_talk: usize) -> (Session<Fake>, Ui) {
+        let mut session = Session::start(Fake { long_talk, ..Fake::default() }).unwrap();
+        let mut ui = Ui::default();
+        session.run("agent");
+        handle(&mut session, &mut ui, Key::Home);
+        assert_eq!(session.view().stack(), "agent");
+        (session, ui)
+    }
+
+    #[test]
+    fn a_conversation_is_written_from_the_bottom_up() {
+        let (session, ui) = with_the_agent(0);
+        let (lines, cursor) = render(&session, &ui);
+
+        // The latest line is at the bottom of the conversation; a long answer
+        // is wrapped under itself, and its own line breaks are kept.
+        assert_eq!(lines[11], "");
+        assert_eq!(lines[12], " You: Who lives in London?");
+        assert_eq!(lines[13], "   - Looked for “London” in Address book: 2 cards.");
+        assert_eq!(
+            lines[14],
+            " Agent: Two people live in London: Charles Babbage, of Difference Works, and"
+        );
+        assert_eq!(lines[15], "        Ada Lovelace, of Analytical Engines.");
+        assert_eq!(lines[16], "        Both have a telephone number.");
+        // Everything fits: there is nothing to page through.
+        assert_eq!(lines[22], "");
+        // The line to write on has the cursor: a conversation takes no focus.
+        assert_eq!(lines[18], " Ask . . . . . . :");
+        assert_eq!(cursor, Some((20, 18)));
+        assert_eq!(lines[20], " Model: test-model  -  Today: 2 actions, 0 refused");
+        assert_eq!(lines[23], " F5=Stop  F12=Back  Enter=Send");
+    }
+
+    #[test]
+    fn a_question_is_typed_and_sent_with_enter() {
+        let (mut session, mut ui) = with_the_agent(0);
+        press(&mut session, &mut ui, &[Key::Char('H'), Key::Char('i'), Key::Char('?'), Key::Enter]);
+        let (action, context) = session_actions(&session).last().unwrap();
+        assert_eq!(action, "send");
+        assert_eq!(context.card.as_deref(), Some("talk-1"));
+        assert_eq!(context.dirty.get("ask").map(String::as_str), Some("Hi?"));
+
+        // The line is empty again, and the agent is said to be working.
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[16], "   The agent is working…");
+        assert_eq!(lines[18], " Ask . . . . . . :");
+    }
+
+    #[test]
+    fn page_up_goes_back_in_a_long_conversation() {
+        let (mut session, mut ui) = with_the_agent(12);
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[16], " Agent: Answer 11");
+        // There is more above, and the screen says how to read it.
+        assert_eq!(lines[22], " PgUp and PgDn go through the conversation.");
+
+        // A page back: the row that was at the top is now at the bottom.
+        let top = lines[3].clone();
+        press(&mut session, &mut ui, &[Key::PageUp]);
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[16], top);
+
+        // Going back stops at the first line, and coming forward at the last.
+        press(&mut session, &mut ui, &[Key::PageUp; 6]);
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[3], " You: Who lives in London?");
+        press(&mut session, &mut ui, &[Key::PageDown; 9]);
+        let (lines, _) = render(&session, &ui);
+        assert_eq!(lines[16], " Agent: Answer 11");
     }
 
     fn session_actions(session: &Session<Fake>) -> &[(String, Context)] {

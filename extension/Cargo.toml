@@ -22,6 +22,11 @@ serde_json = "1"
 # Lua 5.4, built from the sources that come with the crate: the language of
 # the scripts.
 mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
+# HTTPS, for the agent worker to call the model. No other part of the
+# extension talks to the network.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# To keep signals away from the thread that makes that call.
+libc = "0.2"
 
 [build-dependencies]
 cc = "1"

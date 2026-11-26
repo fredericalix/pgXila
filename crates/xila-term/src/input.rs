@@ -23,6 +23,8 @@ pub fn key_from_event(event: KeyEvent) -> Option<Key> {
         KeyCode::Right => Key::Right,
         KeyCode::Home => Key::Home,
         KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Delete => Key::Delete,
         KeyCode::Esc => Key::Escape,
