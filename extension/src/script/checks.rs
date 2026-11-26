@@ -102,8 +102,8 @@ end
     #[pg_test]
     fn a_script_says_which_keys_it_wants() {
         for (source, problem) in [
-            ("keys = { F3 = 'Leave' }\nfunction on_key() end", "F3, F11 and F12 cannot be taken"),
-            ("keys = { F12 = 'Stay' }\nfunction on_key() end", "F3, F11 and F12 cannot be taken"),
+            ("keys = { F3 = 'Leave' }\nfunction on_key() end", "F3, F9, F11 and F12 cannot be taken"),
+            ("keys = { F12 = 'Stay' }\nfunction on_key() end", "F3, F9, F11 and F12 cannot be taken"),
             ("keys = { F6 = 'New' }", "there is no function on_key"),
             ("keys = { F25 = 'New' }\nfunction on_key() end", "is not a key"),
             ("keys = { F6 = '' }\nfunction on_key() end", "needs a label"),
@@ -163,7 +163,7 @@ end"#;
         assert_eq!(books(), 2);
 
         let (code, _) =
-            error_of(r#"xila.act('books', 'script', '{"event": {"on": "key", "key": "F9"}}')"#);
+            error_of(r#"xila.act('books', 'script', '{"event": {"on": "key", "key": "F2"}}')"#);
         assert_eq!(code, "XL002");
     }
 
@@ -514,10 +514,10 @@ end"#,
             Some("function on_click() end")
         );
 
-        let (first, _) = button_with("keys = { F9 = 'Stamp' }\nfunction on_key() end");
-        let (_, second) = button_with("keys = { F9 = 'Again' }\nfunction on_key() end");
+        let (first, _) = button_with("keys = { F2 = 'Stamp' }\nfunction on_key() end");
+        let (_, second) = button_with("keys = { F2 = 'Again' }\nfunction on_key() end");
         assert_eq!(second["ok"], json!(false));
-        assert_eq!(second["message"], json!("F9 already belongs to the script of “Stamp”."));
+        assert_eq!(second["message"], json!("F2 already belongs to the script of “Stamp”."));
         let (_, opening) = button_with("function on_open() end");
         assert!(opening["message"]
             .as_str()
@@ -530,7 +530,7 @@ end"#,
         assert_eq!(code, "XL003");
         let removed = json(&format!("SELECT xila.set_script('books', '{first}', E'  \n')"));
         assert_eq!(removed["removed"], json!(true));
-        assert_eq!(number("SELECT count(*) FROM xila.script s WHERE s.keys ? 'F9'"), 0);
+        assert_eq!(number("SELECT count(*) FROM xila.script s WHERE s.keys ? 'F2'"), 0);
     }
 
     #[pg_test]
@@ -622,7 +622,7 @@ end"#;
         // A key event is tried with the first key the script asks for.
         let keyed = json!({
             "input": {
-                "source": "keys = { F9 = 'Nine', F10 = 'Ten' }\nfunction on_key(key) message(key) end",
+                "source": "keys = { F2 = 'Nine', F10 = 'Ten' }\nfunction on_key(key) message(key) end",
                 "event": {"on": "key"},
             },
         });
@@ -630,7 +630,7 @@ end"#;
             "SELECT xila.act('books', 'test_script', {})",
             quoted(&keyed.to_string())
         ));
-        assert_eq!(tested[0]["lines"], json!(["It says: F9"]), "{tested}");
+        assert_eq!(tested[0]["lines"], json!(["It says: F2"]), "{tested}");
     }
 
     #[pg_test]

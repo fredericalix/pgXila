@@ -372,9 +372,17 @@ DECLARE
     heading uuid;
 BEGIN
     SELECT k INTO unknown FROM jsonb_object_keys(changes) k
-    WHERE k NOT IN ('title', 'card_title', 'icon') LIMIT 1;
+    WHERE k NOT IN ('title', 'card_title', 'icon', 'agent') LIMIT 1;
     IF unknown IS NOT NULL THEN
         RAISE EXCEPTION 'A stack has no property “%”.', unknown USING ERRCODE = 'XL003';
+    END IF;
+
+    -- Whether the agent may read the cards: a privilege on the table, which
+    -- the trigger of xila.stack grants or revokes.
+    IF changes ? 'agent' THEN
+        UPDATE xila.stack
+        SET agent_reads = coalesce((nullif(changes->>'agent', ''))::boolean, false)
+        WHERE id = bg.stack_id;
     END IF;
 
     -- The icon. The list of stacks shows the icons of several stacks at once,
@@ -957,8 +965,10 @@ BEGIN
             SELECT string_agg(format('%I', a.attname), ', ') INTO cols
             FROM pg_attribute a
             WHERE a.attrelid = target::regclass AND a.attnum > 0 AND NOT a.attisdropped;
+            -- A version recorded before a column existed leaves that column
+            -- as it is.
             EXECUTE format(
-                'UPDATE %1$s SET (%2$s) = (SELECT %2$s FROM jsonb_populate_record(NULL::%1$s, $2))
+                'UPDATE %1$s AS t SET (%2$s) = (SELECT %2$s FROM jsonb_populate_record(t, $2))
                  WHERE %3$s', target, cols, pk)
             USING entry.after, entry.before;
         END IF;
@@ -1472,7 +1482,8 @@ $$;
 -- One line per user stack.
 CREATE VIEW xila.stack_info WITH (security_invoker = true) AS
     SELECT s.name, s.title, s.owner::text AS owner, b.managed,
-           coalesce(xila.card_title_template(b.id), '') AS card_title
+           coalesce(xila.card_title_template(b.id), '') AS card_title,
+           s.agent_reads AS agent
     FROM xila.stack s JOIN xila.background b ON b.stack_id = s.id
     WHERE s.kind = 'user';
 
@@ -1547,6 +1558,9 @@ BEGIN
             WHEN before->>'title' <> after->>'title'
                 THEN format('Title changed to “%s”', after->>'title')
             WHEN before->>'icon_id' IS DISTINCT FROM after->>'icon_id' THEN 'Icon changed'
+            WHEN before->>'agent_reads' IS DISTINCT FROM after->>'agent_reads'
+                THEN CASE WHEN (after->>'agent_reads')::boolean
+                          THEN 'Stack opened to the agent' ELSE 'Stack closed to the agent' END
             ELSE 'Stack changed' END;
     WHEN 'column' THEN
         RETURN CASE

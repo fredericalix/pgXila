@@ -18,6 +18,14 @@ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'xila_author') THEN
         CREATE ROLE xila_author NOLOGIN IN ROLE xila_user;
     END IF;
+    -- Administrators set up the agent. The agent itself is a role that owns
+    -- nothing and cannot log in: its worker connects as that role.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'xila_admin') THEN
+        CREATE ROLE xila_admin NOLOGIN IN ROLE xila_author;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'xila_agent') THEN
+        CREATE ROLE xila_agent NOLOGIN;
+    END IF;
 END
 $$;
 
@@ -98,7 +106,10 @@ CREATE TABLE xila.stack (
     kind       text NOT NULL DEFAULT 'user' CHECK (kind IN ('system', 'user')),
     icon_id    uuid REFERENCES xila.image,
     owner      name NOT NULL DEFAULT current_user,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    -- Whether the agent may read the cards. Kept in step with a privilege on
+    -- the table of the stack; see xila.sync_agent_grant.
+    agent_reads boolean NOT NULL DEFAULT true
 );
 
 -- Extra colours of a stack, beyond the 32 system colours.
@@ -143,7 +154,9 @@ CREATE TABLE xila.action (
                       'place_widgets', 'reset_layout', 'add_widget', 'set_widget',
                       'remove_widget', 'undo', 'draw', 'save_drawing', 'set_colour',
                       'remove_colour', 'script', 'edit_script', 'save_script',
-                      'test_script')),
+                      'test_script', 'agent', 'ask_agent', 'stop_agent',
+                      'new_conversation', 'conversations', 'open_conversation',
+                      'agent_journal', 'agent_settings', 'save_agent_settings')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );
@@ -192,7 +205,7 @@ CREATE TABLE xila.key_binding (
 -- The script of a button, or of the screen itself when widget_id is null:
 -- Lua source with one function per event. events and keys say what it
 -- handles; xila.set_script works them out from the source when it saves it.
--- The keys to leave a screen can never be taken.
+-- The keys to leave a screen, and the key of the agent, can never be taken.
 CREATE TABLE xila.script (
     id            uuid PRIMARY KEY DEFAULT uuidv7(),
     background_id uuid NOT NULL REFERENCES xila.background ON DELETE CASCADE,
@@ -203,7 +216,7 @@ CREATE TABLE xila.script (
                   CHECK (events <@ ARRAY['click', 'key', 'open']),
     keys          jsonb NOT NULL DEFAULT '{}'
                   CHECK (jsonb_typeof(keys) = 'object'
-                         AND NOT keys ?| ARRAY['F3', 'F11', 'F12']),
+                         AND NOT keys ?| ARRAY['F3', 'F9', 'F11', 'F12']),
     UNIQUE NULLS NOT DISTINCT (background_id, widget_id)
 );
 
@@ -510,9 +523,11 @@ CREATE POLICY edit ON xila.widget
 
 ALTER TABLE xila.key_binding ENABLE ROW LEVEL SECURITY;
 CREATE POLICY read ON xila.key_binding FOR SELECT USING (true);
+-- F3, F9, F11 and F12 mean the same on every screen: a stack cannot take them.
 CREATE POLICY edit ON xila.key_binding
     USING (xila.may_edit_background(background_id))
-    WITH CHECK (xila.may_edit_background(background_id));
+    WITH CHECK (xila.may_edit_background(background_id)
+                AND key NOT IN ('F3', 'F9', 'F11', 'F12'));
 
 -- A script runs with the rights of whoever triggers it: everyone who may open
 -- the stack may read it.
@@ -609,6 +624,144 @@ CREATE POLICY note ON xila.history FOR INSERT
                         ELSE false
                     END);
 
+
+-- ---------------------------------------------------------------------------
+-- The agent
+-- ---------------------------------------------------------------------------
+-- See docs/api.md, section 11, and agent.sql for the functions.
+
+-- An address the worker may call: https anywhere; plain http for this machine
+-- only, which is what a model that runs locally needs. Nothing a person asks
+-- and no token ever crosses a network in clear.
+CREATE FUNCTION xila.agent_address_ok(address text) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT address ~ '^https://[^\s/@]+(/\S*)?$'
+        OR address ~ '^http://(localhost|127\.0\.0\.1|\[::1\]|host\.docker\.internal)(:[0-9]+)?(/\S*)?$'
+$$;
+
+-- The name of an environment variable that may hold the token: never one of
+-- PostgreSQL itself.
+CREATE FUNCTION xila.agent_variable_ok(variable text) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT variable ~ '^([A-Z][A-Z0-9_]{0,63})?$' AND variable !~ '^(PG|POSTGRES)'
+$$;
+
+-- The settings of the agent, in one row. The token of the model is not here:
+-- token_variable names the environment variable of the server that holds it.
+CREATE TABLE xila.agent_setting (
+    only_row       boolean PRIMARY KEY DEFAULT true CHECK (only_row),
+    address        text NOT NULL DEFAULT ''
+                   CHECK (address = '' OR xila.agent_address_ok(address)),
+    model          text NOT NULL DEFAULT '',
+    token_variable text NOT NULL DEFAULT '' CHECK (xila.agent_variable_ok(token_variable)),
+    options        jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(options) = 'object'),
+    instructions   text NOT NULL DEFAULT '',
+    changed_at     timestamptz,
+    changed_by     name
+);
+
+-- Restoring a dump loads the saved settings on top of the empty ones.
+CREATE FUNCTION xila.agent_setting_upsert() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE xila.agent_setting
+    SET address = NEW.address, model = NEW.model, token_variable = NEW.token_variable,
+        options = NEW.options, instructions = NEW.instructions,
+        changed_at = NEW.changed_at, changed_by = NEW.changed_by;
+    IF FOUND THEN
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER agent_setting_upsert BEFORE INSERT ON xila.agent_setting
+    FOR EACH ROW EXECUTE FUNCTION xila.agent_setting_upsert();
+
+INSERT INTO xila.agent_setting DEFAULT VALUES;
+
+-- A tool of the agent: a SQL function f(as_role name, arguments jsonb)
+-- RETURNS jsonb. The model reads the name, the description and the
+-- parameters; people read the label.
+CREATE TABLE xila.agent_tool (
+    name        text PRIMARY KEY CHECK (name ~ '^[a-z][a-z0-9_]{0,40}$'),
+    ord         integer NOT NULL DEFAULT 0,
+    label       text NOT NULL,
+    description text NOT NULL,
+    parameters  jsonb NOT NULL DEFAULT '{"type": "object", "properties": {}}',
+    function    regproc NOT NULL
+);
+
+-- A conversation between someone and the agent. stack and card say what its
+-- owner was looking at when calling the agent.
+CREATE TABLE xila.conversation (
+    id         uuid PRIMARY KEY DEFAULT uuidv7(),
+    owner      name NOT NULL DEFAULT current_user,
+    title      text NOT NULL DEFAULT '',
+    state      text NOT NULL DEFAULT 'idle' CHECK (state IN ('idle', 'waiting')),
+    stack      text,
+    card       text,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    changed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX conversation_owner ON xila.conversation (owner, changed_at);
+CREATE INDEX conversation_waiting ON xila.conversation (changed_at) WHERE state = 'waiting';
+
+-- A line of a conversation. text is what people read. payload is what the
+-- model is sent back: its own message, or the result of a tool.
+CREATE TABLE xila.agent_message (
+    id              uuid PRIMARY KEY DEFAULT uuidv7(),
+    conversation_id uuid NOT NULL REFERENCES xila.conversation ON DELETE CASCADE,
+    at              timestamptz NOT NULL DEFAULT clock_timestamp(),
+    kind            text NOT NULL CHECK (kind IN ('user', 'agent', 'tool', 'error')),
+    text            text NOT NULL DEFAULT '',
+    payload         jsonb
+);
+
+CREATE INDEX agent_message_order ON xila.agent_message (conversation_id, at, id);
+
+-- The journal of the agent: every call to the model and every tool it ran,
+-- for whom. There is deliberately no foreign key: the journal outlives the
+-- conversations. It does not copy what the cards say.
+CREATE TABLE xila.agent_log (
+    id              uuid PRIMARY KEY DEFAULT uuidv7(),
+    at              timestamptz NOT NULL DEFAULT clock_timestamp(),
+    conversation_id uuid,
+    role            name NOT NULL,
+    event           text NOT NULL CHECK (event IN ('model', 'tool', 'refused', 'failed')),
+    tool            text,
+    summary         text NOT NULL,
+    detail          jsonb NOT NULL DEFAULT '{}',
+    ms              integer,
+    tokens_in       integer,
+    tokens_out      integer
+);
+
+CREATE INDEX agent_log_role ON xila.agent_log (role, at);
+
+-- A conversation is read by its owner alone, and by the worker. People add
+-- their own questions and nothing else; only the worker writes what the
+-- agent says and what it did.
+ALTER TABLE xila.conversation ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own ON xila.conversation TO xila_user
+    USING (owner = current_user) WITH CHECK (owner = current_user);
+CREATE POLICY worker ON xila.conversation TO xila_agent USING (true) WITH CHECK (true);
+
+ALTER TABLE xila.agent_message ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_read ON xila.agent_message FOR SELECT TO xila_user
+    USING (EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id));
+CREATE POLICY own_ask ON xila.agent_message FOR INSERT TO xila_user
+    WITH CHECK (kind = 'user' AND payload IS NULL
+                AND EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id));
+CREATE POLICY worker ON xila.agent_message TO xila_agent USING (true) WITH CHECK (true);
+
+ALTER TABLE xila.agent_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_read ON xila.agent_log FOR SELECT TO xila_user
+    USING (role = current_user OR pg_has_role('xila_admin', 'USAGE'));
+CREATE POLICY worker_read ON xila.agent_log FOR SELECT TO xila_agent USING (true);
+CREATE POLICY worker_write ON xila.agent_log FOR INSERT TO xila_agent WITH CHECK (true);
+
 -- ---------------------------------------------------------------------------
 -- Privileges
 -- ---------------------------------------------------------------------------
@@ -628,6 +781,25 @@ GRANT UPDATE ON xila.palette TO xila_author;
 GRANT SELECT ON xila.history TO xila_user;
 GRANT INSERT (origin, stack_id, object_kind, object_key, op, before, after)
     ON xila.history TO xila_user;
+
+-- The agent. People hold their conversations and ask; they read the journal
+-- within its policy and cannot write it. Administrators change the settings.
+GRANT SELECT ON xila.agent_tool, xila.conversation, xila.agent_message, xila.agent_log
+    TO xila_user;
+GRANT INSERT (stack, card) ON xila.conversation TO xila_user;
+GRANT UPDATE (title, state, stack, card, changed_at) ON xila.conversation TO xila_user;
+GRANT INSERT (conversation_id, kind, text) ON xila.agent_message TO xila_user;
+GRANT SELECT, UPDATE ON xila.agent_setting TO xila_admin;
+
+-- The worker reads the definitions of the stacks, holds the conversations and
+-- writes the journal. It reads the cards of a stack only once the table of
+-- that stack was opened to it. It can write nowhere else.
+GRANT USAGE ON SCHEMA xila TO xila_agent;
+GRANT SELECT ON xila.stack, xila.background, xila.widget, xila.agent_setting, xila.agent_tool
+    TO xila_agent;
+GRANT SELECT, UPDATE ON xila.conversation TO xila_agent;
+GRANT SELECT, INSERT ON xila.agent_message TO xila_agent;
+GRANT SELECT, INSERT ON xila.agent_log TO xila_agent;
 
 -- ---------------------------------------------------------------------------
 -- Backups
@@ -655,6 +827,10 @@ SELECT pg_catalog.pg_extension_config_dump('xila.layout',
 SELECT pg_catalog.pg_extension_config_dump('xila.key_binding',
     $$WHERE background_id IN (SELECT b.id FROM xila.background b
         JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);
+SELECT pg_catalog.pg_extension_config_dump('xila.agent_setting', '');
+SELECT pg_catalog.pg_extension_config_dump('xila.conversation', '');
+SELECT pg_catalog.pg_extension_config_dump('xila.agent_message', '');
+SELECT pg_catalog.pg_extension_config_dump('xila.agent_log', '');
 SELECT pg_catalog.pg_extension_config_dump('xila.script',
     $$WHERE background_id IN (SELECT b.id FROM xila.background b
         JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);

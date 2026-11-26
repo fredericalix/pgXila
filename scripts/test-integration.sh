@@ -102,7 +102,7 @@ echo "A backup is restored with its stacks, its cards and its history"
 # A script, so that the backup has one to carry.
 psql_in db-scratch <<'SQL'
 SELECT xila.set_script('addressbook', 'new', $lua$
-keys = { F9 = "New card" }
+keys = { F2 = "New card" }
 
 function on_click()
   go_to(stack.new_card())
@@ -124,7 +124,7 @@ summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.ba
                 (SELECT count(*) FROM pg_trigger WHERE tgname = 'xila_card'),
                 (SELECT count(*) || ':' || md5(string_agg(source || events::text || keys::text, ''))
                    FROM xila.script),
-                xila.open_stack('addressbook')->'keys' @> '[{\"key\": \"F9\", \"action\": \"script\"}]',
+                xila.open_stack('addressbook')->'keys' @> '[{\"key\": \"F2\", \"action\": \"script\"}]',
                 xila.card('addressbook')->'texts'"
 scratch db-scratch sh -c '
     set -e

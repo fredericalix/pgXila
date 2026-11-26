@@ -493,7 +493,7 @@ fn scripts_run_for_whoever_uses_the_stack() {
         "set_widget",
         serde_json::json!({ "widget": "button1", "changes": { "label": "Sequel" } }),
     );
-    let source = r#"keys = { F9 = "Sequel" }
+    let source = r#"keys = { F2 = "Sequel" }
 
 function on_click()
   local sequel = stack.new_card()
@@ -511,12 +511,12 @@ end
     assert!(author
         .run_with("save_script", serde_json::json!({ "widget": "button1", "source": source })));
     assert_eq!(author.message(), Some("Script saved."));
-    // The screen says so at once: the button runs its script, and so does F9.
+    // The screen says so at once: the button runs its script, and so does F2.
     let button = |session: &Session<Server>| {
         session.view().widgets().find(|w| w.name == "button1").and_then(|w| w.action.clone())
     };
     assert_eq!(button(&author).as_deref(), Some("script"));
-    assert!(keys(&author).contains(&"F9=Sequel".to_owned()), "{:?}", keys(&author));
+    assert!(keys(&author).contains(&"F2=Sequel".to_owned()), "{:?}", keys(&author));
 
     // A test keeps nothing, and tells what the script would do.
     author.be_graphic();
@@ -546,7 +546,7 @@ end
     assert_eq!(user.view().value("year"), "1816");
     assert_eq!(user.view().card.count, 3);
     // The key does the same, from the card it is pressed on.
-    assert!(user.press("F9"));
+    assert!(user.press("F2"));
     assert_eq!(user.view().value("title"), "Emma II II");
     user.press("F10");
     let changes = column(&user, "changes", "summary");

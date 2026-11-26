@@ -267,7 +267,7 @@ a card comes on screen.
 
 ```lua
 -- script of the button "New card"
-keys = { F9 = "New in London" }
+keys = { F2 = "New in London" }
 
 function on_click()
   local new = stack.new_card()

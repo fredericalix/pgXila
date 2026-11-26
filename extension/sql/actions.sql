@@ -49,6 +49,11 @@ BEGIN
     END IF;
 
     CASE act.handler
+    -- The agent: its handlers are in agent.sql.
+    WHEN 'agent', 'ask_agent', 'stop_agent', 'new_conversation', 'conversations',
+         'open_conversation', 'agent_journal', 'agent_settings', 'save_agent_settings' THEN
+        RETURN xila.agent_act(act.handler, stack, context);
+
     WHEN 'quit' THEN
         RETURN jsonb_build_array(jsonb_build_object('do', 'quit'));
 
