@@ -396,20 +396,157 @@ The connection screen is the only screen built into the clients, because it is
 shown before any connection exists. The window in which a `confirm` effect asks
 its question is drawn by the clients as well.
 
-## 9. Scripts (proposal for step 2d, not decided)
+## 9. Scripts (proposal for step 2d, not approved yet)
 
-- A script is a row: `xila.script(id, owner_kind, owner_id, event, language, source)`.
-  The owner is a stack, a background, a card or a widget.
-- Events: `click`, `key`, `open_card`, `timer`, `row_changed`, `message`.
-- A script is one more kind of action handler. It runs in the extension, receives
-  the same context, reads and writes through SQL under the caller's role, and
-  returns the same effects.
-- Language in the meantime: Lua 5.4 or Rhai, embedded in the extension, with no
-  file or network access and a hard limit on the number of instructions so that
-  a script can never block a backend. The choice is made at the start of step
-  2d, after trying to build both with pgrx on PostgreSQL 19. The language of
-  pgXila itself comes later and would replace it behind the same `xila.script`
-  rows.
+A script is written in **Lua 5.4** and runs inside the extension. The language
+was chosen after building Lua and Rhai into the extension on PostgreSQL 19 and
+running the same checks on both. The language of pgXila itself may come later,
+behind the same rows.
+
+### 9.1 What a script is
+
+One script belongs to one object: a **button**, or the **screen** of a stack
+(its background). It holds one function per event it handles.
+
+```lua
+-- script of the button "New card"
+keys = { F6 = "New card" }
+
+function on_click()
+  local new = stack.new_card()
+  new.city = "London"
+  go_to(new)
+  focus("name")
+end
+
+function on_key(key)
+  if key == "F6" then on_click() end
+end
+```
+
+| Event | Function | Where | When |
+|-------|----------|-------|------|
+| click | `on_click()` | a button | the button is pressed |
+| key | `on_key(key)` | a button, the screen | one of the keys the script asks for is pressed |
+| open card | `on_open()` | the screen | a card comes on screen |
+
+- **Keys.** A script asks for keys with the table `keys`: the key, and the
+  label shown in the key bar. On one screen a key belongs to one script only.
+  A key of a script wins over the same key bound to an action. `F3`, `F11` and
+  `F12` can never be taken: a script cannot keep anyone inside a stack.
+- **Top level.** Outside a function, a script only defines things. Calling the
+  database or the screen there is an error, so that checking a script never
+  does anything.
+- **No memory.** Every event runs in a new Lua state. What must last goes in
+  the database.
+- Timer, database change and received message are listed in the editor and
+  marked "later". Scripts on a field, on one card or on the stack, and events
+  passed from an object to the one that contains it, are not in this step.
+
+The row: `xila.script(id, background_id, widget_id, language, source, events,
+keys)`. `widget_id` is null for the script of the screen. `language` is `lua`.
+`events` and `keys` are filled in when the script is saved, from what it
+defines. Everyone who may open the stack may read its scripts, since they run
+with the rights of whoever triggers them; only those who may change the stack
+may write them. A script is part of the screen: its changes are recorded in
+the history, can be rewound and undone, and notify `xila_screen`.
+
+### 9.2 What a script can do
+
+| In a script | Meaning |
+|-------------|---------|
+| `card` | The card on screen, with what the user typed; `nil` on a screen without cards. `card.city` reads a field. `card.city = "London"` writes it on screen, as if typed: nothing is saved yet |
+| `stack.name`, `stack.title` | The stack on screen |
+| `stack.new_card()` | A new empty card, not saved |
+| `stack.cards{city = "London"}` | The cards whose fields equal these values, in the order of the stack, 1000 at most; all of them without a filter |
+| `save(card)` | Saves the card, new or not, as `xila.save_card` does: same checks, same history. Gives the saved card |
+| `delete(card)` | Deletes the card |
+| `go_to(card)` | Shows that card. A card not saved yet is shown empty with its values, to be completed and saved by the user |
+| `go_to("next")` | Also `"previous"`, `"first"`, `"last"` |
+| `open("addressbook")` | Opens another stack |
+| `focus("name")` | Puts the cursor in a widget |
+| `message("Saved.")` | Shows a message |
+| `confirm("Delete it?", "Delete")` | Asks first. Nothing the script did before is kept; once the user accepts, the script runs again from the start and `confirm` gives `true` |
+| `act("save_card")` | Runs an action of the screen and adds what it answers |
+| `query(sql, ...)` | Runs a `SELECT` and gives its rows, 1000 at most, each a table by column name. `$1`, `$2`… take the values that follow |
+| `execute(sql, ...)` | Runs an `INSERT`, `UPDATE`, `DELETE` or `MERGE` and gives the number of rows |
+| `today()`, `now()` | The date and the time of the server, as text |
+| `user`, `instance` | The current role, the name of the instance |
+| `print(...)` | A line for the test report of the editor; ignored otherwise |
+
+From Lua itself: `string`, `table`, `math`, `utf8`, `pairs`, `ipairs`, `next`,
+`select`, `type`, `tostring`, `tonumber`, `pcall`, `error`, `assert`. Nothing
+else: no file, no operating system, no module, no loading of code.
+
+### 9.3 Rights and limits
+
+- **Rights.** A script runs with the rights of the role that triggers it, like
+  an ordinary PostgreSQL function: privileges and row-level security apply to
+  everything it does. `query` and `execute` take one statement that reads or
+  writes rows; anything else (`CREATE`, `GRANT`, `SET ROLE`…) is refused.
+- **Trust.** The script of an author therefore acts with the rights of the
+  user. Open only the stacks of authors you trust. For that reason **a script
+  never runs for a superuser**: the action is refused with a message.
+- **All or nothing.** An event is one transaction. A script that fails leaves
+  nothing behind, and the user sees its message with the line (`XL005`).
+  A script may catch the error of a statement with `pcall` and go on: only
+  that statement is undone.
+- **It cannot block a backend.** A script is stopped after 50 million Lua
+  instructions or 5 seconds, whichever comes first, and it holds 16 MB at
+  most. `pcall` cannot catch these limits, nor a cancelled query.
+
+### 9.4 How the clients trigger it
+
+Nothing changes in how a client asks: `xila.act`. Three additions.
+
+- The context says what triggered the action, in `event`:
+  `{"on": "click", "widget": "new"}`, `{"on": "key", "key": "F6"}` or
+  `{"on": "open"}`.
+- One action for all scripts, `script`, on every screen. In the screen
+  definition, a button whose script has `on_click` names it as its action, and
+  the keys of the scripts are listed with the others, bound to it. The
+  definition also says `"events": ["open"]` when the screen has `on_open`; the
+  client then runs `script` with `{"on": "open"}` each time it shows a card,
+  except a card shown by `on_open` itself.
+- One more effect: `{"do": "set", "values": {"city": "London"}}` puts values
+  in the fields of the card on screen, as if the user had typed them.
+
+Scripts run the same in the text client and in the window. `xila.hello`
+answers `api: 3`.
+
+### 9.5 Functions
+
+| Function | Does |
+|----------|------|
+| `xila.set_script(stack, widget, source)` | Checks and saves the script of a button, or of the screen when `widget` is null. An empty source removes it. Returns the events and keys found |
+| `xila.check_script(source)` | Checks only: `{"ok": true, "events": ["click", "key"], "keys": {"F6": "New card"}}`, or `{"ok": false, "line": 4, "message": "…"}` |
+| `xila.run_script(source, event, context, keep)` | The engine: runs one event of a script and returns its effects. With `keep` false, everything it wrote is undone and the answer also carries what it printed. Used by `xila.act` |
+
+### 9.6 The script editor
+
+A tool of the graphical client, as the visual editor and the drawing editor
+are. The text client runs scripts but does not edit them.
+
+- **Entering it.** In the visual editor, `F8` Script opens the script of the
+  selected button, or of the screen when nothing is selected. The server
+  answers the action `edit_script` with the effect `{"do": "script", "widget":
+  "new", "title": "Script: button New card", "source": "…"}`.
+- **The window.** The source with line numbers and colours for comments,
+  strings, keywords and the functions of 9.2; the line and column of the
+  cursor; whether the script is correct, checked when typing pauses, with the
+  line of the first error otherwise.
+- **Events.** A list on the right: click, key, open card, ticked when the
+  script handles them. Choosing one that is missing adds its empty function.
+  Timer, database change and received message are shown as "later".
+- **Test** (`F5`). Runs the event chosen in the list on the card that was on
+  screen, with the source as typed, saved or not. Everything it writes is
+  undone. The editor then shows what it would have done: the effects in
+  words, the printed lines, or the error and its line.
+- **Leaving** (`F12`, or Close) saves the script through the action
+  `save_script`. A script with an error is saved too, with a warning, so that
+  no work is lost; it handles no event until it is fixed.
+- Keys: `F3` Quit, `F5` Test, `F12` Back. The Agent panel and the "Ask the
+  agent" button of the mockup come with phase 3.
 
 ## 10. Author mode
 

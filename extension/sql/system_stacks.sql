@@ -95,6 +95,15 @@ INSERT INTO xila.action (name, label, handler, args) VALUES
     ('draw',         'Draw',         'draw',         '{"for": "tool"}'),
     ('save_drawing', 'Save picture', 'save_drawing', '{"for": "tool"}');
 
+-- Scripts. "script" runs the script of the button, of the key or of the
+-- screen that triggered it; it is not something to choose for a button. The
+-- others are what the script editor of the graphical client asks for.
+INSERT INTO xila.action (name, label, handler, args) VALUES
+    ('script',      'Script',      'script',      '{"for": "tool"}'),
+    ('edit_script', 'Script',      'edit_script', '{"for": "editor"}'),
+    ('test_script', 'Test',        'test_script', '{"for": "editor"}'),
+    ('save_script', 'Save script', 'save_script', '{"for": "editor"}');
+
 -- What authors find in the list of stacks.
 INSERT INTO xila.action (background_id, name, label, handler, args) VALUES
     (xila.background_id('stacks'), 'new_stack', 'New stack', 'new_stack', '{"for": "author"}'),

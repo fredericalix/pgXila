@@ -18,8 +18,10 @@ pg_test = []
 
 [dependencies]
 pgrx = "=0.20.1"
-# Used by the in-database tests, which are compiled into the library itself.
 serde_json = "1"
+# Lua 5.4, built from the sources that come with the crate: the language of
+# the scripts.
+mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
 
 [build-dependencies]
 cc = "1"

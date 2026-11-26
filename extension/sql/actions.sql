@@ -33,6 +33,9 @@ DECLARE
     is_field boolean;
     drawn   xila.widget;
     n       bigint;
+    event   jsonb := coalesce(context->'event', '{}');
+    scr     xila.script;
+    played  jsonb;
 BEGIN
     SELECT s.* INTO info FROM xila.stack s WHERE s.id = bg.stack_id;
 
@@ -93,23 +96,9 @@ BEGIN
             RETURN xila.fx_confirm('Delete this card?', 'Delete');
         END IF;
         -- The card to show afterwards: the next one, or else the one before.
-        target := xila.card(stack, card, 'next')->>'key';
-        IF target = card THEN
-            target := xila.card(stack, card, 'previous')->>'key';
-        END IF;
-        BEGIN
-            EXECUTE format('DELETE FROM %s WHERE %I::text = $1', source, bg.key_column)
-            USING card;
-        EXCEPTION
-            WHEN insufficient_privilege THEN
-                RAISE EXCEPTION 'You are not allowed to change this stack.'
-                    USING ERRCODE = 'XL004';
-            WHEN foreign_key_violation THEN
-                RAISE EXCEPTION 'This card is used elsewhere and cannot be deleted.'
-                    USING ERRCODE = 'XL003';
-        END;
+        target := xila.delete_card(stack, card)->>'next';
         RETURN jsonb_build_array(
-            xila.fx_show(stack, nullif(target, card)), xila.fx_message('Card deleted.'));
+            xila.fx_show(stack, target), xila.fx_message('Card deleted.'));
 
     -- Author mode ---------------------------------------------------------
 
@@ -329,6 +318,82 @@ BEGIN
         RETURN jsonb_build_array(
             jsonb_build_object('do', 'reload'),
             xila.fx_message(format('Undone: %s.', saved->>'summary')));
+
+    -- Scripts ---------------------------------------------------------------
+    -- "script" runs the script of what triggered it: the button that was
+    -- pressed, the script that asked for the key, or the script of the screen
+    -- when a card comes on screen. The event says which.
+
+    WHEN 'script' THEN
+        CASE event->>'on'
+        WHEN 'click' THEN
+            drawn := xila.widget_named(bg, event->>'widget', card);
+            SELECT s.* INTO scr FROM xila.script s
+            WHERE s.widget_id = drawn.id AND 'click' = ANY (s.events);
+        WHEN 'key' THEN
+            SELECT s.* INTO scr FROM xila.script s
+            WHERE s.background_id = bg.id AND s.keys ? (event->>'key');
+            SELECT w.* INTO drawn FROM xila.widget w WHERE w.id = scr.widget_id;
+        WHEN 'open' THEN
+            SELECT s.* INTO scr FROM xila.script s
+            WHERE s.background_id = bg.id AND s.widget_id IS NULL AND 'open' = ANY (s.events);
+        ELSE
+            NULL;
+        END CASE;
+        IF scr.id IS NULL THEN
+            RAISE EXCEPTION 'No script handles this.' USING ERRCODE = 'XL002';
+        END IF;
+        played := xila.run_script(stack, scr.source, event, context, true);
+        IF played ? 'error' THEN
+            RAISE EXCEPTION '%', xila.script_failure(xila.script_owner(drawn), played->'error')
+                USING ERRCODE = coalesce(played->'error'->>'code', 'XL005');
+        END IF;
+        RETURN played->'effects';
+
+    -- The script editor of the graphical client: "edit_script" opens it on
+    -- the script of a button, or of the screen when no widget is named;
+    -- "test_script" tries the source as typed and keeps nothing;
+    -- "save_script" saves it.
+
+    WHEN 'edit_script' THEN
+        bg := xila.editable(stack);
+        IF context->>'renderer' IS DISTINCT FROM 'graphic' THEN
+            RETURN jsonb_build_array(
+                xila.fx_message('Scripts are written in the graphical client.'));
+        END IF;
+        target := input->>'widget';
+        IF target IS NOT NULL THEN
+            drawn := xila.widget_named(bg, target, card);
+            IF drawn.kind <> 'button' THEN
+                RAISE EXCEPTION 'Only a button, or the screen, has a script.'
+                    USING ERRCODE = 'XL003';
+            END IF;
+        END IF;
+        SELECT s.* INTO scr FROM xila.script s
+        WHERE s.background_id = bg.id AND s.widget_id IS NOT DISTINCT FROM drawn.id;
+        RETURN jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
+            'do', 'script',
+            'widget', target,
+            'title', CASE WHEN target IS NULL THEN format('Script: screen of “%s”', info.title)
+                          ELSE 'Script: button ' || xila.script_owner(drawn) END,
+            'source', coalesce(scr.source, ''))));
+
+    WHEN 'test_script' THEN
+        PERFORM xila.editable(stack);
+        RETURN jsonb_build_array(jsonb_build_object('do', 'tested') || xila.test_script(
+            stack, coalesce(input->>'source', ''), coalesce(input->'event', '{}'),
+            context - 'input' - 'event'));
+
+    WHEN 'save_script' THEN
+        played := xila.set_script(stack, input->>'widget', input->>'source', card);
+        RETURN jsonb_build_array(
+            jsonb_build_object('do', 'reload'),
+            xila.fx_message(CASE
+                WHEN coalesce((played->>'removed')::boolean, false) THEN 'Script removed.'
+                WHEN (played->>'ok')::boolean THEN 'Script saved.'
+                ELSE format('Script saved with an error%s: %s',
+                            coalesce(' at line ' || (played->>'line'), ''),
+                            played->>'message') END));
 
     -- Drawing ---------------------------------------------------------------
     -- A picture is the icon of the stack, the picture a card has in one of
