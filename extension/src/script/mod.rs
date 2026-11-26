@@ -308,8 +308,8 @@ fn host_table(lua: &Lua, host: &Rc<Host>, stack: &str, context: &Json) -> mlua::
         lua.create_function(
             move |lua,
                   (text, wanted, from, mode, previous): (
-                mlua::String,
-                mlua::String,
+                mlua::LuaString,
+                mlua::LuaString,
                 usize,
                 String,
                 Option<usize>,

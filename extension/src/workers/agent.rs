@@ -131,6 +131,9 @@ fn in_transaction<T>(work: impl FnOnce() -> T) -> Result<T, String> {
         PgTryBuilder::new(AssertUnwindSafe(|| {
             let value = work();
             pg_sys::disable_timeout(pg_sys::TimeoutId::STATEMENT_TIMEOUT, false);
+            // The limit may have run out just as the work ended: what it
+            // asked to cancel is done, and must not cancel what comes next.
+            pg_sys::QueryCancelPending = 0;
             pg_sys::PopActiveSnapshot();
             pg_sys::CommitTransactionCommand();
             Ok(value)
@@ -185,7 +188,10 @@ fn waiting() -> Vec<(String, String)> {
 /// What to send for a conversation: the address, the name of the variable of
 /// the token, the line it is asked at, and the body. `None` when there is
 /// nothing to send; the conversation then says why.
-fn request(conversation: &str) -> Option<(String, String, String, String)> {
+fn request(
+    conversation: &str,
+    stuck: &mut Vec<String>,
+) -> Option<(String, String, String, String)> {
     let asked = in_transaction(|| {
         Spi::get_one_with_args::<JsonB>(
             "SELECT xila.agent_request($1::uuid)",
@@ -203,7 +209,9 @@ fn request(conversation: &str) -> Option<(String, String, String, String)> {
         )),
         Ok(None) => None,
         Err(code) => {
-            give_up(conversation, &code);
+            if !give_up(conversation, &code) {
+                stuck.push(conversation.to_owned());
+            }
             None
         }
     }
@@ -211,7 +219,7 @@ fn request(conversation: &str) -> Option<(String, String, String, String)> {
 
 /// Gives the answer of the model to the database, which writes it and runs
 /// the tools it asks for.
-fn answer(call: &Call, outcome: &http::Outcome) {
+fn answer(call: &Call, outcome: &http::Outcome, stuck: &mut Vec<String>) {
     let took = i32::try_from(call.started.elapsed().as_millis()).unwrap_or(i32::MAX);
     let stored = in_transaction(|| {
         Spi::run_with_args(
@@ -227,13 +235,15 @@ fn answer(call: &Call, outcome: &http::Outcome) {
         .is_ok()
     });
     if let Err(code) = stored {
-        give_up(&call.conversation, &code);
+        if !give_up(&call.conversation, &code) {
+            stuck.push(call.conversation.clone());
+        }
     }
 }
 
 /// Ends a question the worker could not deal with, so that it is not tried
-/// again and again.
-fn give_up(conversation: &str, code: &str) {
+/// again and again. Returns false when even that failed.
+fn give_up(conversation: &str, code: &str) -> bool {
     let detail = serde_json::json!({ "code": code }).to_string();
     let said = in_transaction(|| {
         Spi::run_with_args(
@@ -243,9 +253,11 @@ fn give_up(conversation: &str, code: &str) {
         )
         .is_ok()
     });
-    if said.is_err() {
+    if !matches!(said, Ok(true)) {
         log!("pgxila agent: a conversation could not be ended ({code})");
+        return false;
     }
+    true
 }
 
 #[pg_guard]
@@ -276,6 +288,9 @@ pub extern "C-unwind" fn pgxila_agent_main(_arg: pg_sys::Datum) {
     }
 
     let mut calls: Vec<Call> = Vec::new();
+    // Conversations that could be neither answered nor ended: they are left
+    // alone until the worker starts again, rather than tried forever.
+    let mut stuck: Vec<String> = Vec::new();
     let mut ready = false;
     let mut looked = Instant::now() - IDLE;
     loop {
@@ -315,7 +330,7 @@ pub extern "C-unwind" fn pgxila_agent_main(_arg: pg_sys::Datum) {
         let came_back = !back.is_empty();
         for (conversation, upto, started, outcome) in back {
             let (_, nobody) = channel();
-            answer(&Call { conversation, upto, started, answer: nobody }, &outcome);
+            answer(&Call { conversation, upto, started, answer: nobody }, &outcome, &mut stuck);
         }
 
         // Look for work when woken, when an answer may have left a
@@ -335,10 +350,12 @@ pub extern "C-unwind" fn pgxila_agent_main(_arg: pg_sys::Datum) {
                 break;
             }
             // Already asked at this line: the call is on its way.
-            if calls.iter().any(|call| call.conversation == conversation && call.upto == upto) {
+            if calls.iter().any(|call| call.conversation == conversation && call.upto == upto)
+                || stuck.contains(&conversation)
+            {
                 continue;
             }
-            let Some((url, token_variable, upto, body)) = request(&conversation) else {
+            let Some((url, token_variable, upto, body)) = request(&conversation, &mut stuck) else {
                 continue;
             };
             let (send, answer) = channel();

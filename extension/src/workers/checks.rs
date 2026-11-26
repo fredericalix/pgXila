@@ -424,6 +424,14 @@ mod tests {
         answer(&conversation, &before, 200, &says("Two."));
         assert_eq!(lines(&conversation).as_array().unwrap().len(), 2);
 
+        // F9 from the list of conversations comes back to it as it was.
+        let back = json(r#"SELECT xila.act('conversations', 'agent', '{}')"#);
+        assert_eq!(back[0]["card"], json!(conversation));
+        assert_eq!(
+            json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["about"],
+            json!("Looking at Books")
+        );
+
         // F9 again, from the desktop: the same conversation, about nothing.
         let again = json(r#"SELECT xila.act('desktop', 'agent', '{}')"#);
         assert_eq!(again[0]["card"], json!(conversation));

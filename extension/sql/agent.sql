@@ -973,12 +973,16 @@ BEGIN
             RETURN '[]'::jsonb;
         END IF;
         talk := xila.current_conversation();
-        -- What the person is looking at, for "this stack" and "this card".
-        UPDATE xila.conversation c
-        SET stack = s.name, card = CASE WHEN s.name IS NOT NULL THEN on_card END
-        FROM (SELECT 1) one
-        LEFT JOIN xila.stack s ON s.name = agent_act.stack AND s.kind = 'user'
-        WHERE c.id = talk;
+        -- What the person is looking at, for "this stack" and "this card":
+        -- a stack, or nothing when called from the desktop. Coming back from
+        -- one of the screens of the agent itself changes nothing.
+        IF stack NOT IN ('conversations', 'agent_journal', 'agent_settings') THEN
+            UPDATE xila.conversation c
+            SET stack = s.name, card = CASE WHEN s.name IS NOT NULL THEN on_card END
+            FROM (SELECT 1) one
+            LEFT JOIN xila.stack s ON s.name = agent_act.stack AND s.kind = 'user'
+            WHERE c.id = talk;
+        END IF;
         RETURN jsonb_build_array(xila.fx_show('agent', talk::text));
 
     WHEN 'ask_agent' THEN
