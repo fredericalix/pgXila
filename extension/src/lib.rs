@@ -200,7 +200,7 @@ mod tests {
     #[pg_test]
     fn hello_names_the_home_stack() {
         let hello = json("SELECT xila.hello()");
-        assert_eq!(hello["api"], 4);
+        assert_eq!(hello["api"], 5);
         assert_eq!(hello["home"], "desktop");
     }
 

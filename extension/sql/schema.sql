@@ -156,7 +156,8 @@ CREATE TABLE xila.action (
                       'remove_colour', 'script', 'edit_script', 'save_script',
                       'test_script', 'agent', 'ask_agent', 'stop_agent',
                       'new_conversation', 'conversations', 'open_conversation',
-                      'agent_journal', 'agent_settings', 'save_agent_settings')),
+                      'agent_journal', 'agent_settings', 'save_agent_settings',
+                      'apply_proposal', 'refuse_proposal', 'view_proposal')),
     args          jsonb NOT NULL DEFAULT '{}',
     UNIQUE NULLS NOT DISTINCT (background_id, name)
 );
@@ -685,13 +686,20 @@ INSERT INTO xila.agent_setting DEFAULT VALUES;
 -- A tool of the agent: a SQL function f(as_role name, arguments jsonb)
 -- RETURNS jsonb. The model reads the name, the description and the
 -- parameters; people read the label.
+--
+-- A tool that reads has that one function. A tool that changes something has
+-- two: "function" is run by the worker and changes nothing, it only checks
+-- the change and describes it as a proposal; "applies", g(arguments jsonb)
+-- RETURNS jsonb, is run by the session of the person who applies the
+-- proposal, with their rights.
 CREATE TABLE xila.agent_tool (
     name        text PRIMARY KEY CHECK (name ~ '^[a-z][a-z0-9_]{0,40}$'),
     ord         integer NOT NULL DEFAULT 0,
     label       text NOT NULL,
     description text NOT NULL,
     parameters  jsonb NOT NULL DEFAULT '{"type": "object", "properties": {}}',
-    function    regproc NOT NULL
+    function    regproc NOT NULL,
+    applies     regproc
 );
 
 -- A conversation between someone and the agent. stack and card say what its
@@ -711,17 +719,42 @@ CREATE INDEX conversation_owner ON xila.conversation (owner, changed_at);
 CREATE INDEX conversation_waiting ON xila.conversation (changed_at) WHERE state = 'waiting';
 
 -- A line of a conversation. text is what people read. payload is what the
--- model is sent back: its own message, or the result of a tool.
+-- model is sent back: its own message, or the result of a tool. A note says
+-- something that happened, to the person and to the model alike: a proposal
+-- was applied, a question was given up.
 CREATE TABLE xila.agent_message (
     id              uuid PRIMARY KEY DEFAULT uuidv7(),
     conversation_id uuid NOT NULL REFERENCES xila.conversation ON DELETE CASCADE,
     at              timestamptz NOT NULL DEFAULT clock_timestamp(),
-    kind            text NOT NULL CHECK (kind IN ('user', 'agent', 'tool', 'error')),
+    kind            text NOT NULL CHECK (kind IN ('user', 'agent', 'tool', 'error', 'note')),
     text            text NOT NULL DEFAULT '',
     payload         jsonb
 );
 
 CREATE INDEX agent_message_order ON xila.agent_message (conversation_id, at, id);
+
+-- A change the agent proposes. Nothing is changed until the owner of the
+-- conversation applies it: "arguments" is then given to the function that
+-- applies the tool, in the session of that person.
+CREATE TABLE xila.agent_proposal (
+    id              uuid PRIMARY KEY DEFAULT uuidv7(),
+    conversation_id uuid NOT NULL REFERENCES xila.conversation ON DELETE CASCADE,
+    at              timestamptz NOT NULL DEFAULT clock_timestamp(),
+    tool            text NOT NULL,
+    arguments       jsonb NOT NULL,
+    -- What it does: a sentence, a few lines, and the calls that applying runs.
+    title           text NOT NULL,
+    detail          text NOT NULL DEFAULT '',
+    code            text NOT NULL DEFAULT '',
+    -- What it is about, to go and look.
+    stack           text,
+    card            text,
+    state           text NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending', 'applied', 'refused')),
+    resolved_at     timestamptz
+);
+
+CREATE INDEX agent_proposal_order ON xila.agent_proposal (conversation_id, at, id);
 
 -- The journal of the agent: every call to the model and every tool it ran,
 -- for whom. There is deliberately no foreign key: the journal outlives the
@@ -754,9 +787,17 @@ ALTER TABLE xila.agent_message ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own_read ON xila.agent_message FOR SELECT TO xila_user
     USING (EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id));
 CREATE POLICY own_ask ON xila.agent_message FOR INSERT TO xila_user
-    WITH CHECK (kind = 'user' AND payload IS NULL
+    WITH CHECK (kind IN ('user', 'note') AND payload IS NULL
                 AND EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id));
 CREATE POLICY worker ON xila.agent_message TO xila_agent USING (true) WITH CHECK (true);
+
+-- A proposal is written by the worker. Its owner reads it, and says what
+-- became of it.
+ALTER TABLE xila.agent_proposal ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own ON xila.agent_proposal TO xila_user
+    USING (EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id))
+    WITH CHECK (EXISTS (SELECT FROM xila.conversation c WHERE c.id = conversation_id));
+CREATE POLICY worker ON xila.agent_proposal TO xila_agent USING (true) WITH CHECK (true);
 
 ALTER TABLE xila.agent_log ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own_read ON xila.agent_log FOR SELECT TO xila_user
@@ -786,8 +827,9 @@ GRANT INSERT (origin, stack_id, object_kind, object_key, op, before, after)
 
 -- The agent. People hold their conversations and ask; they read the journal
 -- within its policy and cannot write it. Administrators change the settings.
-GRANT SELECT ON xila.agent_tool, xila.conversation, xila.agent_message, xila.agent_log
-    TO xila_user;
+GRANT SELECT ON xila.agent_tool, xila.conversation, xila.agent_message, xila.agent_log,
+    xila.agent_proposal TO xila_user;
+GRANT UPDATE (state, resolved_at, stack, card) ON xila.agent_proposal TO xila_user;
 GRANT INSERT (stack, card) ON xila.conversation TO xila_user;
 GRANT UPDATE (title, state, stack, card, changed_at) ON xila.conversation TO xila_user;
 GRANT INSERT (conversation_id, kind, text) ON xila.agent_message TO xila_user;
@@ -801,6 +843,7 @@ GRANT SELECT ON xila.stack, xila.background, xila.widget, xila.agent_setting, xi
     TO xila_agent;
 GRANT SELECT, UPDATE ON xila.conversation TO xila_agent;
 GRANT SELECT, INSERT ON xila.agent_message TO xila_agent;
+GRANT SELECT, INSERT ON xila.agent_proposal TO xila_agent;
 GRANT SELECT, INSERT ON xila.agent_log TO xila_agent;
 
 -- ---------------------------------------------------------------------------
@@ -833,6 +876,7 @@ SELECT pg_catalog.pg_extension_config_dump('xila.agent_setting', '');
 SELECT pg_catalog.pg_extension_config_dump('xila.conversation', '');
 SELECT pg_catalog.pg_extension_config_dump('xila.agent_message', '');
 SELECT pg_catalog.pg_extension_config_dump('xila.agent_log', '');
+SELECT pg_catalog.pg_extension_config_dump('xila.agent_proposal', '');
 SELECT pg_catalog.pg_extension_config_dump('xila.script',
     $$WHERE background_id IN (SELECT b.id FROM xila.background b
         JOIN xila.stack s ON s.id = b.stack_id WHERE s.kind = 'user')$$);

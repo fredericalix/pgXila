@@ -17,7 +17,7 @@ use serde_json::json;
 use xila_core::connection::ConnectParams;
 use xila_core::server::Server;
 use xila_core::session::Session;
-use xila_core::talk::{self, Speaker};
+use xila_core::talk::{self, Speaker, State};
 
 #[path = "support/fake_model.rs"]
 mod fake_model;
@@ -145,7 +145,8 @@ fn the_agent_reads_the_stacks_to_answer() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["list_stacks", "find_cards", "read_card"]);
+    assert_eq!(tools[..3], ["list_stacks", "find_cards", "read_card"]);
+    assert_eq!(tools.len(), 9, "{tools:?}");
 
     let second = &requests[1].body["messages"];
     assert_eq!(second[2]["tool_calls"][0]["function"]["name"], "find_cards");
@@ -266,9 +267,118 @@ fn the_agent_does_not_read_what_is_closed_to_it_nor_what_the_person_cannot_open(
     assert!(listed.contains(r#"\"closed\": true"#), "{listed}");
     let refused = requests[count - 1].body["messages"].to_string();
     assert!(refused.contains("is closed to the agent"), "{refused}");
-    assert_eq!(author_talk.view().text("today"), "2 actions, 1 refused");
+    assert_eq!(author_talk.view().text("today"), "2 actions, 0 applied, 0 refused");
 
     as_author(
         "DELETE FROM xila.stack WHERE name = 'agent_secrets'; DROP SCHEMA agent_secrets CASCADE",
+    );
+}
+
+/// Runs SQL statements as the author, outside the pgXila API.
+fn execute_as_author(statements: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (client, connection) =
+            xila_core::connection::connect(&params("PGXILA_TEST_AUTHOR")).await.unwrap();
+        tokio::spawn(connection);
+        client.batch_execute(statements).await.unwrap();
+    });
+}
+
+/// What became of the proposals of the conversation on screen, oldest first.
+fn proposed(session: &Session<Server>) -> Vec<(State, String)> {
+    said(session)
+        .into_iter()
+        .filter_map(|(speaker, text)| match speaker {
+            Speaker::Proposal(became) => {
+                Some((became, text.lines().next().unwrap_or_default().to_owned()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs the scratch pgXila server and the fake model"]
+fn the_agent_proposes_and_the_person_decides() {
+    execute_as_author(
+        "DELETE FROM xila.stack WHERE name = 'agent_films'; DROP SCHEMA IF EXISTS agent_films CASCADE",
+    );
+    let model = FakeModel::start();
+    let mut author = session_as("PGXILA_TEST_AUTHOR");
+    with_the_agent(&mut author);
+
+    // A stack, from a description. Nothing exists until the author applies.
+    model.will_call(
+        "create_stack",
+        json!({"title": "Agent films", "fields": [{"label": "Title"}, {"label": "Year", "type": "number"}]}),
+    );
+    model.will_say("I propose a stack with a title and a year.");
+    ask(&mut author, "I want to keep the films I saw.");
+    wait_for_the_answer(&mut author);
+    assert_eq!(proposed(&author), [(State::Pending, "Create the stack “Agent films”".to_owned())]);
+    // The model was told that it only proposed.
+    let told = model.requests().last().unwrap().body["messages"].to_string();
+    assert!(told.contains("Nothing has changed."), "{told}");
+
+    // F2 applies it, in the session of the author.
+    assert!(author.press("F2"));
+    assert_eq!(author.message(), Some("Applied: Stack “Agent films” created, with 2 fields."));
+    assert_eq!(proposed(&author)[0].0, State::Applied);
+    let today = author.view().text("today").to_owned();
+    assert!(today.contains(" 1 applied, 0 refused"), "{today}");
+
+    // A card for it: proposed, then refused. Nothing is written.
+    model.will_call(
+        "save_card",
+        json!({"stack": "agent_films", "values": {"title": "Alien", "year": 1979}}),
+    );
+    model.will_say("I propose a card for Alien.");
+    ask(&mut author, "Add Alien, from 1979.");
+    wait_for_the_answer(&mut author);
+    // The model read, with the question, what became of its first proposal.
+    let sent = model.requests().last().unwrap().body["messages"].to_string();
+    assert!(sent.contains("(Applied: Stack “Agent films” created, with 2 fields.)"), "{sent}");
+    assert_eq!(proposed(&author)[1], (State::Pending, "Add a card to Agent films".to_owned()));
+    assert!(author.press("F4"));
+    assert_eq!(author.message(), Some("Proposal refused."));
+    assert_eq!(proposed(&author)[1].0, State::Refused);
+
+    // Proposed again and applied: the card is there.
+    model.will_call(
+        "save_card",
+        json!({"stack": "agent_films", "values": {"title": "Alien", "year": 1979}}),
+    );
+    model.will_say("Here it is again.");
+    ask(&mut author, "Yes, do add it.");
+    wait_for_the_answer(&mut author);
+    assert!(author.press("F2"));
+    assert_eq!(author.message(), Some("Applied: Card “Alien” added to Agent films."));
+
+    // The stack is an ordinary stack, with its card, and its history says
+    // that the agent was behind what the author applied.
+    let mut browsing = session_as("PGXILA_TEST_AUTHOR");
+    browsing.run("open_stacks");
+    let row = browsing.view().grids["list"]
+        .page
+        .rows
+        .iter()
+        .position(|row| row.cells["title"].as_deref() == Some("Agent films"))
+        .expect("the new stack is listed");
+    browsing.select("list", row);
+    browsing.activate("list");
+    assert_eq!(browsing.view().stack(), "agent_films");
+    assert_eq!(browsing.view().value("title"), "Alien");
+    assert_eq!(browsing.view().value("year"), "1979");
+    assert!(browsing.press("F10"));
+    let who = browsing.view().grids["changes"].page.rows[0].cells["actor"].clone().unwrap();
+    assert!(who.ends_with(" (agent)"), "{who}");
+
+    // Nothing is left to apply.
+    assert!(author.press("F2"));
+    assert_eq!(author.message(), Some("The agent has proposed nothing that waits."));
+
+    execute_as_author(
+        "DELETE FROM xila.stack WHERE name = 'agent_films'; DROP SCHEMA agent_films CASCADE",
     );
 }

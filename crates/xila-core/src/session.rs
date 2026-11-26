@@ -13,7 +13,7 @@ use crate::api::{
 };
 
 /// The version of the API this client speaks; see `docs/api.md`.
-pub const API_VERSION: u32 = 4;
+pub const API_VERSION: u32 = 5;
 
 /// The rows of a grid widget and the selected one.
 #[derive(Debug, Clone, PartialEq, Default)]

@@ -145,6 +145,8 @@ summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.ba
                 (SELECT md5(address || model || token_variable) FROM xila.agent_setting),
                 (SELECT count(*) FROM xila.conversation), (SELECT count(*) FROM xila.agent_message),
                 (SELECT count(*) FROM xila.agent_log),
+                (SELECT count(*) || ':' || count(*) FILTER (WHERE state = 'applied')
+                   FROM xila.agent_proposal),
                 has_table_privilege('xila_agent', 'addressbook.contacts', 'SELECT')"
 scratch db-scratch sh -c '
     set -e

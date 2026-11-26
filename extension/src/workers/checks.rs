@@ -383,8 +383,14 @@ mod tests {
         assert_eq!(on_screen["values"]["about"], json!("Looking at Books"));
         assert_eq!(on_screen["values"]["model"], json!("test-model"));
         assert_eq!(on_screen["values"]["host"], json!("models.example"));
-        assert_eq!(on_screen["values"]["tools"], json!("List the stacks, Find cards, Read a card"));
-        assert_eq!(on_screen["values"]["today"], json!("0 actions, 0 refused"));
+        assert_eq!(
+            on_screen["values"]["tools"],
+            json!(
+                "List the stacks, Find cards, Read a card, Add a field, Change a field, \
+                 Remove a field, Create a stack, Write a card, Delete a card"
+            )
+        );
+        assert_eq!(on_screen["values"]["today"], json!("0 actions, 0 applied, 0 refused"));
 
         // Nothing to send.
         let (code, _) = error_of(&format!(
@@ -499,7 +505,20 @@ mod tests {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["list_stacks", "find_cards", "read_card"]);
+        assert_eq!(
+            tools,
+            [
+                "list_stacks",
+                "find_cards",
+                "read_card",
+                "add_field",
+                "change_field",
+                "remove_field",
+                "create_stack",
+                "save_card",
+                "delete_card"
+            ]
+        );
         assert_eq!(body["tools"][1]["function"]["parameters"]["required"], json!(["stack"]));
 
         // The model asks for a tool: the worker runs it, for Ada, and the
@@ -570,7 +589,7 @@ mod tests {
         );
         assert_eq!(
             json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["today"],
-            json!("1 action, 0 refused")
+            json!("1 action, 0 applied, 0 refused")
         );
         assert_eq!(
             json("SELECT xila.grid_rows('agent_journal', 'list')")["rows"][0]["cells"]["summary"],
@@ -622,7 +641,7 @@ mod tests {
         assert_eq!(state_of(&conversation), "idle");
         assert_eq!(
             json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["today"],
-            json!("0 actions, 1 refused")
+            json!("0 actions, 0 applied, 0 refused")
         );
     }
 
@@ -797,11 +816,12 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "F2=Apply",
                 "F3=Quit",
+                "F4=Refuse",
                 "F5=Stop",
                 "F6=New",
-                "F9=Agent",
-                "F10=Conversations",
+                "F10=List",
                 "F12=Back",
                 "Enter=Send"
             ]
@@ -841,5 +861,544 @@ mod tests {
         )
         .unwrap();
         assert!(!agent_may_read_books());
+    }
+
+    /// Has the model ask for a tool that changes something, then say a word.
+    /// Gives the conversation.
+    fn propose(question: &str, tool: &str, arguments: Json) -> String {
+        let conversation = ask(question);
+        let asked = request(&conversation).expect("a request");
+        answer(&conversation, &asked, 200, &calls(tool, arguments));
+        let again = request(&conversation).expect("a second request");
+        answer(&conversation, &again, 200, &says("I propose it."));
+        assert_eq!(state_of(&conversation), "idle");
+        conversation
+    }
+
+    /// The proposals of a conversation, the latest first.
+    fn proposals(conversation: &str) -> Json {
+        json(&format!(
+            "SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.at DESC, p.id DESC), '[]')
+             FROM xila.agent_proposal p WHERE p.conversation_id = '{conversation}'"
+        ))
+    }
+
+    /// What the model was told the latest tool gave.
+    fn told(conversation: &str) -> String {
+        json(&format!(
+            "SELECT m.payload->'result' FROM xila.agent_message m
+             WHERE m.conversation_id = '{conversation}' AND m.kind = 'tool'
+             ORDER BY m.at DESC, m.id DESC LIMIT 1"
+        ))
+        .to_string()
+    }
+
+    fn act(action: &str, context: Json) -> Json {
+        json(&format!("SELECT xila.act('agent', '{action}', {})", quoted(&context.to_string())))
+    }
+
+    fn has_column(column: &str) -> bool {
+        number(&format!(
+            "SELECT count(*) FROM pg_attribute
+             WHERE attrelid = 'books.cards'::regclass AND attname = '{column}' AND NOT attisdropped"
+        )) == 1
+    }
+
+    #[pg_test]
+    fn the_agent_proposes_and_the_person_applies() {
+        set_up();
+        let conversation = propose(
+            "Add when I bought each book.",
+            "add_field",
+            json!({"stack": "books", "label": "Bought", "type": "date"}),
+        );
+
+        // Nothing changed: the change waits, described, in the conversation.
+        assert!(!has_column("bought"));
+        let waiting = proposals(&conversation);
+        assert_eq!(waiting.as_array().unwrap().len(), 1, "{waiting}");
+        assert_eq!(waiting[0]["state"], json!("pending"));
+        assert_eq!(waiting[0]["title"], json!("Add the field “Bought” to Books"));
+        let detail = "A field of type date, at the end of the cards. It adds the column bought \
+                      to the table books.cards.";
+        assert_eq!(waiting[0]["detail"], json!(detail));
+        assert_eq!(waiting[0]["code"], json!("xila.add_field('books', 'Bought', 'date')"));
+        let proposal = waiting[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            lines(&conversation),
+            json!([
+                ["user", "Add when I bought each book."],
+                ["proposal", format!("Add the field “Bought” to Books\n{detail}")],
+                ["agent", "I propose it."]
+            ])
+        );
+        // The model was told that it is only proposed.
+        let given = told(&conversation);
+        assert!(given.contains(r#""proposed":true"#), "{given}");
+        assert!(given.contains("Nothing has changed."), "{given}");
+        assert_eq!(
+            text(
+                "SELECT summary FROM xila.agent_log WHERE event = 'tool' ORDER BY at DESC LIMIT 1"
+            )
+            .unwrap(),
+            "Proposed: add the field “Bought” to Books."
+        );
+        // The screen gives the proposal its state and the call it runs.
+        let talk =
+            json(&format!("SELECT xila.grid_rows('agent', 'talk', 0, 100, '{conversation}')"));
+        let row = &talk["rows"][1];
+        assert_eq!(row["key"], json!(proposal));
+        assert_eq!(row["cells"]["state"], json!("pending"));
+        assert_eq!(row["cells"]["code"], json!("xila.add_field('books', 'Bought', 'date')"));
+
+        // The same thing asked again is not proposed twice.
+        let again = ask("Did you do it?");
+        let asked = request(&again).unwrap();
+        let same = json!({"stack": "Books", "label": "Bought", "type": "date"});
+        answer(&again, &asked, 200, &calls("add_field", same));
+        assert_eq!(proposals(&conversation).as_array().unwrap().len(), 1);
+        let asked = request(&again).unwrap();
+        answer(&again, &asked, 200, &says("It waits for you."));
+
+        // F2 applies the proposal that waits: Ada's session makes the change.
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[0], json!({"do": "show", "stack": "agent", "card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Field “Bought” added to Books."));
+        assert!(has_column("bought"));
+        assert_eq!(proposals(&conversation)[0]["state"], json!("applied"));
+        assert_eq!(
+            lines(&conversation).as_array().unwrap().last().unwrap(),
+            &json!(["note", "Applied: Field “Bought” added to Books."])
+        );
+        // History knows the change came from the agent, and who applied it.
+        assert_eq!(
+            json(
+                "SELECT jsonb_agg(DISTINCT jsonb_build_array(h.actor, h.origin)) FROM xila.history h
+                 WHERE h.object_kind = 'column'"
+            ),
+            json!([["ada", "agent"], ["ada", "user"]])
+        );
+        assert_eq!(
+            text("SELECT actor FROM xila.history_line WHERE stack = 'books'").unwrap(),
+            "ada (agent)"
+        );
+        // What is done next is Ada's again.
+        Spi::run("SELECT xila.add_field('books', 'Pages', 'number')").unwrap();
+        assert_eq!(
+            text("SELECT h.origin FROM xila.history h ORDER BY h.id DESC LIMIT 1").unwrap(),
+            "user"
+        );
+        assert_eq!(
+            json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["today"],
+            json!("2 actions, 1 applied, 0 refused")
+        );
+
+        // The model reads what became of its proposal with the next question.
+        ask("Thanks.");
+        let sent = request(&conversation).unwrap()["body"]["messages"].to_string();
+        assert!(sent.contains("(Applied: Field “Bought” added to Books.)"), "{sent}");
+
+        // Applied once: nothing is left to apply, and it cannot be applied again.
+        let nothing = act("apply", json!({"card": conversation}));
+        assert_eq!(nothing[0]["text"], json!("The agent has proposed nothing that waits."));
+        let (code, message) = error_of(&format!("xila.apply_proposal('{proposal}')"));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("XL003", "This proposal was already applied.")
+        );
+
+        // What the agent proposed is undone like anything else.
+        Spi::run(
+            "SELECT xila.rewind('books', 'screen',
+                 (SELECT min(h.id) FROM xila.history h WHERE h.origin = 'agent'))",
+        )
+        .unwrap();
+        assert!(!has_column("bought"));
+    }
+
+    #[pg_test]
+    fn a_proposal_that_is_refused_changes_nothing() {
+        set_up();
+        let conversation =
+            propose("Remove the year.", "remove_field", json!({"stack": "books", "field": "Year"}));
+        let waiting = proposals(&conversation);
+        assert_eq!(waiting[0]["title"], json!("Remove the field “Year” from Books"));
+        assert_eq!(
+            waiting[0]["detail"],
+            json!(
+                "2 cards have a value for it. History can bring the field back, with its values."
+            )
+        );
+        let proposal = waiting[0]["id"].as_str().unwrap().to_owned();
+
+        // The window names the proposal its button belongs to.
+        let refused = act("refuse", json!({"card": conversation, "input": {"proposal": proposal}}));
+        assert_eq!(refused[1]["text"], json!("Proposal refused."));
+        assert!(has_column("year"));
+        assert_eq!(proposals(&conversation)[0]["state"], json!("refused"));
+        assert_eq!(
+            lines(&conversation).as_array().unwrap().last().unwrap(),
+            &json!(["note", "Refused: Remove the field “Year” from Books."])
+        );
+        assert_eq!(
+            json(&format!("SELECT xila.card('agent', '{conversation}', 'at')"))["values"]["today"],
+            json!("1 action, 0 applied, 1 refused")
+        );
+        let (code, _) = error_of(&format!("xila.apply_proposal('{proposal}')"));
+        assert_eq!(code, "XL003");
+        // The journal says what became of it.
+        assert_eq!(
+            json("SELECT xila.grid_rows('agent_journal', 'list')")["rows"][0]["cells"]["summary"],
+            json!("Refused: Remove the field “Year” from Books")
+        );
+
+        // Applied, it removes the field, without another question.
+        let conversation =
+            propose("Remove it.", "remove_field", json!({"stack": "books", "field": "year"}));
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Field “Year” removed from Books."));
+        assert!(!has_column("year"));
+    }
+
+    #[pg_test]
+    fn the_agent_proposes_what_a_card_should_say() {
+        set_up();
+        let candide = text("SELECT id::text FROM books.cards WHERE title = 'Candide'").unwrap();
+        let conversation = propose(
+            "Candide is from 1760.",
+            "save_card",
+            json!({"stack": "books", "key": candide, "values": {"Year": 1760, "title": "Candide"}}),
+        );
+        let waiting = proposals(&conversation);
+        // What the card already says is not part of the change.
+        assert_eq!(waiting[0]["title"], json!("Change the card “Candide” of Books"));
+        assert_eq!(waiting[0]["detail"], json!("Year: 1759 → 1760"));
+        assert_eq!(
+            waiting[0]["code"],
+            json!(format!(r#"xila.save_card('books', '{candide}', '{{"year": "1760"}}')"#))
+        );
+        assert_eq!(waiting[0]["card"], json!(candide));
+
+        // Someone changes the card in the meantime: applying overwrites nothing.
+        Spi::run("UPDATE books.cards SET year = 1761 WHERE title = 'Candide'").unwrap();
+        let (code, message) =
+            error_of(&format!(r#"xila.act('agent', 'apply', '{{"card": "{conversation}"}}')"#));
+        assert_eq!(code, "XL003");
+        assert!(message.starts_with("The card changed since the agent proposed this"), "{message}");
+        assert_eq!(proposals(&conversation)[0]["state"], json!("pending"));
+        Spi::run("UPDATE books.cards SET year = 1759 WHERE title = 'Candide'").unwrap();
+
+        // "View" goes to the card the proposal is about.
+        let shown = act("view", json!({"card": conversation}));
+        assert_eq!(shown, json!([{"do": "show", "stack": "books", "card": candide}]));
+
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Card “Candide” of Books changed."));
+        assert_eq!(number("SELECT year::bigint FROM books.cards WHERE title = 'Candide'"), 1760);
+        assert_eq!(
+            text("SELECT actor FROM xila.card_history_line ORDER BY id DESC LIMIT 1").unwrap(),
+            "ada (agent)"
+        );
+
+        // A new card.
+        let conversation = propose(
+            "Add Les Misérables.",
+            "save_card",
+            json!({"stack": "books", "values": {"title": "Les Misérables", "year": "1862"}}),
+        );
+        assert_eq!(proposals(&conversation)[0]["title"], json!("Add a card to Books"));
+        assert_eq!(
+            proposals(&conversation)[0]["detail"],
+            json!("Title: Les Misérables\nYear: 1862")
+        );
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Card “Les Misérables” added to Books."));
+        assert_eq!(number("SELECT count(*) FROM books.cards"), 3);
+        // The proposal now leads to the card it made.
+        let made = text("SELECT id::text FROM books.cards WHERE title = 'Les Misérables'").unwrap();
+        assert_eq!(act("view", json!({"card": conversation}))[0]["card"], json!(made));
+
+        // And a card deleted.
+        let conversation =
+            propose("Delete it.", "delete_card", json!({"stack": "books", "key": made}));
+        assert_eq!(
+            proposals(&conversation)[0]["title"],
+            json!("Delete the card “Les Misérables” of Books")
+        );
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Card “Les Misérables” deleted from Books."));
+        assert_eq!(number("SELECT count(*) FROM books.cards"), 2);
+    }
+
+    #[pg_test]
+    fn what_cannot_be_proposed_is_said_to_the_model() {
+        set_up();
+        let candide = text("SELECT id::text FROM books.cards WHERE title = 'Candide'").unwrap();
+        let cases = [
+            ("add_field", json!({"stack": "books", "label": "Year"}), "already has a field “Year”"),
+            (
+                "add_field",
+                json!({"stack": "books", "label": "Cover", "type": "picture"}),
+                "text, number, date or boolean",
+            ),
+            ("add_field", json!({"stack": "books"}), "A field needs a label."),
+            (
+                "change_field",
+                json!({"stack": "books", "field": "pages", "label": "P"}),
+                "has no field “pages”. Its fields are: title, year.",
+            ),
+            (
+                "change_field",
+                json!({"stack": "books", "field": "year", "label": "Year"}),
+                "There is nothing to change",
+            ),
+            (
+                "save_card",
+                json!({"stack": "books", "key": candide, "values": {"year": "long ago"}}),
+                "“long ago” cannot be the value of “Year”, which is a number field.",
+            ),
+            (
+                "save_card",
+                json!({"stack": "books", "key": candide, "values": {"year": 1759}}),
+                "The card already says so",
+            ),
+            (
+                "save_card",
+                json!({"stack": "books", "key": "nothing", "values": {"year": 1}}),
+                "There is no card with the key “nothing”",
+            ),
+            ("save_card", json!({"stack": "books", "values": {}}), "“values” holds what to write"),
+            ("delete_card", json!({"stack": "books", "key": ""}), "There is no card with the key"),
+            (
+                "create_stack",
+                json!({"title": "Books", "fields": [{"label": "Title"}]}),
+                "The name “books” is already taken",
+            ),
+            ("create_stack", json!({"title": "Films", "fields": []}), "“fields” lists the fields"),
+            (
+                "create_stack",
+                json!({"title": "Films", "fields": [{"label": "Title"}, {"label": "title"}]}),
+                "Two fields cannot both be named “title”.",
+            ),
+        ];
+        for (tool, arguments, said) in cases {
+            let conversation = propose("Do it.", tool, arguments.clone());
+            let given = told(&conversation);
+            assert!(given.contains(said), "{tool} {arguments}: {given}");
+            assert_eq!(proposals(&conversation), json!([]), "{tool} {arguments}");
+        }
+
+        // Required: a card that has no value stands in the way, and a new
+        // card needs what its table requires.
+        Spi::run(
+            r#"SELECT xila.set_field('books', 'title', '{"required": true}');
+               SELECT xila.save_card('books', NULL, '{"title": "Zadig"}')"#,
+        )
+        .unwrap();
+        let wanted = json!({"stack": "books", "field": "year", "required": true});
+        let conversation = propose("Do it.", "change_field", wanted);
+        let given = told(&conversation);
+        assert!(given.contains("1 card has no value for “Year”"), "{given}");
+        let wanted = json!({"stack": "books", "values": {"year": 1900}});
+        let conversation = propose("Do it.", "save_card", wanted);
+        let given = told(&conversation);
+        assert!(given.contains("A card of Books needs a value for: Title."), "{given}");
+    }
+
+    #[pg_test]
+    fn the_agent_proposes_no_more_than_the_person_could_do() {
+        set_up();
+        // Dan reads the books and nothing else; Bob is an author who does
+        // not own them.
+        Spi::run(
+            "GRANT USAGE ON SCHEMA books TO dan, bob; GRANT SELECT ON books.cards TO dan, bob",
+        )
+        .unwrap();
+        let candide = text("SELECT id::text FROM books.cards WHERE title = 'Candide'").unwrap();
+        let cases = [
+            ("dan", "add_field", json!({"stack": "books", "label": "Pages"}), "XL004"),
+            ("bob", "remove_field", json!({"stack": "books", "field": "year"}), "XL004"),
+            (
+                "dan",
+                "save_card",
+                json!({"stack": "books", "key": candide, "values": {"year": 1}}),
+                "XL004",
+            ),
+            ("dan", "delete_card", json!({"stack": "books", "key": candide}), "XL004"),
+            (
+                "dan",
+                "create_stack",
+                json!({"title": "Films", "fields": [{"label": "Title"}]}),
+                "XL004",
+            ),
+            // Someone who cannot open the stack: it does not exist.
+            ("eve", "add_field", json!({"stack": "books", "label": "Pages"}), "XL002"),
+        ];
+        for (as_role, tool, arguments, code) in cases {
+            become_role("xila_agent");
+            let (found, message) = error_of(&format!(
+                "xila.propose_{tool}('{as_role}', {})",
+                quoted(&arguments.to_string())
+            ));
+            become_role("ada");
+            assert_eq!(found, code, "{as_role} {tool}: {message}");
+        }
+        become_role("xila_agent");
+        let (_, message) =
+            error_of(r#"xila.propose_add_field('bob', '{"stack": "books", "label": "Pages"}')"#);
+        assert_eq!(message, "The stack “Books” belongs to ada: bob cannot change its fields.");
+        become_role("ada");
+
+        // Nothing can be proposed on a stack that is closed to the agent.
+        Spi::run(r#"SELECT xila.set_stack('books', '{"agent": false}')"#).unwrap();
+        let conversation =
+            propose("Do it.", "add_field", json!({"stack": "books", "label": "Pages"}));
+        let given = told(&conversation);
+        assert!(given.contains("is closed to the agent"), "{given}");
+        Spi::run(r#"SELECT xila.set_stack('books', '{"agent": true}')"#).unwrap();
+
+        // The functions that propose are for the worker, which still cannot
+        // write a card or a definition itself.
+        let (code, _) =
+            error_of(r#"xila.propose_add_field('ada', '{"stack": "books", "label": "Pages"}')"#);
+        assert_eq!(code, "42501");
+        become_role("xila_agent");
+        let (code, _) = error_of_statement("UPDATE books.cards SET year = 1");
+        assert_eq!(code, "42501");
+        let (code, _) = error_of(
+            r#"xila.apply_add_field('{"stack": "books", "label": "Pages", "type": "text"}')"#,
+        );
+        assert_eq!(code, "XL004");
+        let (code, _) = error_of_statement("UPDATE xila.agent_proposal SET state = 'applied'");
+        assert_eq!(code, "42501");
+        become_role("ada");
+
+        // A proposal belongs to the conversation of its owner: nobody else
+        // sees it or applies it, and its owner cannot rewrite it.
+        let conversation =
+            propose("Do it.", "add_field", json!({"stack": "books", "label": "Pages"}));
+        let proposal = proposals(&conversation)[0]["id"].as_str().unwrap().to_owned();
+        let (code, _) = error_of_statement("UPDATE xila.agent_proposal SET arguments = '{}'");
+        assert_eq!(code, "42501");
+        become_role("bob");
+        assert_eq!(number("SELECT count(*) FROM xila.agent_proposal"), 0);
+        let (code, _) = error_of(&format!("xila.apply_proposal('{proposal}')"));
+        assert_eq!(code, "XL002");
+        let (code, _) = error_of(&format!("xila.refuse_proposal('{proposal}')"));
+        assert_eq!(code, "XL002");
+        become_role("ada");
+        assert!(!has_column("pages"));
+    }
+
+    #[pg_test]
+    fn the_agent_proposes_a_stack_and_changes_to_its_fields() {
+        set_up();
+        let conversation = propose(
+            "I want to keep my films.",
+            "create_stack",
+            json!({"title": "My films", "fields": [
+                {"label": "Title"},
+                {"label": "Seen on", "type": "date"},
+                {"label": "Stars", "type": "number"}]}),
+        );
+        let waiting = proposals(&conversation);
+        assert_eq!(waiting[0]["title"], json!("Create the stack “My films”"));
+        assert_eq!(waiting[0]["detail"], json!("Title: text\nSeen on: date\nStars: number"));
+        assert_eq!(
+            waiting[0]["code"],
+            json!(
+                "xila.create_stack('My films')\n\
+                 xila.add_field('my_films', 'Title', 'text')\n\
+                 xila.add_field('my_films', 'Seen on', 'date')\n\
+                 xila.add_field('my_films', 'Stars', 'number')"
+            )
+        );
+        // There is nothing to look at before it is applied.
+        assert_eq!(
+            act("view", json!({"card": conversation}))[0]["text"],
+            json!("There is nothing to look at yet.")
+        );
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Stack “My films” created, with 3 fields."));
+        assert_eq!(
+            text("SELECT owner::text FROM xila.stack WHERE name = 'my_films'").unwrap(),
+            "ada"
+        );
+        assert_eq!(
+            json("SELECT jsonb_agg(f.name ORDER BY f.ord) FROM xila.field f WHERE f.stack = 'my_films'"),
+            json!(["title", "seen_on", "stars"])
+        );
+        assert_eq!(
+            act("view", json!({"card": conversation})),
+            json!([{"do": "show", "stack": "my_films"}])
+        );
+        // The agent may read what it helped to make.
+        assert_eq!(tool("find_cards", "ada", json!({"stack": "my_films"}))["total"], json!(0));
+
+        // A field changes its label and its name, and becomes required.
+        let conversation = propose(
+            "Call it rating.",
+            "change_field",
+            json!({"stack": "my_films", "field": "Stars", "label": "Rating", "name": "rating",
+                   "required": true}),
+        );
+        let waiting = proposals(&conversation);
+        assert_eq!(waiting[0]["title"], json!("Change the field “Stars” of My films"));
+        assert_eq!(
+            waiting[0]["detail"],
+            json!(
+                "label: Stars → Rating\n\
+                 name: stars → rating (the column is renamed)\n\
+                 required: no → yes"
+            )
+        );
+        let applied = act("apply", json!({"card": conversation}));
+        assert_eq!(applied[1]["text"], json!("Applied: Field “Stars” of My films changed."));
+        assert_eq!(
+            text("SELECT label FROM xila.field f WHERE f.stack = 'my_films' AND f.name = 'rating'")
+                .unwrap(),
+            "Rating"
+        );
+    }
+
+    #[pg_test]
+    fn a_table_pgxila_did_not_create_is_never_altered_by_a_proposal() {
+        set_up();
+        Spi::run(
+            "CREATE TABLE books.loans (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                                       who text NOT NULL, back date, note text);
+             SELECT xila.create_stack('Loans', NULL, 'books.loans'::regclass);
+             SELECT xila.remove_field('loans', 'note')",
+        )
+        .unwrap();
+        // Only a column that is there can become a field.
+        let conversation =
+            propose("Do it.", "add_field", json!({"stack": "loans", "label": "Phone"}));
+        let given = told(&conversation);
+        assert!(given.contains("only one of its columns can become a field"), "{given}");
+        assert!(given.contains("Columns not shown yet: note."), "{given}");
+        let wanted = json!({"stack": "loans", "label": "Note", "name": "note"});
+        let conversation = propose("Do it.", "add_field", wanted);
+        assert_eq!(
+            proposals(&conversation)[0]["detail"],
+            json!("It shows the column note of the table books.loans, which is not changed.")
+        );
+        act("apply", json!({"card": conversation}));
+        assert_eq!(
+            number("SELECT count(*) FROM xila.field WHERE stack = 'loans' AND name = 'note'"),
+            1
+        );
+
+        // A label may change; a name and what is required may not.
+        let wanted = json!({"stack": "loans", "field": "who", "name": "person"});
+        let conversation = propose("Do it.", "change_field", wanted);
+        let given = told(&conversation);
+        assert!(given.contains("only the label of its fields can be changed"), "{given}");
+        let wanted = json!({"stack": "loans", "field": "back"});
+        let conversation = propose("Do it.", "remove_field", wanted);
+        assert_eq!(
+            proposals(&conversation)[0]["detail"],
+            json!("It is only taken off the screen: the table is not changed.")
+        );
     }
 }

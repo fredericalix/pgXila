@@ -1,8 +1,8 @@
 # pgXila SQL API
 
 This document describes the contract between the pgXila extension and its
-clients, as implemented for phase 1, for phase 2 (author mode) and for step 3a
-of the agent. API version: 4.
+clients, as implemented for phase 1, for phase 2 (author mode) and for steps
+3a and 3b of the agent. API version: 5.
 
 A pgXila client is an ordinary PostgreSQL client. It connects over TLS 1.3 with
 SCRAM-SHA-256, calls SQL functions of the `xila` schema, and listens on
@@ -25,7 +25,7 @@ return and sends back what the user does.
 | Tables pgXila alters | Only those it created (`managed`); never a table that existed before |
 | Pictures | An image never changes: a drawing is saved as a new image, and what showed the old one points to the new one |
 | Scripts | Lua 5.4 inside the extension, one script per button or per screen, run with the rights of whoever triggers it |
-| The agent | In a background worker, under a role of its own. It reads for the person it talks with, and never more than that person may read |
+| The agent | In a background worker, under a role of its own. It reads for the person it talks with, and never more than that person may read. It writes nothing: it proposes, and the person applies |
 | Identifiers | `uuid` (UUIDv7), ready for several instances |
 | Text grid | 80 columns by 24 rows |
 | Graphic screen | 480 by 300 pixels, one byte per pixel, each a palette slot |
@@ -69,7 +69,7 @@ its own, usually in a schema of its own, for example `addressbook.contacts`.
 | `xila.key_binding` | a key bound to an action | `background_id`, `key`, `action_id` |
 | `xila.script` | the script of a button, or of a screen | `background_id`, `widget_id`, `language`, `source`, `events`, `keys`; see section 9 |
 | `xila.history` | one recorded change | see section 7 |
-| `xila.agent_setting`, `xila.agent_tool`, `xila.conversation`, `xila.agent_message`, `xila.agent_log` | the agent | see section 11.4 |
+| `xila.agent_setting`, `xila.agent_tool`, `xila.conversation`, `xila.agent_message`, `xila.agent_proposal`, `xila.agent_log` | the agent | see sections 11.4 and 11.10 |
 
 Building a stack means inserting rows in these tables. `examples/addressbook.sql`
 builds a complete one in SQL; author mode (section 10) does the same from the
@@ -144,7 +144,9 @@ client.
   mode, go back. A stack cannot bind them. `{"for": "author"}` in the `args`
   of an action keeps it, and its keys, for the members of `xila_author`;
   `{"for": "editor"}` for those who may change the stack on screen; `{"for":
-  "admin"}` for the members of `xila_admin`.
+  "admin"}` for the members of `xila_admin`. `{"except": ["agent"]}` keeps an
+  action shared by every screen off some of them: the key that leads to a
+  screen is not listed on that screen.
 
 ## 3. Screen definition
 
@@ -357,6 +359,7 @@ The handlers:
 | `script` | Runs the script of what triggered the action; see section 9.4 |
 | `edit_script`, `test_script`, `save_script` | What the script editor asks for; see section 9.6 |
 | `agent`, `ask_agent`, `stop_agent`, `new_conversation`, `conversations`, `open_conversation`, `agent_journal`, `agent_settings`, `save_agent_settings` | The agent and its screens; see section 11.7 |
+| `apply_proposal`, `refuse_proposal`, `view_proposal` | What the person does with a change the agent proposes; see section 11.10 |
 
 The author handlers read the context and call the functions of section 10.3.
 On the author screens the key of the card is the subject of the dialog: the
@@ -388,7 +391,7 @@ Every change to a stack, a screen or a card is recorded in `xila.history`:
 |--------|---------|
 | `id`, `at`, `txid` | order, time and transaction of the change |
 | `actor` | the role that made it |
-| `origin` | `user`, `agent` or `system` |
+| `origin` | `user`, `agent` or `system`. `agent` is a change the agent proposed and `actor` applied (section 11.10) |
 | `stack_id`, `object_kind`, `object_key` | what changed: a `card`, or a row of `stack`, `background`, `widget`, `layout`, `action`, `key_binding`, `stack_colour`, `palette` |
 | `op` | `insert`, `update` or `delete` |
 | `before`, `after` | the row before and after, as `jsonb` |
@@ -767,8 +770,8 @@ the dialog, and what is typed on it goes to an action, never to the view:
 
 `Escape` leaves a screen like `F12`, and gives up a question.
 
-Left for later steps: creating a stack from a description with the agent
-(step 3b); sharing the cards of a stack from the client.
+Left for later steps: sharing the cards of a stack from the client. A stack
+can also be made from a description, with the agent (section 11.10).
 
 ### 10.7 The visual editor
 
@@ -936,13 +939,13 @@ Agent button.
 
 Phase 3 is delivered in three steps: 3a, talking with the agent from a screen
 and letting it read; 3b, the agent proposes changes that the user applies or
-refuses; 3c, memory, with pgvector. This section describes step 3a, which is
-implemented.
+refuses; 3c, memory, with pgvector. This section describes steps 3a and 3b,
+which are implemented.
 
 | Decision | Choice |
 |----------|--------|
 | Where the agent runs | In a background worker, never in the backend of a user |
-| What it can do in 3a | Read, and answer. It changes nothing: writing comes in 3b, as proposals |
+| What it can do | Read, answer, and propose changes. It changes nothing itself: the person applies a proposal or refuses it (11.10) |
 | What it may read | The cards of the stacks left open to it, and never more than the person it talks with may read |
 | A stack and the agent | Open by default; whoever may edit the stack closes it. Being open is a `GRANT` to the role `xila_agent` |
 | Its tools | SQL functions, listed in a table, run under the role `xila_agent` |
@@ -986,7 +989,7 @@ of the server.
 
 | Role | Login | Purpose |
 |------|-------|---------|
-| `xila_agent` | no | The role of the worker. It owns nothing, cannot create anything, and is not a member of `xila_user` |
+| `xila_agent` | no | The role of the worker. It owns nothing, cannot create anything, cannot write to a stack, and is not a member of `xila_user` |
 | `xila_admin` | no | Group role, member of `xila_author`. May change the agent settings and read the whole journal |
 
 `xila_agent` may read the definitions of the stacks, read and write the tables
@@ -1018,9 +1021,10 @@ sent, so that the agent can say that it is closed. The address must be
 local LM Studio needs. The worker follows no redirection.
 
 **What a card can make it do.** The model reads cards as text, and a card may
-hold text written to steer it. In 3a the worst such a card can do is to make
-the answer wrong: the agent has no tool that writes, sends or fetches
-anything.
+hold text written to steer it. The worst such a card can do is to make an
+answer wrong, or a proposal unwanted: the agent has no tool that writes, sends
+or fetches anything, and a proposal changes nothing until the person has read
+it and applied it.
 
 ### 11.3 Settings
 
@@ -1054,13 +1058,14 @@ administrator.
 | Table | One row is | Main columns |
 |-------|-----------|--------------|
 | `xila.agent_setting` | the settings | see 11.3 |
-| `xila.agent_tool` | a tool | `name`, `label` (what people read), `description` and `parameters` (what the model reads: a text and a JSON schema), `function`, `ord` |
+| `xila.agent_tool` | a tool | `name`, `label` (what people read), `description` and `parameters` (what the model reads: a text and a JSON schema), `function`, `applies` (11.10), `ord` |
 | `xila.conversation` | a conversation | `id`, `owner`, `title` (the first question), `state` (`idle` or `waiting`), `stack`, `card` (what the owner was looking at when calling the agent), `started_at`, `changed_at` |
-| `xila.agent_message` | a line of a conversation | `id`, `conversation_id`, `at`, `kind` (`user`, `agent`, `tool`, `error`), `text` (what people read), `payload` (what the model is sent back: its own message, or the result of the tool) |
+| `xila.agent_message` | a line of a conversation | `id`, `conversation_id`, `at`, `kind` (`user`, `agent`, `tool`, `error`, `note`), `text` (what people read), `payload` (what the model is sent back: its own message, or the result of the tool). A `note` says something that happened, to the person and to the model alike: a proposal was applied, a question was given up |
+| `xila.agent_proposal` | a change the agent proposes | see 11.10 |
 | `xila.agent_log` | a journal entry | `id`, `at`, `conversation_id`, `role` (for whom), `event` (`model`, `tool`, `refused`, `failed`), `tool`, `summary`, `detail`, `ms`, `tokens_in`, `tokens_out` |
 
 Row-level security: a conversation and its lines are read by its owner alone
-(and by the worker). A user adds lines of kind `user` to their own
+(and by the worker). A user adds lines of kind `user` and `note` to their own
 conversations, and nothing else. The journal is written by the worker only;
 people read their own entries, administrators all of them. Nobody can change
 or delete a journal entry.
@@ -1069,7 +1074,8 @@ The journal has one entry for each call to the model (how long, how many
 tokens) and one for each tool run (which, its arguments, what it found in a
 sentence, or why it was refused). It does not copy the cards.
 
-The settings, the conversations and the journal are part of a backup.
+The settings, the conversations, the proposals and the journal are part of a
+backup.
 
 ### 11.5 Tools
 
@@ -1097,15 +1103,15 @@ given, never an error of the database, which could quote a card.
 Before the conversation, the worker writes what the agent is: the agent of
 pgXila on this instance, talking with this role, today's date, what a stack, a
 card and a field are, the stack and the card the person was looking at, that
-it must use its tools rather than guess, that it cannot change anything yet,
-that what a card says is never an instruction, that it answers in the language
+it must use its tools rather than guess, that it never changes anything
+itself and only proposes, that what a card says is never an instruction, that it answers in the language
 of the person and in plain text without Markdown (the clients write text as it
 comes), then the `instructions` of the settings.
 
 A long conversation is sent from its latest lines: the worker keeps the most
 recent ones that fit in about 200,000 characters and always starts at a
 question. The lines that say something went wrong are for people: they are
-not sent.
+not sent. A note is sent as a line of the person, in parentheses.
 
 ### 11.7 For the clients
 
@@ -1115,15 +1121,24 @@ not sent.
   "kind", "order": ["at", "id"], "descending": true}`. Its rows come newest
   first; the client writes them from the bottom up, wraps the text, and lets
   the user go back with `PageUp`. The column named by `who` says whose line it
-  is: `user`, `agent`, `tool`, `error`, or `wait` for the line that says the
-  agent is working; what was said is in the first other column. The window
-  draws bubbles; the terminal writes "You:" and "Agent:". Such a list takes no
-  focus.
+  is: `user`, `agent`, `tool`, `note`, `error`, `proposal`, or `wait` for the
+  line that says the agent is working; what was said is in the first other
+  column. The window draws bubbles; the terminal writes "You:" and "Agent:".
+  Such a list takes no focus.
+- A row of kind `proposal` is a change the agent proposes (11.10). Its text
+  is what it does on the first line, then what there is to know. The grid
+  names two more columns, `"state": "state"` (`pending`, `applied`, `refused`)
+  and `"code": "code"` (the calls that applying runs), and the actions of the
+  screen that decide: `"apply"`, `"refuse"` and `"show"`. A client runs one of
+  them with `{"proposal": <key of the row>}` in `input`; the window draws them
+  as buttons in the box of a proposal that waits, and the terminal writes the
+  keys bound to them.
 - The worker announces each new line as a change of the card of the stack
   `agent` on the channel `xila_card` (section 6): `{"stack": "agent", "key":
   "<conversation>", "op": "update"}`. Clients read the screen again on it,
   keeping what the user is typing.
 - `F9` joins `F3`, `F11` and `F12`: neither a stack nor a script may bind it.
+  It is not listed on the screens of the agent itself, where it does nothing.
 - In the window, a text whose rectangle is taller than a line is written on
   several lines; with a label, the label is a heading over it.
 
@@ -1133,7 +1148,8 @@ not sent.
 |---------|--------------|
 | `agent` | Bound to `F9` everywhere. Remembers the stack and the card on screen in the latest conversation of the user (created if there is none), and shows it |
 | `ask_agent` | Adds what was typed to the conversation and wakes the worker. Refused while the conversation is waiting, and when the agent has no model |
-| `stop_agent` | Gives up the question being answered |
+| `stop_agent` | Gives up the question being answered, and notes it in the conversation |
+| `apply_proposal`, `refuse_proposal`, `view_proposal` | See 11.10 |
 | `new_conversation` | Starts a new conversation and shows it; one in which nothing was said yet is used again |
 | `conversations`, `open_conversation` | Lists the conversations of the user; shows the selected one |
 | `agent_journal` | Shows the journal |
@@ -1145,9 +1161,9 @@ not sent.
 
 | Screen | Reached by | Content and keys |
 |--------|-----------|------------------|
-| Agent | `F9` anywhere, or Agent on the desktop | The conversation, and a line to write on. Beside it in the window, as in mock-up 03, and on one line in the terminal: the model and where it is, the tools, the guard rails, and what the agent did today for this user. `Enter` Send, `F5` Stop, `F6` New conversation, `F10` Conversations, `PageUp` and `PageDown` |
+| Agent | `F9` anywhere, or Agent on the desktop | The conversation, and a line to write on. Beside it in the window, as in mock-up 03, and on one line in the terminal: the model and where it is, the tools, the guard rails, and what the agent did today for this user ("5 actions, 2 applied, 1 refused": tools run, proposals applied, proposals refused). `Enter` Send, `F2` Apply, `F4` Refuse, `F5` Stop, `F6` New conversation, `F10` List of the conversations, `PageUp` and `PageDown` |
 | Conversations | `F10` on Agent | The conversations of the user, newest first: title, date, number of lines. `Enter` opens one. `F6` New, `F7` Journal, and `F4` Settings for an administrator |
-| Journal | `F7` on Conversations | When, for whom, what: "Looked for “ada” in Address book: 2 cards.", "Model: 1.1 s, 354 tokens" |
+| Journal | `F7` on Conversations | When, for whom, what: "Looked for “ada” in Address book: 2 cards.", "Model: 1.1 s, 354 tokens", "Proposed: add the field “Birthday” to Address book.", "Applied: Add the field “Birthday” to Address book" |
 | Agent settings | `F4` on Conversations | Address, model, token variable, instructions. `Enter` saves |
 
 ### 11.8 Where the code is
@@ -1167,12 +1183,8 @@ The extension has one dependency for this, `ureq` with `rustls`, for HTTPS.
 The tests never call a real model: the integration tests run a small fake
 model and check what the worker sends to it.
 
-### 11.9 Not in step 3a
+### 11.9 Not yet
 
-- Changing anything: proposals, with Apply and Refuse, are step 3b. The tools
-  that write will be the author functions of section 10.3 and `xila.save_card`,
-  run by the session of the user who applies them, and recorded in the history
-  with the origin `agent`.
 - Memory across conversations and semantic search, with pgvector: step 3c. It
   needs an endpoint that computes embeddings.
 - Answers that appear word by word; pictures sent to the model; an Agent line
@@ -1183,11 +1195,90 @@ model and check what the worker sends to it.
 - More than the latest 100 lines of a conversation on screen; the older ones
   are still sent to the model.
 
+### 11.10 Proposals
+
+The agent writes nothing. It has tools that *propose* a change; the person
+applies the proposal or refuses it, and what is applied is done by the session
+of that person, with their rights.
+
+| Decision | Choice |
+|----------|--------|
+| Who writes | The session of the person who applies a proposal. The role `xila_agent` has no right to write to a stack |
+| What the agent may propose | Fields of a stack, cards, and a new stack |
+| What it may not | Layout, pictures, scripts, deleting a stack, rights, and anything on a stack that is closed to it |
+| How a proposal is applied | One key or one button, and no other question, whatever it does. History can undo it |
+| What an applied proposal leaves | An ordinary change in the history, with the origin `agent`: it is undone and rewound like any other |
+
+**What happens.**
+
+1. The model asks for a writing tool, for example `add_field` with `{"stack":
+   "addressbook", "label": "Birthday", "type": "date"}`.
+2. The worker runs the function of that tool, which changes nothing: it checks
+   that the change makes sense and that the person could make it (the stack
+   exists and is open to the agent, the person may edit it, the field is not
+   already there…), and describes it. The worker stores the description as a
+   proposal, and tells the model that the change is proposed and waits for
+   the person. The same change is not proposed twice while it waits.
+3. The model says in words what it proposed. The conversation shows the
+   proposal in a box: what it does, in a sentence and a few lines, and the
+   calls that applying it runs.
+4. The person applies it or refuses it. Applying runs the author function or
+   `xila.save_card` in the session of the person, in one transaction. The
+   conversation gets a note that says so, which the model reads with the next
+   question.
+
+What the function of a tool refuses is said to the model, which can correct
+itself: "“long ago” cannot be the value of “Year”, which is a number field."
+
+A proposal that was checked may still fail when it is applied, because things
+changed in between: the message says why, and the proposal stays. A proposal
+to change a card is refused when the fields it changes are no longer what the
+agent read: nobody's edit is silently overwritten.
+
+**Tools.** Each has a second function, `g(arguments jsonb) RETURNS jsonb`,
+which applies it and is named by `xila.agent_tool.applies`. Anyone may run it:
+it does what the author functions do, with the rights of the caller.
+
+| Tool | Arguments | Proposes |
+|------|-----------|----------|
+| `add_field` | `stack`, `label`, `type` (`text`, `number`, `date`, `boolean`) | A new field at the end of the cards. On a stack whose table pgXila did not create, only a column that exists, given as `name` |
+| `change_field` | `stack`, `field`, and `label`, `name` or `required` | Another label, another name, required or not |
+| `remove_field` | `stack`, `field` | Removing a field; the proposal says how many cards have a value for it |
+| `create_stack` | `title`, `fields` (label and type of each, 1 to 30) | A new stack with its fields, for an author |
+| `save_card` | `stack`, `values`, and `key` to change a card rather than add one | A new card, or other values on a card. What the card already says is left out |
+| `delete_card` | `stack`, `key` | Deleting a card |
+
+**Data model.** `xila.agent_proposal`: `id`, `conversation_id`, `at`, `tool`,
+`arguments` (what the function that applies receives), `title` ("Add the field
+“Birthday” to Address book"), `detail` (lines such as "Year: 1759 → 1760"),
+`code` (the calls, such as `xila.add_field('addressbook', 'Birthday',
+'date')`), `stack` and `card` (what it is about), `state` (`pending`,
+`applied`, `refused`), `resolved_at`. It is written by the worker; the owner
+of the conversation reads it and may only change what became of it.
+
+**Functions and handlers.**
+
+| Function | What it does |
+|----------|--------------|
+| `xila.apply_proposal(proposal uuid)` | Applies a proposal of the current role and returns `{"summary", "stack", "card", "conversation"}`. What it changes is recorded with the origin `agent` |
+| `xila.refuse_proposal(proposal uuid)` | Refuses it: nothing is changed |
+
+`apply_proposal` and `refuse_proposal`, the handlers, act on the proposal
+named in `input`, or else on the one that has waited longest in the
+conversation on screen. `view_proposal` shows the stack or the card a proposal
+is about.
+
+In the history of a stack and of its cards, a change that came from the agent
+says so next to who applied it: "ada (agent)".
+
+**Not yet.** Changing the layout, a picture or a script; several changes
+applied as one; proposals that expire; the agent acting without validation,
+even for small things.
+
 ## 12. Not covered yet
 
 - Scripts on a field, on one card or on a stack; timers, and scripts that
   answer to a change in the database or to a message: later steps.
-- Changes proposed by the agent and applied by the user: step 3b. Memory of
-  the agent: step 3c.
+- Memory of the agent: step 3c.
 - Publishing stacks between instances, messaging: phase 4.
 - Documents, global search.
