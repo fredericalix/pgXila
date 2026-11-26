@@ -20,7 +20,8 @@ pgXila is made of two parts:
 Early development. Phase 1 is done: one vertical slice, from the database to
 two clients. Phase 2, author mode, is done too: a stack is built from the
 client, without SQL, laid out with a visual editor, illustrated with a drawing
-editor, and given scripts.
+editor, and given scripts. Phase 3, the agent, has its first step: one talks
+with the agent from a screen, and it reads the stacks to answer.
 
 - a Docker image with PostgreSQL 19, the `pgxila` extension and
   [pgvector](https://github.com/pgvector/pgvector) built from source;
@@ -47,9 +48,14 @@ editor, and given scripts.
   written and tested in a script editor, in the graphical client, and run in
   both clients;
 - **rewinding**: a card, the screen of a stack or a whole stack goes back to
-  before any recorded change, a deleted stack or a removed field included.
+  before any recorded change, a deleted stack or a removed field included;
+- **the agent**, in both clients: `F9` on any screen opens a conversation with
+  a language model, which reads the stacks to answer. It runs in a background
+  worker of PostgreSQL, under a role of its own, and never reads more than the
+  person it talks with may read.
 
-Not there yet: the agent and multiple instances. A stack can also be
+Not there yet: an agent that changes things, its memory, and multiple
+instances. A stack can also be
 built with SQL, as [examples/addressbook.sql](examples/addressbook.sql) shows.
 The interface is in English.
 
@@ -79,6 +85,8 @@ cargo run -p xila-gui -- --user ada --ca docker/certs/ca.crt
 #    ...or in the terminal
 cargo run -p xila-term -- --user ada --ca docker/certs/ca.crt
 ```
+
+The agent needs a model to call: see [The agent](#the-agent).
 
 In either client, type the password and press Enter. Open the list of stacks
 (Enter in the window, `1` then Enter in the terminal), and press Enter again to
@@ -111,7 +119,8 @@ docker compose exec -u postgres db psql -d pgxila
 
 Users are PostgreSQL roles, members of `xila_user`. `scripts/create-user.sh`
 creates one; add `--author` for a member of `xila_author`, who may also build
-stacks. Any PostgreSQL client that verifies the certificate can connect with
+stacks, or `--admin` for a member of `xila_admin`, an author who may also set
+up the agent. Any PostgreSQL client that verifies the certificate can connect with
 such a role:
 
 ```sh
@@ -124,19 +133,13 @@ To start again from an empty database, remove the volumes:
 docker compose down --volumes
 ```
 
-Backups are those of PostgreSQL: `pg_dump` saves the stacks, their cards and
-the history, and `pg_restore` brings them back. The system stacks are not part
+Backups are those of PostgreSQL: `pg_dump` saves the stacks, their cards, the
+history, and the conversations with the agent, and `pg_restore` brings them
+back. The system stacks are not part
 of a dump; the extension creates them.
 
 The extension has no upgrade script yet: after pulling a new version, rebuild
 the image and start again from an empty database.
-
-### Agent settings
-
-The agent (a later phase) calls a model through an OpenAI-compatible API. Its
-endpoint and token are read from a `.env.local` file at the root of the
-repository. Copy `.env.example` to `.env.local` and fill it in. The file is
-ignored by git and is optional: the server runs without it.
 
 ## The clients
 
@@ -329,6 +332,69 @@ A stack can also be made from a table that already exists and that you own:
 choose it in the New stack dialog. pgXila then shows the table and never alters
 it; its columns are added and removed in SQL.
 
+## The agent
+
+`F9`, on any screen, opens a conversation with the agent. Write a question and
+press Enter: the agent answers in the conversation, and says on the way what
+it looked at.
+
+```text
+ You: Who lives in London?
+   - Looked for “London” in Address book: 2 cards.
+ Agent: Two people live in London: Charles Babbage and Ada Lovelace.
+```
+
+`F5` gives up a question, `F6` starts a new conversation and `F10` lists the
+conversations; from that list, `F7` shows the journal of what the agent did.
+Called from a card, the agent knows which stack and which card "this" is.
+
+In this first step the agent reads and answers. It changes nothing: it has no
+tool to. Its three tools list the stacks, find cards and read a card.
+
+### Setting it up
+
+The agent calls a language model through an API that speaks the OpenAI chat
+API, such as [OpenRouter](https://openrouter.ai) or a local
+[LM Studio](https://lmstudio.ai). It needs an address, the name of a model
+and, for most endpoints, a token.
+
+```sh
+# 1. The token goes in .env.local, under a name of your choice
+cp .env.example .env.local        # then fill in OPENROUTER_API_KEY
+docker compose up --detach --wait
+
+# 2. The address, the model, and the NAME of the variable that holds the token
+scripts/set-agent.sh https://openrouter.ai/api/v1 some/model OPENROUTER_API_KEY
+
+# A model on this machine needs no token
+scripts/set-agent.sh http://host.docker.internal:1234/v1 some-local-model
+```
+
+`.env.local` is ignored by git. The token never enters the database: the
+settings hold the name of its variable, and the worker reads the value from
+its environment when it calls the model. An administrator
+(`scripts/create-user.sh ada --admin`) can change the settings from the
+client: `F9`, `F10`, then `F4`.
+
+The address must be `https://`. Plain `http://` is accepted for the machine
+itself only (`localhost`, `host.docker.internal`): nothing a person asks, and
+no token, crosses a network in clear.
+
+### What it may read
+
+What the agent reads is sent to the model, so it matters what it may read:
+
+- **A stack is open to the agent until someone closes it.** In author mode,
+  the check box "The agent may read the cards" does it. This is a real
+  PostgreSQL privilege on the table of the stack, granted to the role of the
+  agent, not a flag. Of a closed stack the agent knows the name and the
+  title, so that it can say that it is closed.
+- **Never more than the person.** The agent reads for the person who asks,
+  and refuses what this person could not open.
+- **Everything is written down.** The journal has a line for every call to
+  the model and every tool the agent ran, for whom. It does not copy the
+  cards.
+
 ## Security model
 
 - **TLS 1.3 only.** `ssl_min_protocol_version` is `TLSv1.3` and `pg_hba.conf`
@@ -354,6 +420,15 @@ it; its columns are added and removed in SQL.
   access, only loads source text, and is stopped when it exceeds its time or
   its memory. It acts with the privileges of the role that triggers it, through
   statements that read and write rows only, and never for a superuser.
+- **The agent is confined.** It runs in a background worker connected as
+  `xila_agent`, a role that cannot log in, owns nothing, and may only write
+  its own conversations and journal. It reads the cards of a stack through a
+  privilege that the owner of the stack can take away, and never for someone
+  who could not read them. The model does not write SQL: it can only ask for
+  one of the tools, which are fixed SQL functions. The token of the model
+  stays in the environment of the server, is sent to the configured address
+  only, over HTTPS, and is never stored or logged; only an administrator can
+  change that address.
 
 ## Tests
 
@@ -374,9 +449,11 @@ is refused, both by the configuration and by the extension alone, that TLS 1.2
 is refused, and that the client rejects an untrusted certificate or a wrong
 host name. They also drive both clients from the desktop to a card, with its
 picture, and check what is written; an author builds a stack from the client,
-rewinds it, deletes it and brings it back; and an author writes a script in
-the window, tests it, and a user runs it. They run against a throwaway server
-and do not touch the data of the development server.
+rewinds it, deletes it and brings it back; an author writes a script in the
+window, tests it, and a user runs it; and a user asks the agent, whose worker
+calls a fake model run by the tests, which check what is sent to it. No test
+calls a real model. They run against a throwaway server and do not touch the
+data of the development server.
 
 The same three suites run in GitHub Actions on every push, with the clients
 built and tested on Linux, macOS and Windows.
@@ -385,7 +462,7 @@ built and tested on Linux, macOS and Windows.
 
 | Path | Content |
 |------|---------|
-| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, Lua for the scripts, and SQL: schema, client API, author functions, scripts, actions, system stacks) |
+| `extension/` | The `pgxila` PostgreSQL extension (Rust with pgrx, Lua for the scripts, and SQL: schema, client API, author functions, scripts, agent, actions, system stacks). `src/workers/` holds the background workers |
 | `crates/xila-core/` | Code shared by the clients: connection, API, session, connection form |
 | `crates/xila-gui/` | The graphical client, with its fonts |
 | `crates/xila-term/` | The text client |

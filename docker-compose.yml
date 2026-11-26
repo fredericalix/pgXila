@@ -18,8 +18,10 @@ services:
       dockerfile: docker/Dockerfile
       target: runtime
     image: pgxila/db:dev
-    # The agent settings (endpoint URL and token) come from .env.local, which
-    # is never committed. The file is optional: the server runs without it.
+    # The token of the model the agent calls comes from .env.local, which is
+    # never committed. The agent is told the name of the variable, not its
+    # value (scripts/set-agent.sh). The file is optional: the server runs
+    # without it.
     env_file:
       - path: .env.local
         required: false

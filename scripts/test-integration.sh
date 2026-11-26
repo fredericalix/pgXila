@@ -114,7 +114,7 @@ after="$(history_count)"
 echo "ok"
 
 echo
-echo "A backup is restored with its stacks, its cards and its history"
+echo "A backup is restored with its stacks, its cards, its history and its conversations"
 # A script, so that the backup has one to carry.
 psql_in db-scratch <<'SQL'
 SELECT xila.set_script('addressbook', 'new', $lua$
@@ -141,7 +141,11 @@ summary="SELECT (SELECT count(*) FROM xila.stack), (SELECT count(*) FROM xila.ba
                 (SELECT count(*) || ':' || md5(string_agg(source || events::text || keys::text, ''))
                    FROM xila.script),
                 xila.open_stack('addressbook')->'keys' @> '[{\"key\": \"F2\", \"action\": \"script\"}]',
-                xila.card('addressbook')->'texts'"
+                xila.card('addressbook')->'texts',
+                (SELECT md5(address || model || token_variable) FROM xila.agent_setting),
+                (SELECT count(*) FROM xila.conversation), (SELECT count(*) FROM xila.agent_message),
+                (SELECT count(*) FROM xila.agent_log),
+                has_table_privilege('xila_agent', 'addressbook.contacts', 'SELECT')"
 scratch db-scratch sh -c '
     set -e
     pg_dump -d pgxila -Fc -f /tmp/pgxila.dump

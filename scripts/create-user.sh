@@ -6,12 +6,14 @@
 #
 #   scripts/create-user.sh ada            a user
 #   scripts/create-user.sh ada --author   a user who may also build stacks
+#   scripts/create-user.sh ada --admin    an author who may also set up the agent
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
-name="${1:?usage: scripts/create-user.sh <name> [--author]}"
+name="${1:?usage: scripts/create-user.sh <name> [--author | --admin]}"
 group="xila_user"
 [ "${2:-}" = "--author" ] && group="xila_author"
+[ "${2:-}" = "--admin" ] && group="xila_admin"
 
 read -r -s -p "Password for $name: " password; echo
 read -r -s -p "Again: " again; echo
